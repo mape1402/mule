@@ -73,13 +73,9 @@ public sealed class InMemoryMuleIntegrationTests
                 });
 
                 services.AddSingleton(new TestProbe(fail));
-                services.AddSingleton<TestService>();
                 services.AddMule(mule =>
                 {
-                    mule.For<TestService, TestPayload>(
-                        Key,
-                        static (service, context, cancellationToken) =>
-                            service.CaptureAsync(context.Payload, cancellationToken));
+                    mule.For<CaptureTestPayloadAction, TestPayload>(Key);
                 });
                 services.UseInMemoryMule();
             })
@@ -87,21 +83,21 @@ public sealed class InMemoryMuleIntegrationTests
 
     private sealed record TestPayload(string Value);
 
-    private sealed class TestService
+    private sealed class CaptureTestPayloadAction : IMuleAction<TestPayload>
     {
         private readonly TestProbe _probe;
 
-        public TestService(TestProbe probe)
+        public CaptureTestPayloadAction(TestProbe probe)
         {
             _probe = probe;
         }
 
-        public ValueTask CaptureAsync(TestPayload payload, CancellationToken cancellationToken)
+        public ValueTask ExecuteAsync(MuleActionContext<TestPayload> context, CancellationToken cancellationToken)
         {
             if (_probe.Fail)
                 throw new InvalidOperationException("planned failure");
 
-            _probe.Values.Add(payload.Value);
+            _probe.Values.Add(context.Payload.Value);
             _probe.Signal();
             return ValueTask.CompletedTask;
         }

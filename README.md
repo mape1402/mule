@@ -36,21 +36,45 @@ There is no implicit conversion from `string` to `ActionKey`. Treat key changes 
 
 ## Register Actions
 
-Register Mule and map an `ActionKey` to a service method:
+The recommended pattern is to create an action class and register that class with Mule. The action class itself does not need to be registered in DI; Mule creates it with `ActivatorUtilities` when the action executes. Only its real dependencies belong in DI.
 
 ```csharp
-services.AddSingleton<PaymentService>();
+public sealed class CapturePaymentAction : IMuleAction<CapturePayment>
+{
+    private readonly PaymentGateway _gateway;
+
+    public CapturePaymentAction(PaymentGateway gateway)
+    {
+        _gateway = gateway;
+    }
+
+    public ValueTask ExecuteAsync(
+        MuleActionContext<CapturePayment> context,
+        CancellationToken cancellationToken)
+        => _gateway.CaptureAsync(context.Payload, cancellationToken);
+}
+```
+
+```csharp
+services.AddSingleton<PaymentGateway>();
 
 services.AddMule(mule =>
 {
-    mule.For<PaymentService, CapturePayment>(
-        BillingActions.CapturePayment,
-        static (service, context, cancellationToken) =>
-            service.CaptureAsync(context.Payload, cancellationToken));
+    mule.For<CapturePaymentAction, CapturePayment>(
+        BillingActions.CapturePayment);
 });
 ```
 
 The payload type is not the durable identity. This keeps generic payloads and envelopes like `Payload<T>` from accidentally changing action identity.
+
+If you already have an application service registered in DI and want Mule to call it directly, the service-backed overload is available:
+
+```csharp
+mule.For<PaymentGateway, CapturePayment>(
+    BillingActions.CapturePayment,
+    static (gateway, context, cancellationToken) =>
+        gateway.CaptureAsync(context.Payload, cancellationToken));
+```
 
 ## Choose Storage
 

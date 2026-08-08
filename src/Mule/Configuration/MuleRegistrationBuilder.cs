@@ -11,6 +11,13 @@ internal sealed class MuleRegistrationBuilder : IMuleRegistrationBuilder
         _registry = registry ?? throw new ArgumentNullException(nameof(registry));
     }
 
+    public IMuleRegistrationBuilder For<TAction, TPayload>(ActionKey key)
+        where TAction : class, IMuleAction<TPayload>
+    {
+        _registry.Add(new ActivatorMuleActionHandler<TAction, TPayload>(key));
+        return this;
+    }
+
     public IMuleRegistrationBuilder For<TService, TPayload>(
         ActionKey key,
         Func<TService, MuleActionContext<TPayload>, CancellationToken, ValueTask> execute)

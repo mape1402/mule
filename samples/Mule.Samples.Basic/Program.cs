@@ -13,13 +13,10 @@ var host = Host.CreateDefaultBuilder(args)
             settings.MaxAttempts = 3;
         });
 
-        services.AddSingleton<ReceiptService>();
+        services.AddSingleton<ReceiptGateway>();
         services.AddMule(mule =>
         {
-            mule.For<ReceiptService, SendReceipt>(
-                SampleActions.SendReceipt,
-                static (service, context, cancellationToken) =>
-                    service.SendAsync(context.Payload, cancellationToken));
+            mule.For<SendReceiptAction, SendReceipt>(SampleActions.SendReceipt);
         });
         services.UseInMemoryMule();
     })
@@ -57,7 +54,20 @@ public static class SampleActions
 
 public sealed record SendReceipt(string OrderId, string Email);
 
-public sealed class ReceiptService
+public sealed class SendReceiptAction : IMuleAction<SendReceipt>
+{
+    private readonly ReceiptGateway _gateway;
+
+    public SendReceiptAction(ReceiptGateway gateway)
+    {
+        _gateway = gateway;
+    }
+
+    public ValueTask ExecuteAsync(MuleActionContext<SendReceipt> context, CancellationToken cancellationToken)
+        => _gateway.SendAsync(context.Payload, cancellationToken);
+}
+
+public sealed class ReceiptGateway
 {
     public ValueTask SendAsync(SendReceipt receipt, CancellationToken cancellationToken)
     {
