@@ -2,6 +2,12 @@
 
 All notable changes to Mule packages will be documented in this file.
 
+## [v1.0.1] - 2026-08-08
+
+### Fixed
+
+- Fixed release automation so the merged `main` build is validated before publishing NuGet packages.
+
 ## [v1.0.0] - 2026-08-08
 
 ### Added
