@@ -1,0 +1,22 @@
+namespace Microsoft.Extensions.DependencyInjection;
+
+using Microsoft.Extensions.DependencyInjection.Extensions;
+using Mule;
+using Mule.Diagnostics;
+using Mule.InMemory;
+
+public static class InMemoryMuleServiceCollectionExtensions
+{
+    public static IServiceCollection UseInMemoryMule(this IServiceCollection services)
+    {
+        if (services == null)
+            throw new ArgumentNullException(nameof(services));
+
+        services.TryAddSingleton<InMemoryMuleStore>();
+        services.TryAddSingleton<IInMemoryMule, InMemoryMule>();
+        services.TryAddScoped<IMuleStorage, InMemoryMuleStorage>();
+        services.TryAddSingleton<IMuleDiagnostics, InMemoryMuleDiagnostics>();
+
+        return services;
+    }
+}
