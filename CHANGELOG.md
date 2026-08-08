@@ -2,7 +2,7 @@
 
 All notable changes to Mule packages will be documented in this file.
 
-## [1.0.0] - 2026-08-08
+## [v1.0.0] - 2026-08-08
 
 ### Added
 
