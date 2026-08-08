@@ -24,11 +24,3 @@ After the merge, the `Build and Release` workflow restores, builds, and tests th
 ## Manual release
 
 The same `Build and Release` workflow can be run manually from a `releases/v*.*.*` branch. Manual releases derive the package version from the selected branch name instead of `.release`.
-
-## Repository setup
-
-The repository must define these settings before automatic releases can run:
-
-- `NUGET_USER` repository variable with the nuget.org username configured for Trusted Publishing.
-
-The NuGet Trusted Publishing policy should point to `build-and-release.yml`, because it is the only workflow that publishes packages.

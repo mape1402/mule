@@ -229,8 +229,7 @@ jobs:
         shell: bash
         run: |
           if [[ -z "$NUGET_USER" ]]; then
-            echo "Repository variable NUGET_USER must be set to the nuget.org username that created the Trusted Publishing policy."
-            echo "This is not necessarily the package owner, organization, GitHub repository owner, or policy name."
+            echo "NuGet publishing user is not configured."
             exit 1
           fi
 
