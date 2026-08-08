@@ -1,0 +1,13 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <PackageId>Mule.DurableActions.EntityFrameworkCore</PackageId>
+    <Description>Entity Framework Core storage provider for Mule durable action execution.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.EntityFrameworkCore" Version="8.0.18" />
+    <ProjectReference Include="..\Mule\Mule.csproj" />
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,12 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <PackageId>Mule.DurableActions.InMemory</PackageId>
+    <Description>In-memory storage provider for Mule durable action execution.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Mule\Mule.csproj" />
+  </ItemGroup>
+
+</Project>
