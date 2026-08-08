@@ -1,8 +1,12 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
+    <IsPackable>true</IsPackable>
     <PackageId>Mule.DurableActions</PackageId>
-    <Description>Durable, resilient action execution for .NET applications.</Description>
+    <Title>Mule Durable Actions</Title>
+    <PackageType>Dependency</PackageType>
+    <Description>Core abstractions and dispatcher services for registering durable actions, persisting execution intents, and processing them with retries in .NET applications.</Description>
+    <PackageTags>$(PackageTags);actions;dispatcher;dependency-injection</PackageTags>
   </PropertyGroup>
 
   <ItemGroup>
