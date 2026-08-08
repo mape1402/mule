@@ -21,10 +21,14 @@ Mule releases are requested with the `.release` marker file.
 
 After the merge, the `Build` workflow restores, builds, and tests the merged `main` commit first. Only after that succeeds does it check whether `.release` changed in that push. If it changed, the workflow validates the tag, validates the changelog entry, creates `releases/v1.0.0` as a release marker branch, packs the NuGet packages, creates the GitHub release, and publishes to NuGet.
 
+## Manual release
+
+The same `Build` workflow can be run manually from a `releases/v*.*.*` branch. Manual releases derive the package version from the selected branch name instead of `.release`.
+
 ## Repository setup
 
 The repository must define these settings before automatic releases can run:
 
 - `NUGET_USER` repository variable with the nuget.org username configured for Trusted Publishing.
 
-The `Release to NuGet` workflow remains available for manual `workflow_dispatch` runs from a `releases/v*.*.*` branch.
+The NuGet Trusted Publishing policy should point to `CI.yml`, because it is the only workflow that publishes packages.
