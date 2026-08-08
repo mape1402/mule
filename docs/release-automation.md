@@ -19,7 +19,7 @@ Mule releases are requested with the `.release` marker file.
 3. Open a pull request to `main`.
 4. Merge the pull request after approval and a passing build.
 
-After the merge, the `Build` workflow checks whether `.release` changed in that push. If it changed, the workflow validates the tag, validates the changelog entry, creates `releases/v1.0.0` as a release marker branch, packs the NuGet packages, creates the GitHub release, and publishes to NuGet.
+After the merge, the `Build` workflow restores, builds, and tests the merged `main` commit first. Only after that succeeds does it check whether `.release` changed in that push. If it changed, the workflow validates the tag, validates the changelog entry, creates `releases/v1.0.0` as a release marker branch, packs the NuGet packages, creates the GitHub release, and publishes to NuGet.
 
 ## Repository setup
 
