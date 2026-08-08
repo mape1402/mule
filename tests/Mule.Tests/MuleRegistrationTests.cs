@@ -34,6 +34,21 @@ public sealed class MuleRegistrationTests
         Assert.Null(provider.GetService<TestAction>());
     }
 
+    [Fact]
+    public void AddActionsFromAssembly_Should_Discover_Attributed_Action_Types()
+    {
+        var services = new ServiceCollection();
+
+        services.AddMule(mule =>
+        {
+            mule.AddActionsFromAssemblyContaining<DiscoveredTestAction>();
+        });
+
+        using var provider = services.BuildServiceProvider();
+
+        Assert.Null(provider.GetService<DiscoveredTestAction>());
+    }
+
     private sealed class TestService
     {
     }
@@ -41,6 +56,13 @@ public sealed class MuleRegistrationTests
     private sealed record TestPayload(string Value);
 
     private sealed class TestAction : IMuleAction<TestPayload>
+    {
+        public ValueTask ExecuteAsync(MuleActionContext<TestPayload> context, CancellationToken cancellationToken)
+            => ValueTask.CompletedTask;
+    }
+
+    [MuleAction("discovered.action")]
+    private sealed class DiscoveredTestAction : IMuleAction<TestPayload>
     {
         public ValueTask ExecuteAsync(MuleActionContext<TestPayload> context, CancellationToken cancellationToken)
             => ValueTask.CompletedTask;

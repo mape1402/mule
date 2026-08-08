@@ -75,7 +75,7 @@ public sealed class InMemoryMuleIntegrationTests
                 services.AddSingleton(new TestProbe(fail));
                 services.AddMule(mule =>
                 {
-                    mule.For<CaptureTestPayloadAction, TestPayload>(Key);
+                    mule.AddActionsFromAssemblyContaining<CaptureTestPayloadAction>();
                 });
                 services.UseInMemoryMule();
             })
@@ -83,6 +83,7 @@ public sealed class InMemoryMuleIntegrationTests
 
     private sealed record TestPayload(string Value);
 
+    [MuleAction("tests.capture.v1")]
     private sealed class CaptureTestPayloadAction : IMuleAction<TestPayload>
     {
         private readonly TestProbe _probe;

@@ -34,11 +34,12 @@ public static class BillingActions
 
 There is no implicit conversion from `string` to `ActionKey`. Treat key changes as durable schema changes.
 
-## Register Actions
+## Discover Actions
 
-The recommended pattern is to create an action class and register that class with Mule. The action class itself does not need to be registered in DI; Mule creates it with `ActivatorUtilities` when the action executes. Only its real dependencies belong in DI.
+The recommended pattern is to put the durable key on the action class and let Mule discover actions from an assembly. You do not register every action in DI, and you do not list every action in startup.
 
 ```csharp
+[MuleAction("billing.capture-payment.v1")]
 public sealed class CapturePaymentAction : IMuleAction<CapturePayment>
 {
     private readonly PaymentGateway _gateway;
@@ -60,14 +61,22 @@ services.AddSingleton<PaymentGateway>();
 
 services.AddMule(mule =>
 {
-    mule.For<CapturePaymentAction, CapturePayment>(
-        BillingActions.CapturePayment);
+    mule.AddActionsFromAssemblyContaining<CapturePaymentAction>();
 });
 ```
 
+Mule discovers classes marked with `[MuleAction(...)]`, verifies they implement exactly one `IMuleAction<TPayload>`, and creates them with `ActivatorUtilities` when they execute. Only their real dependencies belong in DI.
+
 The payload type is not the durable identity. This keeps generic payloads and envelopes like `Payload<T>` from accidentally changing action identity.
 
-If you already have an application service registered in DI and want Mule to call it directly, the service-backed overload is available:
+Manual registration is still available for advanced cases, but it should not be the default for large applications:
+
+```csharp
+mule.For<CapturePaymentAction, CapturePayment>(
+    BillingActions.CapturePayment);
+```
+
+If you already have an application service registered in DI and want Mule to call it directly, the service-backed overload is also available:
 
 ```csharp
 mule.For<PaymentGateway, CapturePayment>(

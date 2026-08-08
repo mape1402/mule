@@ -1,7 +1,13 @@
 namespace Mule.Configuration;
 
+using System.Reflection;
+
 public interface IMuleRegistrationBuilder
 {
+    IMuleRegistrationBuilder AddActionsFromAssembly(Assembly assembly);
+
+    IMuleRegistrationBuilder AddActionsFromAssemblyContaining<TMarker>();
+
     IMuleRegistrationBuilder For<TAction, TPayload>(ActionKey key)
         where TAction : class, IMuleAction<TPayload>;
 

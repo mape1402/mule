@@ -16,7 +16,7 @@ var host = Host.CreateDefaultBuilder(args)
         services.AddSingleton<ReceiptGateway>();
         services.AddMule(mule =>
         {
-            mule.For<SendReceiptAction, SendReceipt>(SampleActions.SendReceipt);
+            mule.AddActionsFromAssemblyContaining<SendReceiptAction>();
         });
         services.UseInMemoryMule();
     })
@@ -54,6 +54,7 @@ public static class SampleActions
 
 public sealed record SendReceipt(string OrderId, string Email);
 
+[MuleAction("samples.send-receipt.v1")]
 public sealed class SendReceiptAction : IMuleAction<SendReceipt>
 {
     private readonly ReceiptGateway _gateway;

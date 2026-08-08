@@ -101,7 +101,7 @@ public sealed class EntityFrameworkMuleTests
                 services.AddSingleton<TestProbe>();
                 services.AddMule(mule =>
                 {
-                    mule.For<CaptureTestPayloadAction, TestPayload>(Key);
+                    mule.AddActionsFromAssemblyContaining<CaptureTestPayloadAction>();
                 });
                 services.UseEntityFrameworkMule(options => options.UseSqlite($"Data Source={capturedPath}"));
             })
@@ -129,6 +129,7 @@ public sealed class EntityFrameworkMuleTests
 
     private sealed record TestPayload(string Value);
 
+    [MuleAction("tests.ef.capture.v1")]
     private sealed class CaptureTestPayloadAction : IMuleAction<TestPayload>
     {
         private readonly TestProbe _probe;
