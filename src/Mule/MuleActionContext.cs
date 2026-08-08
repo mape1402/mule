@@ -1,7 +1,6 @@
 namespace Mule;
 
 using System.Text.Json;
-using Microsoft.Extensions.DependencyInjection;
 
 public class MuleActionContext
 {
