@@ -1,8 +1,12 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
+    <IsPackable>true</IsPackable>
     <PackageId>Mule.DurableActions.EntityFrameworkCore</PackageId>
-    <Description>Entity Framework Core storage provider for Mule durable action execution.</Description>
+    <Title>Mule Durable Actions Entity Framework Core Provider</Title>
+    <PackageType>Dependency</PackageType>
+    <Description>Entity Framework Core storage provider for Mule durable actions, enabling persistent action queues, retry state, locking, and recovery across application restarts.</Description>
+    <PackageTags>$(PackageTags);entity-framework-core;ef-core;persistence;sqlite;sql-server</PackageTags>
   </PropertyGroup>
 
   <ItemGroup>

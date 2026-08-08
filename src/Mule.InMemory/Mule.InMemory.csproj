@@ -1,8 +1,12 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
+    <IsPackable>true</IsPackable>
     <PackageId>Mule.DurableActions.InMemory</PackageId>
-    <Description>In-memory storage provider for Mule durable action execution.</Description>
+    <Title>Mule Durable Actions In-Memory Provider</Title>
+    <PackageType>Dependency</PackageType>
+    <Description>In-memory storage provider for Mule durable actions, intended for samples, tests, local development, and lightweight non-persistent action processing.</Description>
+    <PackageTags>$(PackageTags);in-memory;testing;samples</PackageTags>
   </PropertyGroup>
 
   <ItemGroup>
