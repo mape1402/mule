@@ -2,17 +2,23 @@
 
 Mule is a .NET library for durable, resilient action execution.
 
-Application code records an intent in the foreground. Mule persists that intent, then a background dispatcher executes the registered action with locking, retries, recovery, cleanup, and diagnostics.
+Your application records an intent in the foreground. Mule stores that intent, then a background dispatcher executes the matching action with locking, retries, recovery, cleanup, and diagnostics.
 
-Mule provides at-least-once execution. Actions should be idempotent or use deduplication keys.
+Mule provides **at-least-once execution**. Actions should be idempotent, or you should use deduplication keys for operations that cannot safely run twice.
 
 ## Packages
+
+```bash
+dotnet add package Mule.DurableActions
+dotnet add package Mule.DurableActions.InMemory
+dotnet add package Mule.DurableActions.EntityFrameworkCore
+```
 
 - `Mule.DurableActions`: core API, dispatcher, registration, serialization, and contracts.
 - `Mule.DurableActions.InMemory`: in-memory provider for tests, samples, and local experiments.
 - `Mule.DurableActions.EntityFrameworkCore`: EF Core provider for durable storage.
 
-Namespaces intentionally stay short:
+Package IDs are descriptive, but namespaces stay short:
 
 ```csharp
 using Mule;
@@ -20,108 +26,137 @@ using Mule.InMemory;
 using Mule.EntityFrameworkCore;
 ```
 
-## Action Keys
+## Concepts
 
-Mule persists action identity as a string, but the public API uses `ActionKey` so string values are deliberate and easy to centralize.
+- **Action key**: a durable, stable identifier for a kind of work.
+- **Payload**: the serialized data Mule stores with the intent.
+- **Action**: a class that implements `IMuleAction<TPayload>`.
+- **Client**: `IMuleClient`, used by foreground code to enqueue work.
+- **Storage provider**: InMemory or EF Core.
+- **Dispatcher**: a hosted background service that locks and executes pending actions.
+
+Mule stores the action key as a string, but public APIs use `ActionKey` to avoid loose string usage.
+
+## Quick Start
+
+Define a payload:
 
 ```csharp
-public static class BillingActions
+public sealed record SendReceipt(string OrderId, string Email);
+```
+
+Define an action. The `[MuleAction]` attribute is the durable key.
+
+```csharp
+[MuleAction("receipts.send.v1")]
+public sealed class SendReceiptAction : IMuleAction<SendReceipt>
+{
+    private readonly ReceiptGateway _gateway;
+
+    public SendReceiptAction(ReceiptGateway gateway)
+    {
+        _gateway = gateway;
+    }
+
+    public ValueTask ExecuteAsync(
+        MuleActionContext<SendReceipt> context,
+        CancellationToken cancellationToken)
+    {
+        return _gateway.SendAsync(context.Payload, cancellationToken);
+    }
+}
+```
+
+Register Mule once and let it discover actions from an assembly:
+
+```csharp
+services.AddSingleton<ReceiptGateway>();
+
+services.AddMule(mule =>
+{
+    mule.AddActionsFromAssemblyContaining<SendReceiptAction>();
+});
+
+services.UseInMemoryMule();
+```
+
+Enqueue work from foreground code:
+
+```csharp
+var mule = scope.ServiceProvider.GetRequiredService<IMuleClient>();
+
+await mule.EnqueueAsync(
+    ActionKey.From("receipts.send.v1"),
+    new SendReceipt("order-1001", "mario@example.com"),
+    cancellationToken);
+```
+
+Mule persists the intent, queues it for background execution, and retries it if the action fails.
+
+## Action Discovery
+
+The recommended registration style is assembly discovery:
+
+```csharp
+services.AddMule(mule =>
+{
+    mule.AddActionsFromAssemblyContaining<SendReceiptAction>();
+});
+```
+
+Mule scans the assembly for concrete classes marked with `[MuleAction(...)]`.
+
+Each discovered action must implement exactly one `IMuleAction<TPayload>`:
+
+```csharp
+[MuleAction("billing.capture-payment.v1")]
+public sealed class CapturePaymentAction : IMuleAction<CapturePayment>
+{
+    public ValueTask ExecuteAsync(
+        MuleActionContext<CapturePayment> context,
+        CancellationToken cancellationToken)
+    {
+        // Execute durable work here.
+        return ValueTask.CompletedTask;
+    }
+}
+```
+
+Actions are **not** registered in DI one by one. Mule creates the action with `ActivatorUtilities` when it executes, so constructor dependencies are still resolved from the application service provider.
+
+## Action Keys
+
+Keys should be stable and versioned:
+
+```csharp
+public static class BillingActionKeys
 {
     public static readonly ActionKey CapturePayment =
         ActionKey.From("billing.capture-payment.v1");
 }
 ```
 
-There is no implicit conversion from `string` to `ActionKey`. Treat key changes as durable schema changes.
-
-## Discover Actions
-
-The recommended pattern is to put the durable key on the action class and let Mule discover actions from an assembly. You do not register every action in DI, and you do not list every action in startup.
+Use the same value in the attribute:
 
 ```csharp
 [MuleAction("billing.capture-payment.v1")]
 public sealed class CapturePaymentAction : IMuleAction<CapturePayment>
 {
-    private readonly PaymentGateway _gateway;
-
-    public CapturePaymentAction(PaymentGateway gateway)
-    {
-        _gateway = gateway;
-    }
-
-    public ValueTask ExecuteAsync(
-        MuleActionContext<CapturePayment> context,
-        CancellationToken cancellationToken)
-        => _gateway.CaptureAsync(context.Payload, cancellationToken);
+    // ...
 }
 ```
 
-```csharp
-services.AddSingleton<PaymentGateway>();
+There is no implicit conversion from `string` to `ActionKey`. Treat key changes as durable schema changes.
 
-services.AddMule(mule =>
-{
-    mule.AddActionsFromAssemblyContaining<CapturePaymentAction>();
-});
-```
+The payload type is not the durable identity. That keeps generic payloads and envelopes such as `Payload<T>` from accidentally changing action identity.
 
-Mule discovers classes marked with `[MuleAction(...)]`, verifies they implement exactly one `IMuleAction<TPayload>`, and creates them with `ActivatorUtilities` when they execute. Only their real dependencies belong in DI.
+## Enqueue Options
 
-The payload type is not the durable identity. This keeps generic payloads and envelopes like `Payload<T>` from accidentally changing action identity.
-
-Manual registration is still available for advanced cases, but it should not be the default for large applications:
-
-```csharp
-mule.For<CapturePaymentAction, CapturePayment>(
-    BillingActions.CapturePayment);
-```
-
-If you already have an application service registered in DI and want Mule to call it directly, the service-backed overload is also available:
-
-```csharp
-mule.For<PaymentGateway, CapturePayment>(
-    BillingActions.CapturePayment,
-    static (gateway, context, cancellationToken) =>
-        gateway.CaptureAsync(context.Payload, cancellationToken));
-```
-
-## Choose Storage
-
-For tests or local usage:
-
-```csharp
-services.UseInMemoryMule();
-```
-
-For EF Core:
-
-```csharp
-services.UseEntityFrameworkMule(options =>
-    options.UseSqlServer(connectionString));
-```
-
-For SQLite or local samples:
-
-```csharp
-services.UseEntityFrameworkMule(options =>
-    options.UseSqlite("Data Source=mule.db"));
-```
-
-Create the schema with migrations or call `EnsureCreated()` for simple apps:
-
-```csharp
-using var scope = app.Services.CreateScope();
-var db = scope.ServiceProvider.GetRequiredService<MuleDbContext>();
-await db.Database.EnsureCreatedAsync();
-```
-
-## Enqueue Work
-
-Foreground code records the intent and returns quickly:
+Use `EnqueueOptions` for correlation, metadata, and deduplication:
 
 ```csharp
 await mule.EnqueueAsync(
-    BillingActions.CapturePayment,
+    BillingActionKeys.CapturePayment,
     new CapturePayment(orderId, amount),
     options =>
     {
@@ -132,9 +167,119 @@ await mule.EnqueueAsync(
     cancellationToken);
 ```
 
-`EnqueueAsync` does not require the handler to be present in the producer process. That allows producer-only services to record intents while worker processes execute them.
+`EnqueueAsync` does not require the handler to be present in the producer process. Producer-only services can record intents while worker services discover and execute the actions.
 
-## Run The Sample
+## Storage Providers
+
+### InMemory
+
+Use InMemory for tests and samples:
+
+```csharp
+services.UseInMemoryMule();
+```
+
+The provider is process-local and non-durable. It exposes `IInMemoryMule` for assertions:
+
+```csharp
+var store = provider.GetRequiredService<IInMemoryMule>();
+var action = Assert.Single(store.Actions);
+```
+
+### Entity Framework Core
+
+Use EF Core for durable storage:
+
+```csharp
+services.UseEntityFrameworkMule(options =>
+    options.UseSqlServer(connectionString));
+```
+
+For SQLite:
+
+```csharp
+services.UseEntityFrameworkMule(options =>
+    options.UseSqlite("Data Source=mule.db"));
+```
+
+Create the schema with migrations, or call `EnsureCreated()` in simple apps:
+
+```csharp
+using var scope = app.Services.CreateScope();
+var db = scope.ServiceProvider.GetRequiredService<MuleDbContext>();
+await db.Database.EnsureCreatedAsync();
+```
+
+If you want to include Mule in your own `DbContext`, use the model extension:
+
+```csharp
+protected override void OnModelCreating(ModelBuilder modelBuilder)
+{
+    modelBuilder.UseMuleModel();
+}
+```
+
+## Dispatcher Settings
+
+Configure retry, polling, locking, and cleanup through `MuleSettings`:
+
+```csharp
+services.Configure<MuleSettings>(settings =>
+{
+    settings.ImmediateDispatch = true;
+    settings.DispatchInterval = TimeSpan.FromSeconds(5);
+    settings.DispatchBatchSize = 50;
+    settings.MaxAttempts = 10;
+    settings.RetryDelay = TimeSpan.FromSeconds(30);
+    settings.LockTimeout = TimeSpan.FromMinutes(5);
+    settings.CleanupInterval = TimeSpan.FromMinutes(10);
+    settings.CompletedRetention = TimeSpan.FromDays(1);
+});
+```
+
+The dispatcher also recovers pending actions through polling. If immediate dispatch is unavailable or a process restarts, pending actions are picked up by the recovery loop.
+
+## Diagnostics
+
+Providers expose `IMuleDiagnostics`:
+
+```csharp
+var diagnostics = scope.ServiceProvider.GetRequiredService<IMuleDiagnostics>();
+var snapshot = await diagnostics.GetSnapshotAsync();
+```
+
+The snapshot includes:
+
+- pending count
+- locked count
+- completed count
+- failed count
+- oldest pending timestamp
+- oldest failed timestamp
+
+## Manual Registration
+
+Assembly discovery is the default recommendation. Manual registration remains available for advanced cases:
+
+```csharp
+mule.For<CapturePaymentAction, CapturePayment>(
+    BillingActionKeys.CapturePayment);
+```
+
+If you already have an application service registered in DI and want Mule to call it directly:
+
+```csharp
+mule.For<PaymentGateway, CapturePayment>(
+    BillingActionKeys.CapturePayment,
+    static (gateway, context, cancellationToken) =>
+        gateway.CaptureAsync(context.Payload, cancellationToken));
+```
+
+Use these overloads sparingly in large applications. Discovery keeps startup composition clean as action count grows.
+
+## Sample
+
+Run the basic sample:
 
 ```bash
 dotnet run --project samples/Mule.Samples.Basic/Mule.Samples.Basic.csproj --framework net8.0
@@ -146,14 +291,3 @@ Expected output:
 Sending receipt for order-1001 to mario@example.com.
 Action samples.send-receipt.v1 finished with status Completed.
 ```
-
-## Diagnostics
-
-Providers can expose `IMuleDiagnostics`:
-
-```csharp
-var diagnostics = scope.ServiceProvider.GetRequiredService<IMuleDiagnostics>();
-var snapshot = await diagnostics.GetSnapshotAsync();
-```
-
-The snapshot includes counts for pending, locked, completed, and failed actions, plus oldest pending and failed timestamps.
