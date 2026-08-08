@@ -14,4 +14,5 @@ All notable changes to Mule packages will be documented in this file.
 - Added diagnostics contracts through `IMuleDiagnostics` and `MuleDiagnosticsSnapshot`.
 - Added `Mule.DurableActions.InMemory` provider with process-local storage and `IInMemoryMule` inspection support.
 - Added `Mule.DurableActions.EntityFrameworkCore` provider with `MuleDbContext`, `UseEntityFrameworkMule(...)`, and `UseMuleModel()`.
+- Added embedded NuGet package icon.
 - Added basic sample application showing action discovery, in-memory storage, enqueue, background execution, and completed status inspection.

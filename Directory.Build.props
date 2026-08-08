@@ -21,6 +21,7 @@
     <RepositoryUrl>https://github.com/mape1402/mule</RepositoryUrl>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <PackageProjectUrl>https://github.com/mape1402/mule</PackageProjectUrl>
+    <PackageIcon>icon.png</PackageIcon>
     <PackageReleaseNotes>https://github.com/mape1402/mule/releases</PackageReleaseNotes>
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <PackageRequireLicenseAcceptance>false</PackageRequireLicenseAcceptance>
@@ -28,6 +29,7 @@
 
   <ItemGroup>
     <None Include="../../README.md" Pack="true" Visible="false" PackagePath="" />
+    <None Include="../../assets/icon.png" Pack="true" Visible="false" PackagePath="" />
   </ItemGroup>
 
   <PropertyGroup>
