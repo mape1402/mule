@@ -1,6 +1,9 @@
 name: Release to NuGet
 
 on:
+  push:
+    branches:
+      - 'releases/v*.*.*'
   workflow_dispatch:
 
 env:
