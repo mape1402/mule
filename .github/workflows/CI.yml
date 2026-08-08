@@ -57,6 +57,23 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Install .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            8.0.x
+            9.0.x
+            10.0.x
+
+      - name: Restore
+        run: dotnet restore "$DOTNET_TARGET"
+
+      - name: Build
+        run: dotnet build "$DOTNET_TARGET" --no-restore --configuration "$CONFIGURATION"
+
+      - name: Test
+        run: dotnet test "$DOTNET_TARGET" --no-build --configuration "$CONFIGURATION" --verbosity normal
+
       - name: Resolve release marker
         id: release
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -100,23 +117,6 @@ jobs:
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
-
-      - name: Install .NET SDK
-        uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: |
-            8.0.x
-            9.0.x
-            10.0.x
-
-      - name: Restore
-        run: dotnet restore "$DOTNET_TARGET"
-
-      - name: Build
-        run: dotnet build "$DOTNET_TARGET" --no-restore --configuration "$CONFIGURATION"
-
-      - name: Test
-        run: dotnet test "$DOTNET_TARGET" --no-build --configuration "$CONFIGURATION" --verbosity normal
 
       - name: Create release branch
         if: steps.release.outputs.should_release == 'true'
