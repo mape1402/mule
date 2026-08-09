@@ -1,9 +1,18 @@
 namespace Mule.Configuration;
 
 using System.Reflection;
+using Microsoft.Extensions.DependencyInjection;
 
 public interface IMuleRegistrationBuilder
 {
+    IMuleRegistrationBuilder Configure(Action<MuleSettings> configure);
+
+    IMuleRegistrationBuilder AddServices(Action<IServiceCollection> configure);
+
+    IMuleRegistrationBuilder UseRecovery(MuleRecoveryMode mode);
+
+    IMuleRegistrationBuilder UseCleanup(MuleCleanupMode mode);
+
     IMuleRegistrationBuilder AddActionsFromAssembly(Assembly assembly);
 
     IMuleRegistrationBuilder AddActionsFromAssemblyContaining<TMarker>();
