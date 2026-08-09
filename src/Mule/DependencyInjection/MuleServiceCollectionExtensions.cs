@@ -24,14 +24,13 @@ public static class MuleServiceCollectionExtensions
         services.TryAddScoped<IMuleClient, MuleClient>();
         services.AddSingleton<IHostedService, MuleDispatcherHostedService>();
 
+        var registry = new MuleActionRegistry();
+
         if (configure != null)
-        {
-            using var provider = services.BuildServiceProvider();
-            var registry = provider.GetRequiredService<MuleActionRegistry>();
-            configure(new MuleRegistrationBuilder(registry));
-            services.Replace(ServiceDescriptor.Singleton(registry));
-            services.Replace(ServiceDescriptor.Singleton<IMuleActionRegistry>(registry));
-        }
+            configure(new MuleRegistrationBuilder(services, registry));
+
+        services.Replace(ServiceDescriptor.Singleton(registry));
+        services.Replace(ServiceDescriptor.Singleton<IMuleActionRegistry>(registry));
 
         return services;
     }

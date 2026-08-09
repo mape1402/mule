@@ -1,16 +1,43 @@
 namespace Mule.Configuration;
 
 using System.Reflection;
+using Microsoft.Extensions.DependencyInjection;
 using Mule.Dispatching;
 
 internal sealed class MuleRegistrationBuilder : IMuleRegistrationBuilder
 {
+    private readonly IServiceCollection _services;
     private readonly MuleActionRegistry _registry;
 
-    public MuleRegistrationBuilder(MuleActionRegistry registry)
+    public MuleRegistrationBuilder(IServiceCollection services, MuleActionRegistry registry)
     {
+        _services = services ?? throw new ArgumentNullException(nameof(services));
         _registry = registry ?? throw new ArgumentNullException(nameof(registry));
     }
+
+    public IMuleRegistrationBuilder Configure(Action<MuleSettings> configure)
+    {
+        if (configure == null)
+            throw new ArgumentNullException(nameof(configure));
+
+        _services.Configure(configure);
+        return this;
+    }
+
+    public IMuleRegistrationBuilder AddServices(Action<IServiceCollection> configure)
+    {
+        if (configure == null)
+            throw new ArgumentNullException(nameof(configure));
+
+        configure(_services);
+        return this;
+    }
+
+    public IMuleRegistrationBuilder UseRecovery(MuleRecoveryMode mode)
+        => Configure(settings => settings.RecoveryMode = mode);
+
+    public IMuleRegistrationBuilder UseCleanup(MuleCleanupMode mode)
+        => Configure(settings => settings.CleanupMode = mode);
 
     public IMuleRegistrationBuilder AddActionsFromAssembly(Assembly assembly)
     {
