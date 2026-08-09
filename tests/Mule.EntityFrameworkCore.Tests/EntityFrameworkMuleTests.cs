@@ -53,6 +53,42 @@ public sealed class EntityFrameworkMuleTests
     }
 
     [Fact]
+    public async Task LockAsync_Should_Allow_Only_One_Replica_To_Claim_Action()
+    {
+        using var host = CreateAppDbContextHost(out var databasePath);
+        var actionId = Guid.NewGuid();
+
+        using (var scope = host.Services.CreateScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<TestDbContext>();
+            await db.Database.EnsureCreatedAsync();
+            db.Set<DurableAction>().Add(new DurableAction
+            {
+                Id = actionId,
+                Key = Key,
+                Payload = "{}",
+                PayloadType = typeof(TestPayload).AssemblyQualifiedName,
+                Status = DurableActionStatus.Pending,
+                CreatedOnUtc = DateTimeOffset.UtcNow
+            });
+            await db.SaveChangesAsync();
+        }
+
+        using var firstScope = host.Services.CreateScope();
+        using var secondScope = host.Services.CreateScope();
+        var firstStorage = firstScope.ServiceProvider.GetRequiredService<IMuleStorage>();
+        var secondStorage = secondScope.ServiceProvider.GetRequiredService<IMuleStorage>();
+
+        var firstClaim = await firstStorage.LockAsync(actionId, TimeSpan.FromMinutes(5), DateTimeOffset.UtcNow);
+        var secondClaim = await secondStorage.LockAsync(actionId, TimeSpan.FromMinutes(5), DateTimeOffset.UtcNow);
+
+        Assert.NotNull(firstClaim);
+        Assert.Null(secondClaim);
+
+        TryDelete(databasePath);
+    }
+
+    [Fact]
     public async Task EnqueueAsync_Should_Persist_Action()
     {
         using var host = CreateHost(out var databasePath);
@@ -113,6 +149,7 @@ public sealed class EntityFrameworkMuleTests
 
         var probe = host.Services.GetRequiredService<TestProbe>();
         await probe.WaitAsync();
+        await WaitForActionStatusAsync(host, DurableActionStatus.Completed);
         await host.StopAsync();
 
         Assert.Equal("hello", Assert.Single(probe.Values));
@@ -171,6 +208,23 @@ public sealed class EntityFrameworkMuleTests
         using var scope = host.Services.CreateScope();
         var db = scope.ServiceProvider.GetRequiredService<MuleDbContext>();
         await db.Database.EnsureCreatedAsync();
+    }
+
+    private static async Task WaitForActionStatusAsync(IHost host, DurableActionStatus status)
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+
+        while (!timeout.IsCancellationRequested)
+        {
+            using var scope = host.Services.CreateScope();
+            var db = scope.ServiceProvider.GetRequiredService<MuleDbContext>();
+            var current = await db.Actions.AsNoTracking().Select(x => x.Status).SingleOrDefaultAsync(timeout.Token);
+
+            if (current == status)
+                return;
+
+            await Task.Delay(25, timeout.Token);
+        }
     }
 
     private static void TryDelete(string path)
