@@ -68,6 +68,31 @@ internal sealed class InMemoryMuleStore
         }
     }
 
+    public DateTimeOffset? GetNextPendingOnUtc(TimeSpan lockTimeout, DateTimeOffset now)
+    {
+        lock (_gate)
+        {
+            var lockExpiration = now.Subtract(lockTimeout);
+            return _actions
+                .Where(x => x.Status is DurableActionStatus.Pending or DurableActionStatus.Locked)
+                .Select(x =>
+                {
+                    if (x.Status == DurableActionStatus.Pending)
+                        return x.NextAttemptOnUtc == null || x.NextAttemptOnUtc <= now
+                            ? now
+                            : x.NextAttemptOnUtc;
+
+                    if (x.LockedOnUtc <= lockExpiration)
+                        return now;
+
+                    return x.LockedOnUtc?.Add(lockTimeout);
+                })
+                .Where(x => x != null)
+                .OrderBy(x => x)
+                .FirstOrDefault();
+        }
+    }
+
     public void MarkCompleted(Guid id, DateTimeOffset completedOnUtc)
     {
         lock (_gate)
@@ -108,6 +133,18 @@ internal sealed class InMemoryMuleStore
                 _actions.Remove(action);
 
             return actions.Length;
+        }
+    }
+
+    public DateTimeOffset? GetOldestCompletedOnUtc()
+    {
+        lock (_gate)
+        {
+            return _actions
+                .Where(x => x.Status == DurableActionStatus.Completed && x.CompletedOnUtc != null)
+                .OrderBy(x => x.CompletedOnUtc)
+                .Select(x => x.CompletedOnUtc)
+                .FirstOrDefault();
         }
     }
 

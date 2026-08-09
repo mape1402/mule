@@ -61,7 +61,106 @@ public sealed class InMemoryMuleIntegrationTests
         Assert.Contains("planned failure", action.LastError);
     }
 
-    private static IHost CreateHost(bool fail = false)
+    [Fact]
+    public async Task ScheduledRecovery_Should_Retry_Failed_Action_Without_Polling()
+    {
+        using var host = CreateHost(failOnce: true, configureSettings: settings =>
+        {
+            settings.RecoveryMode = MuleRecoveryMode.Scheduled;
+            settings.DispatchInterval = TimeSpan.FromHours(1);
+            settings.RetryDelay = TimeSpan.FromMilliseconds(50);
+            settings.MaxAttempts = 2;
+        });
+        await host.StartAsync();
+
+        using var scope = host.Services.CreateScope();
+        var client = scope.ServiceProvider.GetRequiredService<IMuleClient>();
+        await client.EnqueueAsync(Key, new TestPayload("retry"));
+
+        var probe = host.Services.GetRequiredService<TestProbe>();
+        await probe.WaitAsync();
+        await host.StopAsync();
+
+        Assert.Equal("retry", Assert.Single(probe.Values));
+
+        var action = Assert.Single(host.Services.GetRequiredService<IInMemoryMule>().Actions);
+        Assert.Equal(DurableActionStatus.Completed, action.Status);
+        Assert.Equal(1, action.Attempts);
+    }
+
+    [Fact]
+    public async Task ScheduledRecovery_Should_Process_Enqueued_Action_When_ImmediateDispatch_Is_Disabled()
+    {
+        using var host = CreateHost(configureSettings: settings =>
+        {
+            settings.ImmediateDispatch = false;
+            settings.RecoveryMode = MuleRecoveryMode.Scheduled;
+            settings.DispatchInterval = TimeSpan.FromHours(1);
+        });
+        await host.StartAsync();
+
+        using var scope = host.Services.CreateScope();
+        var client = scope.ServiceProvider.GetRequiredService<IMuleClient>();
+        await client.EnqueueAsync(Key, new TestPayload("scheduled"));
+
+        var probe = host.Services.GetRequiredService<TestProbe>();
+        await probe.WaitAsync();
+        await host.StopAsync();
+
+        Assert.Equal("scheduled", Assert.Single(probe.Values));
+    }
+
+    [Fact]
+    public async Task DisabledCleanup_Should_Keep_Completed_Actions()
+    {
+        using var host = CreateHost(configureSettings: settings =>
+        {
+            settings.CleanupMode = MuleCleanupMode.Disabled;
+            settings.CompletedRetention = TimeSpan.FromMilliseconds(1);
+            settings.CleanupInterval = TimeSpan.FromMilliseconds(10);
+        });
+        await host.StartAsync();
+
+        using var scope = host.Services.CreateScope();
+        var client = scope.ServiceProvider.GetRequiredService<IMuleClient>();
+        await client.EnqueueAsync(Key, new TestPayload("audit"));
+
+        var probe = host.Services.GetRequiredService<TestProbe>();
+        await probe.WaitAsync();
+        await Task.Delay(100);
+        await host.StopAsync();
+
+        var action = Assert.Single(host.Services.GetRequiredService<IInMemoryMule>().Actions);
+        Assert.Equal(DurableActionStatus.Completed, action.Status);
+    }
+
+    [Fact]
+    public async Task ScheduledCleanup_Should_Remove_Completed_Actions_When_Retention_Expires()
+    {
+        using var host = CreateHost(configureSettings: settings =>
+        {
+            settings.CleanupMode = MuleCleanupMode.Scheduled;
+            settings.CompletedRetention = TimeSpan.FromMilliseconds(50);
+            settings.CleanupInterval = TimeSpan.FromHours(1);
+        });
+        await host.StartAsync();
+
+        using var scope = host.Services.CreateScope();
+        var client = scope.ServiceProvider.GetRequiredService<IMuleClient>();
+        await client.EnqueueAsync(Key, new TestPayload("cleanup"));
+
+        var probe = host.Services.GetRequiredService<TestProbe>();
+        await probe.WaitAsync();
+        await WaitForNoActionsAsync(host);
+        await host.StopAsync();
+
+        Assert.Empty(host.Services.GetRequiredService<IInMemoryMule>().Actions);
+    }
+
+    private static IHost CreateHost(
+        bool fail = false,
+        bool failOnce = false,
+        Action<MuleSettings> configureSettings = null)
         => Host.CreateDefaultBuilder()
             .ConfigureServices(services =>
             {
@@ -70,16 +169,28 @@ public sealed class InMemoryMuleIntegrationTests
                     settings.DispatchInterval = TimeSpan.FromMilliseconds(50);
                     settings.RetryDelay = TimeSpan.FromMilliseconds(50);
                     settings.MaxAttempts = 1;
+                    configureSettings?.Invoke(settings);
                 });
 
-                services.AddSingleton(new TestProbe(fail));
-                services.AddMule(mule =>
-                {
-                    mule.AddActionsFromAssemblyContaining<CaptureTestPayloadAction>();
-                });
-                services.UseInMemoryMule();
+                services.AddSingleton(new TestProbe(fail, failOnce));
+                services.AddMule(mule => mule
+                    .UseInMemory()
+                    .AddActionsFromAssemblyContaining<CaptureTestPayloadAction>());
             })
             .Build();
+
+    private static async Task WaitForNoActionsAsync(IHost host)
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+
+        while (!timeout.IsCancellationRequested)
+        {
+            if (host.Services.GetRequiredService<IInMemoryMule>().Actions.Count == 0)
+                return;
+
+            await Task.Delay(25, timeout.Token);
+        }
+    }
 
     private sealed record TestPayload(string Value);
 
@@ -95,7 +206,7 @@ public sealed class InMemoryMuleIntegrationTests
 
         public ValueTask ExecuteAsync(MuleActionContext<TestPayload> context, CancellationToken cancellationToken)
         {
-            if (_probe.Fail)
+            if (_probe.ShouldFail())
                 throw new InvalidOperationException("planned failure");
 
             _probe.Values.Add(context.Payload.Value);
@@ -107,15 +218,25 @@ public sealed class InMemoryMuleIntegrationTests
     private sealed class TestProbe
     {
         private readonly TaskCompletionSource _completion = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private int _remainingFailures;
 
-        public TestProbe(bool fail)
+        public TestProbe(bool fail, bool failOnce)
         {
             Fail = fail;
+            _remainingFailures = failOnce ? 1 : 0;
         }
 
         public bool Fail { get; }
 
         public List<string> Values { get; } = new();
+
+        public bool ShouldFail()
+        {
+            if (Fail)
+                return true;
+
+            return _remainingFailures > 0 && Interlocked.Decrement(ref _remainingFailures) >= 0;
+        }
 
         public void Signal()
             => _completion.TrySetResult();
