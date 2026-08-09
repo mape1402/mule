@@ -28,6 +28,12 @@ internal sealed class InMemoryMuleStorage : IMuleStorage
         CancellationToken cancellationToken = default)
         => Task.FromResult(_store.GetPending(batchSize, lockTimeout, now));
 
+    public Task<DateTimeOffset?> GetNextPendingOnUtcAsync(
+        TimeSpan lockTimeout,
+        DateTimeOffset now,
+        CancellationToken cancellationToken = default)
+        => Task.FromResult(_store.GetNextPendingOnUtc(lockTimeout, now));
+
     public Task<DurableAction> LockAsync(Guid id, TimeSpan lockTimeout, DateTimeOffset now, CancellationToken cancellationToken = default)
         => Task.FromResult(_store.Lock(id, lockTimeout, now));
 
@@ -50,6 +56,9 @@ internal sealed class InMemoryMuleStorage : IMuleStorage
 
     public Task<int> CleanCompletedAsync(DateTimeOffset olderThanUtc, int batchSize, CancellationToken cancellationToken = default)
         => Task.FromResult(_store.CleanCompleted(olderThanUtc, batchSize));
+
+    public Task<DateTimeOffset?> GetOldestCompletedOnUtcAsync(CancellationToken cancellationToken = default)
+        => Task.FromResult(_store.GetOldestCompletedOnUtc());
 
     public Task SaveChangesAsync(CancellationToken cancellationToken = default)
     {

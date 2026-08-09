@@ -74,6 +74,41 @@ internal class EntityFrameworkMuleStorage<TDbContext> : IMuleStorage, IDisposabl
         return await Actions.FindAsync(new object[] { id }, cancellationToken);
     }
 
+    public async Task<DateTimeOffset?> GetNextPendingOnUtcAsync(
+        TimeSpan lockTimeout,
+        DateTimeOffset now,
+        CancellationToken cancellationToken = default)
+    {
+        var lockExpiration = now.Subtract(lockTimeout);
+        var actions = await Actions
+            .AsNoTracking()
+            .Where(x => x.Status == DurableActionStatus.Pending || x.Status == DurableActionStatus.Locked)
+            .Select(x => new
+            {
+                x.Status,
+                x.LockedOnUtc,
+                x.NextAttemptOnUtc
+            })
+            .ToListAsync(cancellationToken);
+
+        return actions
+            .Select(x =>
+            {
+                if (x.Status == DurableActionStatus.Pending)
+                    return x.NextAttemptOnUtc == null || x.NextAttemptOnUtc <= now
+                        ? now
+                        : x.NextAttemptOnUtc;
+
+                if (x.LockedOnUtc <= lockExpiration)
+                    return now;
+
+                return x.LockedOnUtc?.Add(lockTimeout);
+            })
+            .Where(x => x != null)
+            .OrderBy(x => x)
+            .FirstOrDefault();
+    }
+
     public async Task MarkCompletedAsync(Guid id, DateTimeOffset completedOnUtc, CancellationToken cancellationToken = default)
     {
         var action = await FindAsync(id, cancellationToken);
@@ -113,6 +148,14 @@ internal class EntityFrameworkMuleStorage<TDbContext> : IMuleStorage, IDisposabl
         Actions.RemoveRange(actions);
         return actions.Length;
     }
+
+    public async Task<DateTimeOffset?> GetOldestCompletedOnUtcAsync(CancellationToken cancellationToken = default)
+        => await Actions
+            .AsNoTracking()
+            .Where(x => x.Status == DurableActionStatus.Completed && x.CompletedOnUtc != null)
+            .OrderBy(x => x.CompletedOnUtc)
+            .Select(x => x.CompletedOnUtc)
+            .FirstOrDefaultAsync(cancellationToken);
 
     public Task SaveChangesAsync(CancellationToken cancellationToken = default)
         => _dbContext.SaveChangesAsync(cancellationToken);

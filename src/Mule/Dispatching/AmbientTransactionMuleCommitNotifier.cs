@@ -8,15 +8,18 @@ using Microsoft.Extensions.Options;
 internal sealed class AmbientTransactionMuleCommitNotifier : IMuleCommitNotifier
 {
     private readonly IMuleDispatchQueue _dispatchQueue;
+    private readonly MuleSchedulerSignal _schedulerSignal;
     private readonly MuleSettings _settings;
     private readonly ILogger<AmbientTransactionMuleCommitNotifier> _logger;
 
     public AmbientTransactionMuleCommitNotifier(
         IMuleDispatchQueue dispatchQueue,
+        MuleSchedulerSignal schedulerSignal,
         IOptions<MuleSettings> settings,
         ILogger<AmbientTransactionMuleCommitNotifier> logger = null)
     {
         _dispatchQueue = dispatchQueue ?? throw new ArgumentNullException(nameof(dispatchQueue));
+        _schedulerSignal = schedulerSignal ?? throw new ArgumentNullException(nameof(schedulerSignal));
         _settings = settings?.Value ?? throw new ArgumentNullException(nameof(settings));
         _logger = logger ?? NullLogger<AmbientTransactionMuleCommitNotifier>.Instance;
     }
@@ -24,7 +27,12 @@ internal sealed class AmbientTransactionMuleCommitNotifier : IMuleCommitNotifier
     public async ValueTask NotifySavedAsync(Guid actionId, CancellationToken cancellationToken = default)
     {
         if (!_settings.ImmediateDispatch)
+        {
+            if (_settings.RecoveryMode == MuleRecoveryMode.Scheduled)
+                _schedulerSignal.SignalRecovery();
+
             return;
+        }
 
         var transaction = Transaction.Current;
 
