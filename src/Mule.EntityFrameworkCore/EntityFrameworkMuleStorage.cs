@@ -2,13 +2,17 @@ namespace Mule.EntityFrameworkCore;
 
 using Microsoft.EntityFrameworkCore;
 
-internal sealed class EntityFrameworkMuleStorage : IMuleStorage
+internal class EntityFrameworkMuleStorage<TDbContext> : IMuleStorage, IDisposable, IAsyncDisposable
+    where TDbContext : DbContext
 {
-    private readonly MuleDbContext _dbContext;
+    private readonly TDbContext _dbContext;
 
-    public EntityFrameworkMuleStorage(MuleDbContext dbContext)
+    public EntityFrameworkMuleStorage(IMuleDbContextFactory<TDbContext> dbContextFactory)
     {
-        _dbContext = dbContext ?? throw new ArgumentNullException(nameof(dbContext));
+        if (dbContextFactory == null)
+            throw new ArgumentNullException(nameof(dbContextFactory));
+
+        _dbContext = dbContextFactory.CreateDbContext();
     }
 
     public async Task AddAsync(DurableAction action, CancellationToken cancellationToken = default)
@@ -18,7 +22,7 @@ internal sealed class EntityFrameworkMuleStorage : IMuleStorage
 
         if (!string.IsNullOrWhiteSpace(action.DeduplicationKey))
         {
-            var exists = await _dbContext.Actions.AnyAsync(
+            var exists = await Actions.AnyAsync(
                 x => x.Key == action.Key && x.DeduplicationKey == action.DeduplicationKey,
                 cancellationToken);
 
@@ -26,7 +30,7 @@ internal sealed class EntityFrameworkMuleStorage : IMuleStorage
                 return;
         }
 
-        await _dbContext.Actions.AddAsync(action, cancellationToken);
+        await Actions.AddAsync(action, cancellationToken);
     }
 
     public async Task<IReadOnlyCollection<DurableAction>> LockPendingAsync(
@@ -37,7 +41,7 @@ internal sealed class EntityFrameworkMuleStorage : IMuleStorage
     {
         var lockExpiration = now.Subtract(lockTimeout);
 
-        var candidates = await _dbContext.Actions
+        var candidates = await Actions
             .Where(x =>
                 x.Status == DurableActionStatus.Pending && (x.NextAttemptOnUtc == null || x.NextAttemptOnUtc <= now) ||
                 x.Status == DurableActionStatus.Locked && x.LockedOnUtc <= lockExpiration)
@@ -57,7 +61,7 @@ internal sealed class EntityFrameworkMuleStorage : IMuleStorage
         CancellationToken cancellationToken = default)
     {
         var lockExpiration = now.Subtract(lockTimeout);
-        var action = await _dbContext.Actions.FindAsync(new object[] { id }, cancellationToken);
+        var action = await Actions.FindAsync(new object[] { id }, cancellationToken);
 
         if (action == null)
             return null;
@@ -102,7 +106,7 @@ internal sealed class EntityFrameworkMuleStorage : IMuleStorage
 
     public async Task<int> CleanCompletedAsync(DateTimeOffset olderThanUtc, int batchSize, CancellationToken cancellationToken = default)
     {
-        var candidates = await _dbContext.Actions
+        var candidates = await Actions
             .Where(x => x.Status == DurableActionStatus.Completed && x.CompletedOnUtc <= olderThanUtc)
             .ToListAsync(cancellationToken);
 
@@ -111,14 +115,30 @@ internal sealed class EntityFrameworkMuleStorage : IMuleStorage
             .Take(batchSize)
             .ToArray();
 
-        _dbContext.Actions.RemoveRange(actions);
+        Actions.RemoveRange(actions);
         return actions.Length;
     }
 
     public Task SaveChangesAsync(CancellationToken cancellationToken = default)
         => _dbContext.SaveChangesAsync(cancellationToken);
 
+    protected DbSet<DurableAction> Actions => _dbContext.Set<DurableAction>();
+
     private async Task<DurableAction> FindAsync(Guid id, CancellationToken cancellationToken)
-        => await _dbContext.Actions.FindAsync(new object[] { id }, cancellationToken)
+        => await Actions.FindAsync(new object[] { id }, cancellationToken)
             ?? throw new InvalidOperationException($"Mule action '{id}' was not found.");
+
+    public void Dispose()
+        => _dbContext.Dispose();
+
+    public ValueTask DisposeAsync()
+        => _dbContext.DisposeAsync();
+}
+
+internal sealed class EntityFrameworkMuleStorage : EntityFrameworkMuleStorage<MuleDbContext>
+{
+    public EntityFrameworkMuleStorage(IMuleDbContextFactory<MuleDbContext> dbContextFactory)
+        : base(dbContextFactory)
+    {
+    }
 }
