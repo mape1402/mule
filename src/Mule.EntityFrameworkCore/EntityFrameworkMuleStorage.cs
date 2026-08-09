@@ -1,6 +1,9 @@
 namespace Mule.EntityFrameworkCore;
 
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Metadata;
+using Microsoft.EntityFrameworkCore.Storage;
 
 internal class EntityFrameworkMuleStorage<TDbContext> : IMuleStorage, IDisposable, IAsyncDisposable
     where TDbContext : DbContext
@@ -61,22 +64,14 @@ internal class EntityFrameworkMuleStorage<TDbContext> : IMuleStorage, IDisposabl
         CancellationToken cancellationToken = default)
     {
         var lockExpiration = now.Subtract(lockTimeout);
-        var action = await Actions.FindAsync(new object[] { id }, cancellationToken);
+        var locked = _dbContext.Database.IsRelational()
+            ? await LockRelationalAsync(id, lockExpiration, now, cancellationToken)
+            : await LockTrackedAsync(id, lockExpiration, now, cancellationToken);
 
-        if (action == null)
+        if (locked == 0)
             return null;
 
-        var canLock =
-            action.Status == DurableActionStatus.Pending && (action.NextAttemptOnUtc == null || action.NextAttemptOnUtc <= now) ||
-            action.Status == DurableActionStatus.Locked && action.LockedOnUtc <= lockExpiration;
-
-        if (!canLock)
-            return null;
-
-        action.Status = DurableActionStatus.Locked;
-        action.LockedOnUtc = now;
-
-        return action;
+        return await Actions.FindAsync(new object[] { id }, cancellationToken);
     }
 
     public async Task MarkCompletedAsync(Guid id, DateTimeOffset completedOnUtc, CancellationToken cancellationToken = default)
@@ -124,6 +119,87 @@ internal class EntityFrameworkMuleStorage<TDbContext> : IMuleStorage, IDisposabl
 
     protected DbSet<DurableAction> Actions => _dbContext.Set<DurableAction>();
 
+    private async Task<int> LockRelationalAsync(
+        Guid id,
+        DateTimeOffset lockExpiration,
+        DateTimeOffset now,
+        CancellationToken cancellationToken)
+    {
+        var names = GetActionStoreNames();
+        var sql = $$"""
+UPDATE {{names.Table}}
+SET {{names.Status}} = {0},
+    {{names.LockedOnUtc}} = {1}
+WHERE {{names.Id}} = {2}
+  AND (
+      ({{names.Status}} = {3} AND ({{names.NextAttemptOnUtc}} IS NULL OR {{names.NextAttemptOnUtc}} <= {4}))
+      OR ({{names.Status}} = {5} AND {{names.LockedOnUtc}} <= {6})
+  )
+""";
+
+        return await _dbContext.Database.ExecuteSqlRawAsync(
+            sql,
+            [
+                (int)DurableActionStatus.Locked,
+                now,
+                id,
+                (int)DurableActionStatus.Pending,
+                now,
+                (int)DurableActionStatus.Locked,
+                lockExpiration
+            ],
+            cancellationToken);
+    }
+
+    private async Task<int> LockTrackedAsync(
+        Guid id,
+        DateTimeOffset lockExpiration,
+        DateTimeOffset now,
+        CancellationToken cancellationToken)
+    {
+        var action = await Actions.FindAsync(new object[] { id }, cancellationToken);
+
+        if (action == null)
+            return 0;
+
+        var canLock =
+            action.Status == DurableActionStatus.Pending && (action.NextAttemptOnUtc == null || action.NextAttemptOnUtc <= now) ||
+            action.Status == DurableActionStatus.Locked && action.LockedOnUtc <= lockExpiration;
+
+        if (!canLock)
+            return 0;
+
+        action.Status = DurableActionStatus.Locked;
+        action.LockedOnUtc = now;
+        await _dbContext.SaveChangesAsync(cancellationToken);
+        return 1;
+    }
+
+    private ActionStoreNames GetActionStoreNames()
+    {
+        var entity = _dbContext.Model.FindEntityType(typeof(DurableAction))
+            ?? throw new InvalidOperationException("Mule action entity is not part of the DbContext model.");
+        var tableName = entity.GetTableName()
+            ?? throw new InvalidOperationException("Mule action entity is not mapped to a table.");
+        var schema = entity.GetSchema();
+        var table = StoreObjectIdentifier.Table(tableName, schema);
+        var helper = _dbContext.GetService<ISqlGenerationHelper>();
+
+        string Column(string propertyName)
+        {
+            var property = entity.FindProperty(propertyName)
+                ?? throw new InvalidOperationException($"Mule action property '{propertyName}' is not part of the DbContext model.");
+            return helper.DelimitIdentifier(property.GetColumnName(table), schema: null);
+        }
+
+        return new ActionStoreNames(
+            helper.DelimitIdentifier(tableName, schema),
+            Column(nameof(DurableAction.Id)),
+            Column(nameof(DurableAction.Status)),
+            Column(nameof(DurableAction.LockedOnUtc)),
+            Column(nameof(DurableAction.NextAttemptOnUtc)));
+    }
+
     private async Task<DurableAction> FindAsync(Guid id, CancellationToken cancellationToken)
         => await Actions.FindAsync(new object[] { id }, cancellationToken)
             ?? throw new InvalidOperationException($"Mule action '{id}' was not found.");
@@ -133,6 +209,13 @@ internal class EntityFrameworkMuleStorage<TDbContext> : IMuleStorage, IDisposabl
 
     public ValueTask DisposeAsync()
         => _dbContext.DisposeAsync();
+
+    private sealed record ActionStoreNames(
+        string Table,
+        string Id,
+        string Status,
+        string LockedOnUtc,
+        string NextAttemptOnUtc);
 }
 
 internal sealed class EntityFrameworkMuleStorage : EntityFrameworkMuleStorage<MuleDbContext>
