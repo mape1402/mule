@@ -11,6 +11,48 @@ public sealed class EntityFrameworkMuleTests
     private static readonly ActionKey Key = ActionKey.From("tests.ef.capture.v1");
 
     [Fact]
+    public async Task UseEntityFrameworkCore_Should_Add_Mule_Entity_To_App_DbContext_Model()
+    {
+        using var host = CreateAppDbContextHost(out var databasePath);
+
+        using var scope = host.Services.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<TestDbContext>();
+
+        Assert.NotNull(db.Model.FindEntityType(typeof(DurableAction)));
+
+        TryDelete(databasePath);
+    }
+
+    [Fact]
+    public async Task UseEntityFrameworkCore_Should_Persist_Action_In_App_DbContext_Model()
+    {
+        using var host = CreateAppDbContextHost(out var databasePath);
+
+        using (var scope = host.Services.CreateScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<TestDbContext>();
+            await db.Database.EnsureCreatedAsync();
+        }
+
+        using (var scope = host.Services.CreateScope())
+        {
+            var client = scope.ServiceProvider.GetRequiredService<IMuleClient>();
+            await client.EnqueueAsync(Key, new TestPayload("stored"));
+        }
+
+        using (var scope = host.Services.CreateScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<TestDbContext>();
+            var action = await db.Set<DurableAction>().AsNoTracking().SingleAsync();
+
+            Assert.Equal(Key, action.Key);
+            Assert.Equal(DurableActionStatus.Pending, action.Status);
+        }
+
+        TryDelete(databasePath);
+    }
+
+    [Fact]
     public async Task EnqueueAsync_Should_Persist_Action()
     {
         using var host = CreateHost(out var databasePath);
@@ -108,6 +150,22 @@ public sealed class EntityFrameworkMuleTests
             .Build();
     }
 
+    private static IHost CreateAppDbContextHost(out string databasePath)
+    {
+        databasePath = Path.Combine(Path.GetTempPath(), $"mule-app-{Guid.NewGuid():N}.db");
+        var capturedPath = databasePath;
+
+        return Host.CreateDefaultBuilder()
+            .ConfigureServices(services =>
+            {
+                services.AddDbContext<TestDbContext>(options => options.UseSqlite($"Data Source={capturedPath}"));
+                services.AddMule(mule => mule
+                    .UseEntityFrameworkCore<TestDbContext>()
+                    .AddActionsFromAssemblyContaining<CaptureTestPayloadAction>());
+            })
+            .Build();
+    }
+
     private static async Task EnsureDatabaseAsync(IHost host)
     {
         using var scope = host.Services.CreateScope();
@@ -158,5 +216,13 @@ public sealed class EntityFrameworkMuleTests
 
         public async Task WaitAsync()
             => await _completion.Task.WaitAsync(TimeSpan.FromSeconds(3));
+    }
+
+    private sealed class TestDbContext : DbContext
+    {
+        public TestDbContext(DbContextOptions<TestDbContext> options)
+            : base(options)
+        {
+        }
     }
 }
