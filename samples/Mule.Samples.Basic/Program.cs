@@ -14,11 +14,9 @@ var host = Host.CreateDefaultBuilder(args)
         });
 
         services.AddSingleton<ReceiptGateway>();
-        services.AddMule(mule =>
-        {
-            mule.AddActionsFromAssemblyContaining<SendReceiptAction>();
-        });
-        services.UseInMemoryMule();
+        services.AddMule(mule => mule
+            .UseInMemory()
+            .AddActionsFromAssemblyContaining<SendReceiptAction>());
     })
     .Build();
 
