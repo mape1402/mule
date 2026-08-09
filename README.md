@@ -72,12 +72,9 @@ Register Mule once and let it discover actions from an assembly:
 ```csharp
 services.AddSingleton<ReceiptGateway>();
 
-services.AddMule(mule =>
-{
-    mule.AddActionsFromAssemblyContaining<SendReceiptAction>();
-});
-
-services.UseInMemoryMule();
+services.AddMule(mule => mule
+    .UseInMemory()
+    .AddActionsFromAssemblyContaining<SendReceiptAction>());
 ```
 
 Enqueue work from foreground code:
@@ -98,10 +95,8 @@ Mule persists the intent, queues it for background execution, and retries it if 
 The recommended registration style is assembly discovery:
 
 ```csharp
-services.AddMule(mule =>
-{
-    mule.AddActionsFromAssemblyContaining<SendReceiptAction>();
-});
+services.AddMule(mule => mule
+    .AddActionsFromAssemblyContaining<SendReceiptAction>());
 ```
 
 Mule scans the assembly for concrete classes marked with `[MuleAction(...)]`.
@@ -176,7 +171,9 @@ await mule.EnqueueAsync(
 Use InMemory for tests and samples:
 
 ```csharp
-services.UseInMemoryMule();
+services.AddMule(mule => mule
+    .UseInMemory()
+    .AddActionsFromAssemblyContaining<SendReceiptAction>());
 ```
 
 The provider is process-local and non-durable. It exposes `IInMemoryMule` for assertions:
@@ -191,53 +188,66 @@ var action = Assert.Single(store.Actions);
 Use EF Core for durable storage:
 
 ```csharp
-services.UseEntityFrameworkMule(options =>
+services.AddDbContext<AppDbContext>(options =>
     options.UseSqlServer(connectionString));
+
+services.AddMule(mule => mule
+    .UseEntityFrameworkCore<AppDbContext>()
+    .AddActionsFromAssemblyContaining<SendReceiptAction>());
 ```
 
 For SQLite:
 
 ```csharp
-services.UseEntityFrameworkMule(options =>
+services.AddDbContext<AppDbContext>(options =>
     options.UseSqlite("Data Source=mule.db"));
 ```
 
-Create the schema with migrations, or call `EnsureCreated()` in simple apps:
+Mule adds its table to the application `DbContext` model automatically. Create the schema with migrations, or call `EnsureCreated()` in simple apps:
 
 ```csharp
 using var scope = app.Services.CreateScope();
-var db = scope.ServiceProvider.GetRequiredService<MuleDbContext>();
+var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
 await db.Database.EnsureCreatedAsync();
 ```
 
-If you want to include Mule in your own `DbContext`, use the model extension:
-
-```csharp
-protected override void OnModelCreating(ModelBuilder modelBuilder)
-{
-    modelBuilder.UseMuleModel();
-}
-```
+`UseEntityFrameworkMule(...)` and `MuleDbContext` remain available for standalone storage, but `UseEntityFrameworkCore<TDbContext>()` is the recommended integration for applications that already have a DbContext.
 
 ## Dispatcher Settings
 
-Configure retry, polling, locking, and cleanup through `MuleSettings`:
+Configure retry, recovery, locking, and cleanup through `MuleSettings`:
 
 ```csharp
-services.Configure<MuleSettings>(settings =>
-{
-    settings.ImmediateDispatch = true;
-    settings.DispatchInterval = TimeSpan.FromSeconds(5);
-    settings.DispatchBatchSize = 50;
-    settings.MaxAttempts = 10;
-    settings.RetryDelay = TimeSpan.FromSeconds(30);
-    settings.LockTimeout = TimeSpan.FromMinutes(5);
-    settings.CleanupInterval = TimeSpan.FromMinutes(10);
-    settings.CompletedRetention = TimeSpan.FromDays(1);
-});
+services.AddMule(mule => mule
+    .UseInMemory()
+    .Configure(settings =>
+    {
+        settings.ImmediateDispatch = true;
+        settings.RecoveryMode = MuleRecoveryMode.Scheduled;
+        settings.DispatchInterval = TimeSpan.FromSeconds(5);
+        settings.DispatchBatchSize = 50;
+        settings.MaxAttempts = 10;
+        settings.RetryDelay = TimeSpan.FromSeconds(30);
+        settings.LockTimeout = TimeSpan.FromMinutes(5);
+        settings.CleanupMode = MuleCleanupMode.Scheduled;
+        settings.CleanupInterval = TimeSpan.FromMinutes(10);
+        settings.CompletedRetention = TimeSpan.FromDays(1);
+    })
+    .AddActionsFromAssemblyContaining<SendReceiptAction>());
 ```
 
-The dispatcher also recovers pending actions through polling. If immediate dispatch is unavailable or a process restarts, pending actions are picked up by the recovery loop.
+`RecoveryMode` controls how pending work is recovered:
+
+- `Polling`: checks storage every `DispatchInterval`.
+- `Scheduled`: checks storage on startup, then wakes when an action is due for retry or when immediate dispatch is disabled and new work is persisted.
+
+`CleanupMode` controls completed action retention:
+
+- `Disabled`: completed actions are kept for audit/history.
+- `Polling`: cleanup runs every `CleanupInterval`.
+- `Scheduled`: cleanup wakes when completed actions reach `CompletedRetention`.
+
+Mule uses storage locks so multiple service replicas can run workers at the same time without intentionally executing the same locked action concurrently. Actions should still be idempotent because Mule provides at-least-once execution.
 
 ## Diagnostics
 
