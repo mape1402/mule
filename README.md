@@ -150,7 +150,9 @@ The payload type is not the durable identity. That keeps generic payloads and en
 
 ## Enqueue Options
 
-Use `EnqueueOptions` for correlation, metadata, and deduplication:
+`EnqueueAsync` accepts an optional `EnqueueOptions` callback for values that belong to the durable intent but are not part of the business payload.
+
+Use the payload for data the action needs to do the work. Use options for execution context, traceability, and idempotency:
 
 ```csharp
 await mule.EnqueueAsync(
@@ -164,6 +166,71 @@ await mule.EnqueueAsync(
     },
     cancellationToken);
 ```
+
+### CorrelationId
+
+Use `CorrelationId` to connect a durable action with the request, command, message, job, or workflow that produced it.
+
+It is stored with the action and exposed to the handler through `MuleActionContext<TPayload>`:
+
+```csharp
+public ValueTask ExecuteAsync(
+    MuleActionContext<CapturePayment> context,
+    CancellationToken cancellationToken)
+{
+    logger.LogInformation(
+        "Capturing payment for correlation {CorrelationId}.",
+        context.CorrelationId);
+
+    return gateway.CaptureAsync(context.Payload, cancellationToken);
+}
+```
+
+Good correlation IDs are values you already use in logs or tracing, such as a request id, order id, command id, distributed trace id, or upstream message id.
+
+### DeduplicationKey
+
+Use `DeduplicationKey` when the same logical action could be enqueued more than once and should only have one durable intent for the same `ActionKey`.
+
+Mule checks duplicates by the pair:
+
+```text
+ActionKey + DeduplicationKey
+```
+
+That means the same deduplication key can be reused safely by different action types, but two enqueues with the same action key and deduplication key represent the same logical work.
+
+Common examples:
+
+- Use an order id when sending a receipt.
+- Use a payment intent id when capturing a payment.
+- Use an external event id when reacting to a webhook.
+- Use a command id when retrying a submitted command from the foreground.
+
+The deduplication key should be stable and domain-owned. Avoid timestamps, random values, or generated ids when the goal is to prevent duplicate work.
+
+### Metadata
+
+Use `Metadata` for small string values that help with diagnostics, routing, filtering, or audit.
+
+Metadata is stored as part of the durable action and is available inside the handler:
+
+```csharp
+public ValueTask ExecuteAsync(
+    MuleActionContext<CapturePayment> context,
+    CancellationToken cancellationToken)
+{
+    var source = context.Metadata.TryGetValue("source", out var value)
+        ? value
+        : "unknown";
+
+    logger.LogInformation("Capture payment source: {Source}.", source);
+
+    return gateway.CaptureAsync(context.Payload, cancellationToken);
+}
+```
+
+Keep metadata compact. If the handler needs structured business data, put that data in the payload instead.
 
 `EnqueueAsync` does not require the handler to be present in the producer process. Producer-only services can record intents while worker services discover and execute the actions.
 
