@@ -27,6 +27,8 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Mule.Testing", "src\Mule.Te
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Mule.Testing.Tests", "tests\Mule.Testing.Tests\Mule.Testing.Tests.csproj", "{5C836F84-5900-4C9E-928D-C8FBA53E520D}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Mule.Samples.Testing", "samples\Mule.Samples.Testing\Mule.Samples.Testing.csproj", "{5E190FA9-4392-4F2E-B779-915BE39879DF}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -145,6 +147,18 @@ Global
 		{5C836F84-5900-4C9E-928D-C8FBA53E520D}.Release|x64.Build.0 = Release|Any CPU
 		{5C836F84-5900-4C9E-928D-C8FBA53E520D}.Release|x86.ActiveCfg = Release|Any CPU
 		{5C836F84-5900-4C9E-928D-C8FBA53E520D}.Release|x86.Build.0 = Release|Any CPU
+		{5E190FA9-4392-4F2E-B779-915BE39879DF}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{5E190FA9-4392-4F2E-B779-915BE39879DF}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{5E190FA9-4392-4F2E-B779-915BE39879DF}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{5E190FA9-4392-4F2E-B779-915BE39879DF}.Debug|x64.Build.0 = Debug|Any CPU
+		{5E190FA9-4392-4F2E-B779-915BE39879DF}.Debug|x86.ActiveCfg = Debug|Any CPU
+		{5E190FA9-4392-4F2E-B779-915BE39879DF}.Debug|x86.Build.0 = Debug|Any CPU
+		{5E190FA9-4392-4F2E-B779-915BE39879DF}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{5E190FA9-4392-4F2E-B779-915BE39879DF}.Release|Any CPU.Build.0 = Release|Any CPU
+		{5E190FA9-4392-4F2E-B779-915BE39879DF}.Release|x64.ActiveCfg = Release|Any CPU
+		{5E190FA9-4392-4F2E-B779-915BE39879DF}.Release|x64.Build.0 = Release|Any CPU
+		{5E190FA9-4392-4F2E-B779-915BE39879DF}.Release|x86.ActiveCfg = Release|Any CPU
+		{5E190FA9-4392-4F2E-B779-915BE39879DF}.Release|x86.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
@@ -159,5 +173,6 @@ Global
 		{E6DFAD32-0756-44D6-A709-A2C155FB4CCB} = {5D20AA90-6969-D8BD-9DCD-8634F4692FDA}
 		{F9265C6F-AB03-4640-B64C-AD1B310B49C2} = {827E0CD3-B72D-47B6-A68D-7590B98EB39B}
 		{5C836F84-5900-4C9E-928D-C8FBA53E520D} = {0AB3BF05-4346-4AA6-1389-037BE0695223}
+		{5E190FA9-4392-4F2E-B779-915BE39879DF} = {5D20AA90-6969-D8BD-9DCD-8634F4692FDA}
 	EndGlobalSection
 EndGlobal

@@ -11,6 +11,7 @@ All notable changes to Mule packages will be documented in this file.
 - Added configurable cleanup modes: disabled, polling, and scheduled.
 - Added automatic EF Core model integration through `UseEntityFrameworkCore<TDbContext>()`.
 - Added `Mule.DurableActions.Testing` package with an in-memory Mule test harness.
+- Added testing sample project showing `UseTesting()` and `IMuleTestHarness`.
 
 ### Changed
 
