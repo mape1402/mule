@@ -12,11 +12,13 @@ Mule provides **at-least-once execution**. Actions should be idempotent, or you 
 dotnet add package Mule.DurableActions
 dotnet add package Mule.DurableActions.InMemory
 dotnet add package Mule.DurableActions.EntityFrameworkCore
+dotnet add package Mule.DurableActions.Testing
 ```
 
 - `Mule.DurableActions`: core API, dispatcher, registration, serialization, and contracts.
 - `Mule.DurableActions.InMemory`: in-memory provider for tests, samples, and local experiments.
 - `Mule.DurableActions.EntityFrameworkCore`: EF Core provider for durable storage.
+- `Mule.DurableActions.Testing`: test harness helpers for durable action assertions.
 
 Package IDs are descriptive, but namespaces stay short:
 
@@ -266,6 +268,30 @@ The snapshot includes:
 - failed count
 - oldest pending timestamp
 - oldest failed timestamp
+
+## Testing
+
+Use the testing package to register Mule with in-memory storage and a test harness:
+
+```csharp
+services.AddMule(mule => mule
+    .UseTesting()
+    .AddActionsFromAssemblyContaining<SendReceiptAction>());
+```
+
+Then wait for actions deterministically in tests:
+
+```csharp
+var actionId = await mule.EnqueueAsync(
+    BillingActionKeys.CapturePayment,
+    new CapturePayment(orderId, amount),
+    cancellationToken);
+
+var harness = provider.GetRequiredService<IMuleTestHarness>();
+var action = await harness.WaitForActionAsync(
+    actionId,
+    DurableActionStatus.Completed);
+```
 
 ## Manual Registration
 

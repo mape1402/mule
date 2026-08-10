@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <IsPackable>true</IsPackable>
+    <PackageId>Mule.DurableActions.Testing</PackageId>
+    <Title>Mule Durable Actions Testing</Title>
+    <PackageType>Dependency</PackageType>
+    <Description>Testing helpers for Mule durable actions, including an in-memory test harness for inspecting and awaiting action execution.</Description>
+    <PackageTags>$(PackageTags);testing;test-harness;assertions</PackageTags>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Mule.InMemory\Mule.InMemory.csproj" />
+  </ItemGroup>
+
+</Project>
