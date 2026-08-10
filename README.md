@@ -26,6 +26,7 @@ Package IDs are descriptive, but namespaces stay short:
 using Mule;
 using Mule.InMemory;
 using Mule.EntityFrameworkCore;
+using Mule.Testing;
 ```
 
 ## Concepts
@@ -313,7 +314,7 @@ mule.For<PaymentGateway, CapturePayment>(
 
 Use these overloads sparingly in large applications. Discovery keeps startup composition clean as action count grows.
 
-## Sample
+## Samples
 
 Run the basic sample:
 
@@ -326,4 +327,17 @@ Expected output:
 ```text
 Sending receipt for order-1001 to mario@example.com.
 Action samples.send-receipt.v1 finished with status Completed.
+```
+
+Run the testing sample:
+
+```bash
+dotnet run --project samples/Mule.Samples.Testing/Mule.Samples.Testing.csproj --framework net8.0
+```
+
+Expected output:
+
+```text
+Observed action samples.testing.send-receipt.v1 with status Completed.
+Captured receipt for order-1001 to mario@example.com.
 ```
