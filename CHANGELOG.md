@@ -2,6 +2,20 @@
 
 All notable changes to Mule packages will be documented in this file.
 
+## [v1.1.0] - 2026-08-09
+
+### Added
+
+- Added chainable provider configuration through the Mule registration builder.
+- Added scheduled recovery mode for retrying pending work without constant storage polling.
+- Added configurable cleanup modes: disabled, polling, and scheduled.
+- Added automatic EF Core model integration through `UseEntityFrameworkCore<TDbContext>()`.
+
+### Changed
+
+- Changed EF Core locking to use atomic conditional claims for safer execution across multiple service replicas.
+- Updated documentation and sample code to use the chainable Mule configuration style.
+
 ## [v1.0.1] - 2026-08-08
 
 ### Fixed
