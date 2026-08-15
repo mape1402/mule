@@ -169,11 +169,11 @@ public sealed class InMemoryMuleIntegrationTests
         using var host = CreateHost();
         var scopeFactory = host.Services.GetRequiredService<IServiceScopeFactory>();
 
-        await Task.WhenAll(Enumerable.Range(0, 25).Select(_ =>
+        var ids = await Task.WhenAll(Enumerable.Range(0, 25).Select(async _ =>
         {
             using var scope = scopeFactory.CreateScope();
             var client = scope.ServiceProvider.GetRequiredService<IMuleClient>();
-            return client.EnqueueAsync(
+            return await client.EnqueueAsync(
                     Key,
                     new TestPayload("duplicate"),
                     options => options.DeduplicationKey = "order-1001")
@@ -184,6 +184,8 @@ public sealed class InMemoryMuleIntegrationTests
         var diagnostics = await host.Services.GetRequiredService<IMuleDiagnostics>().GetSnapshotAsync();
 
         Assert.Single(actions);
+        Assert.Single(ids.Distinct());
+        Assert.Equal(ids[0], Assert.Single(actions).Id);
         Assert.Equal(24, diagnostics.DuplicatesIgnored);
     }
 
@@ -256,6 +258,30 @@ public sealed class InMemoryMuleIntegrationTests
         await host.StopAsync();
 
         Assert.True(elapsed < TimeSpan.FromMilliseconds(450), $"Fast lane was blocked by slow lane for {elapsed}.");
+    }
+
+    [Fact]
+    public async Task HostedService_Should_Process_Thousands_Of_Actions()
+    {
+        using var host = CreateHost(configureSettings: settings =>
+        {
+            settings.WorkerCount = 8;
+            settings.MaxDegreeOfParallelism = 16;
+            settings.DispatchBatchSize = 100;
+        });
+        await host.StartAsync();
+
+        using var scope = host.Services.CreateScope();
+        var client = scope.ServiceProvider.GetRequiredService<IMuleClient>();
+
+        await Task.WhenAll(Enumerable.Range(0, 2_000).Select(index =>
+            client.EnqueueAsync(Key, new TestPayload($"stress-{index}")).AsTask()));
+
+        var probe = host.Services.GetRequiredService<TestProbe>();
+        await probe.WaitForCountAsync(2_000, TimeSpan.FromSeconds(10));
+        await host.StopAsync();
+
+        Assert.Equal(2_000, probe.Values.Count);
     }
 
     private static IHost CreateHost(
@@ -351,15 +377,18 @@ public sealed class InMemoryMuleIntegrationTests
         }
 
         public async Task WaitForCountAsync(int count)
-        {
-            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+            => await WaitForCountAsync(count, TimeSpan.FromSeconds(3));
 
-            while (!timeout.IsCancellationRequested)
+        public async Task WaitForCountAsync(int count, TimeSpan timeout)
+        {
+            using var timeoutSource = new CancellationTokenSource(timeout);
+
+            while (!timeoutSource.IsCancellationRequested)
             {
                 if (Values.Count >= count)
                     return;
 
-                await Task.Delay(25, timeout.Token);
+                await Task.Delay(25, timeoutSource.Token);
             }
         }
 

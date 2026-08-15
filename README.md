@@ -224,6 +224,8 @@ The deduplication key should be stable and domain-owned. Avoid timestamps, rando
 
 Storage providers enforce deduplication at write time. When a duplicate is detected, Mule treats the enqueue as an idempotent success and keeps the existing durable action.
 
+When the duplicate already exists, `EnqueueAsync` returns the existing action id instead of the transient id from the ignored enqueue attempt. This lets callers safely correlate follow-up work with the durable row that Mule will execute.
+
 ### Metadata
 
 Use `Metadata` for small string values that help with diagnostics, routing, filtering, or audit.
@@ -298,6 +300,8 @@ await db.Database.EnsureCreatedAsync();
 
 `UseEntityFrameworkMule(...)` and `MuleDbContext` remain available for standalone storage, but `UseEntityFrameworkCore<TDbContext>()` is the recommended integration for applications that already have a DbContext.
 
+For existing SQL Server installations upgrading to the lane and latency model, use [docs/sql-server-upgrade-1.2.0.sql](/C:/elysium/mule/docs/sql-server-upgrade-1.2.0.sql) as the reference migration. It adds lane and runtime timestamp columns, creates the filtered deduplication constraint, and adds the lane/status/due-date index used by the dispatcher.
+
 ## Dispatcher Settings
 
 Configure concurrency, retry, recovery, locking, and cleanup through `MuleSettings`:
@@ -325,6 +329,8 @@ services.AddMule(mule => mule
             WorkerCount = 2,
             MaxDegreeOfParallelism = 8,
             DispatchBatchSize = 100,
+            DispatchQueueCapacity = 1_000,
+            PollingInterval = TimeSpan.FromSeconds(2),
             RetryPolicy = new MuleRetryPolicy
             {
                 MaxAttempts = 12,
@@ -355,9 +361,13 @@ services.AddMule(mule => mule
 
 `DispatchQueueCapacity` controls the in-memory immediate dispatch queue capacity. Use `0` for an unbounded queue.
 
+Lane-level `DispatchQueueCapacity` lets a busy lane absorb foreground enqueue bursts without letting that lane consume the full process queue. If omitted or set to `0`, the lane uses the global queue capacity.
+
+Lane-level `PollingInterval` controls how often that lane checks durable storage when `RecoveryMode` is `Polling`. If omitted or set to `TimeSpan.Zero`, the lane uses the global `DispatchInterval`.
+
 `LockTimeout` is the lease duration. If a process dies while an action is locked, the action becomes claimable again after the lock expires.
 
-Lane settings override the global worker count, batch size, parallelism, retry delay, max attempts, and priority for actions enqueued into that lane.
+Lane settings override the global worker count, batch size, queue capacity, polling interval, parallelism, retry delay, max attempts, and priority for actions enqueued into that lane.
 
 `RetryPolicy` can be configured globally or per lane. It supports fixed, linear, and exponential backoff, optional max delay, and optional jitter:
 
@@ -381,6 +391,8 @@ Lanes with higher `Priority` are claimed before lower-priority lanes during reco
 - `Polling`: checks storage every `DispatchInterval`.
 - `Scheduled`: checks storage on startup, then wakes when an action is due for retry or when immediate dispatch is disabled and new work is persisted.
 
+Use `Polling` when another process may insert work without notifying the current process, or when you prefer a simple heartbeat. Use `Scheduled` when Mule owns the enqueue path in the current application and you want to avoid storage polling while there is no pending or failed work.
+
 `CleanupMode` controls completed action retention:
 
 - `Disabled`: completed actions are kept for audit/history.
@@ -388,6 +400,8 @@ Lanes with higher `Priority` are claimed before lower-priority lanes during reco
 - `Scheduled`: cleanup wakes when completed actions reach `CompletedRetention`.
 
 Mule uses atomic storage claims and locks so multiple service replicas can run workers at the same time without intentionally executing the same locked action concurrently. Actions should still be idempotent because Mule provides at-least-once execution.
+
+SQL Server claims use update locks with `READPAST`, so a replica may skip rows that another replica is locking at that exact moment. That is expected: later waves or later polling cycles can claim the remaining rows without duplicating work.
 
 ## Diagnostics
 
@@ -445,6 +459,8 @@ var action = await harness.WaitForActionAsync(
     actionId,
     DurableActionStatus.Completed);
 ```
+
+The EF Core test suite includes optional SQL Server integration tests. Set `MULE_SQLSERVER_CONNECTION_STRING` to run them locally; without that variable, they are skipped. The tests create and drop temporary databases and validate concurrent deduplication plus atomic claiming across replica-like workers.
 
 ## Manual Registration
 

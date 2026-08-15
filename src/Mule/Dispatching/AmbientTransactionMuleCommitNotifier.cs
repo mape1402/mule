@@ -24,7 +24,7 @@ internal sealed class AmbientTransactionMuleCommitNotifier : IMuleCommitNotifier
         _logger = logger ?? NullLogger<AmbientTransactionMuleCommitNotifier>.Instance;
     }
 
-    public async ValueTask NotifySavedAsync(Guid actionId, CancellationToken cancellationToken = default)
+    public async ValueTask NotifySavedAsync(Guid actionId, string lane, CancellationToken cancellationToken = default)
     {
         if (!_settings.ImmediateDispatch)
         {
@@ -38,7 +38,7 @@ internal sealed class AmbientTransactionMuleCommitNotifier : IMuleCommitNotifier
 
         if (transaction == null)
         {
-            await _dispatchQueue.EnqueueAsync(actionId, cancellationToken);
+            await _dispatchQueue.EnqueueAsync(actionId, lane, cancellationToken);
             return;
         }
 
@@ -47,15 +47,15 @@ internal sealed class AmbientTransactionMuleCommitNotifier : IMuleCommitNotifier
             if (args.Transaction.TransactionInformation.Status != TransactionStatus.Committed)
                 return;
 
-            ThreadPool.QueueUserWorkItem(_ => _ = EnqueueCommittedActionAsync(actionId));
+            ThreadPool.QueueUserWorkItem(_ => _ = EnqueueCommittedActionAsync(actionId, lane));
         };
     }
 
-    private async Task EnqueueCommittedActionAsync(Guid actionId)
+    private async Task EnqueueCommittedActionAsync(Guid actionId, string lane)
     {
         try
         {
-            await _dispatchQueue.EnqueueAsync(actionId);
+            await _dispatchQueue.EnqueueAsync(actionId, lane);
         }
         catch (Exception ex)
         {

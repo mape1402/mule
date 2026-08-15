@@ -53,8 +53,14 @@ internal sealed class MuleClient : IMuleClient
 
         await _storage.AddAsync(action, cancellationToken);
         await _storage.SaveChangesAsync(cancellationToken);
-        await _commitNotifier.NotifySavedAsync(action.Id, cancellationToken);
 
-        return action.Id;
+        var actionId = action.Id;
+        if (!string.IsNullOrWhiteSpace(action.DeduplicationKey))
+            actionId = await _storage.FindByDeduplicationKeyAsync(action.Key, action.DeduplicationKey, cancellationToken)
+                ?? action.Id;
+
+        await _commitNotifier.NotifySavedAsync(actionId, action.Lane, cancellationToken);
+
+        return actionId;
     }
 }

@@ -29,6 +29,20 @@ internal sealed class InMemoryMuleStore
         }
     }
 
+    public Guid? FindByDeduplicationKey(ActionKey key, string deduplicationKey)
+    {
+        if (string.IsNullOrWhiteSpace(deduplicationKey))
+            return null;
+
+        lock (_gate)
+        {
+            return _actions
+                .Where(x => x.Key == key && x.DeduplicationKey == deduplicationKey)
+                .Select(x => (Guid?)x.Id)
+                .FirstOrDefault();
+        }
+    }
+
     public IReadOnlyCollection<DurableAction> ClaimPending(string lane, int batchSize, TimeSpan lockTimeout, DateTimeOffset now)
     {
         lock (_gate)

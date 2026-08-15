@@ -33,10 +33,28 @@ internal class EntityFrameworkMuleStorage<TDbContext> : IMuleStorage, IDisposabl
                 cancellationToken);
 
             if (exists)
+            {
+                _metrics.RecordDuplicateIgnored();
                 return;
+            }
         }
 
         await Actions.AddAsync(action, cancellationToken);
+    }
+
+    public async Task<Guid?> FindByDeduplicationKeyAsync(
+        ActionKey key,
+        string deduplicationKey,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(deduplicationKey))
+            return null;
+
+        return await Actions
+            .AsNoTracking()
+            .Where(x => x.Key == key && x.DeduplicationKey == deduplicationKey)
+            .Select(x => (Guid?)x.Id)
+            .FirstOrDefaultAsync(cancellationToken);
     }
 
     public async Task<IReadOnlyCollection<DurableAction>> ClaimPendingAsync(
