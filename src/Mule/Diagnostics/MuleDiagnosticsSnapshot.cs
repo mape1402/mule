@@ -16,6 +16,10 @@ public sealed class MuleDiagnosticsSnapshot
 
     public int ThroughputPerMinute { get; init; }
 
+    public int RuntimeCompleted { get; init; }
+
+    public int RuntimeFailed { get; init; }
+
     public DateTimeOffset? OldestPendingOnUtc { get; init; }
 
     public DateTimeOffset? OldestLockedOnUtc { get; init; }

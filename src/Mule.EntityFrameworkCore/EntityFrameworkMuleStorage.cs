@@ -4,18 +4,21 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
 using Microsoft.EntityFrameworkCore.Metadata;
 using Microsoft.EntityFrameworkCore.Storage;
+using Mule.Diagnostics;
 
 internal class EntityFrameworkMuleStorage<TDbContext> : IMuleStorage, IDisposable, IAsyncDisposable
     where TDbContext : DbContext
 {
     private readonly TDbContext _dbContext;
+    private readonly MuleRuntimeMetrics _metrics;
 
-    public EntityFrameworkMuleStorage(IMuleDbContextFactory<TDbContext> dbContextFactory)
+    public EntityFrameworkMuleStorage(IMuleDbContextFactory<TDbContext> dbContextFactory, MuleRuntimeMetrics metrics)
     {
         if (dbContextFactory == null)
             throw new ArgumentNullException(nameof(dbContextFactory));
 
         _dbContext = dbContextFactory.CreateDbContext();
+        _metrics = metrics ?? throw new ArgumentNullException(nameof(metrics));
     }
 
     public async Task AddAsync(DurableAction action, CancellationToken cancellationToken = default)
@@ -173,6 +176,8 @@ internal class EntityFrameworkMuleStorage<TDbContext> : IMuleStorage, IDisposabl
         {
             foreach (var entry in _dbContext.ChangeTracker.Entries<DurableAction>().Where(x => x.State == EntityState.Added))
                 entry.State = EntityState.Detached;
+
+            _metrics.RecordDuplicateIgnored();
         }
     }
 
@@ -355,8 +360,8 @@ WHERE {{names.Id}} = {2}
 
 internal sealed class EntityFrameworkMuleStorage : EntityFrameworkMuleStorage<MuleDbContext>
 {
-    public EntityFrameworkMuleStorage(IMuleDbContextFactory<MuleDbContext> dbContextFactory)
-        : base(dbContextFactory)
+    public EntityFrameworkMuleStorage(IMuleDbContextFactory<MuleDbContext> dbContextFactory, MuleRuntimeMetrics metrics)
+        : base(dbContextFactory, metrics)
     {
     }
 }

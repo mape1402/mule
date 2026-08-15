@@ -30,6 +30,8 @@ public sealed class MuleSettings
 
     public TimeSpan RetryDelay { get; set; } = TimeSpan.FromSeconds(30);
 
+    public MuleRetryPolicy RetryPolicy { get; set; }
+
     public TimeSpan LockTimeout { get; set; } = TimeSpan.FromMinutes(5);
 
     public IDictionary<string, MuleLaneSettings> Lanes { get; } = new Dictionary<string, MuleLaneSettings>(StringComparer.OrdinalIgnoreCase);

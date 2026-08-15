@@ -42,6 +42,10 @@ public sealed class InMemoryMuleIntegrationTests
 
         var action = Assert.Single(host.Services.GetRequiredService<IInMemoryMule>().Actions);
         Assert.Equal(DurableActionStatus.Completed, action.Status);
+
+        var diagnostics = await host.Services.GetRequiredService<IMuleDiagnostics>().GetSnapshotAsync();
+        Assert.True(diagnostics.ThroughputPerMinute >= 1);
+        Assert.True(diagnostics.RuntimeCompleted >= 1);
     }
 
     [Fact]

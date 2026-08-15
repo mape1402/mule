@@ -325,8 +325,14 @@ services.AddMule(mule => mule
             WorkerCount = 2,
             MaxDegreeOfParallelism = 8,
             DispatchBatchSize = 100,
-            RetryDelay = TimeSpan.FromSeconds(10),
-            MaxAttempts = 12,
+            RetryPolicy = new MuleRetryPolicy
+            {
+                MaxAttempts = 12,
+                Delay = TimeSpan.FromSeconds(10),
+                MaxDelay = TimeSpan.FromMinutes(2),
+                Backoff = MuleRetryBackoff.Exponential,
+                JitterRatio = 0.10
+            },
             Priority = 10
         };
 
@@ -352,6 +358,23 @@ services.AddMule(mule => mule
 `LockTimeout` is the lease duration. If a process dies while an action is locked, the action becomes claimable again after the lock expires.
 
 Lane settings override the global worker count, batch size, parallelism, retry delay, max attempts, and priority for actions enqueued into that lane.
+
+`RetryPolicy` can be configured globally or per lane. It supports fixed, linear, and exponential backoff, optional max delay, and optional jitter:
+
+```csharp
+settings.RetryPolicy = new MuleRetryPolicy
+{
+    MaxAttempts = 10,
+    Delay = TimeSpan.FromSeconds(15),
+    MaxDelay = TimeSpan.FromMinutes(5),
+    Backoff = MuleRetryBackoff.Exponential,
+    JitterRatio = 0.15
+};
+```
+
+The older `MaxAttempts` and `RetryDelay` settings remain supported. Mule uses them when no `RetryPolicy` is configured.
+
+Lanes with higher `Priority` are claimed before lower-priority lanes during recovery cycles. Lanes with the same priority are processed together.
 
 `RecoveryMode` controls how pending work is recovered:
 
@@ -384,6 +407,8 @@ The snapshot includes:
 - expired lock count
 - duplicates ignored by idempotency
 - throughput per minute
+- runtime completed count
+- runtime failed count
 - oldest pending timestamp
 - oldest locked timestamp
 - oldest failed timestamp
