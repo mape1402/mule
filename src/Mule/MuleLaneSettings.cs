@@ -16,5 +16,7 @@ public sealed class MuleLaneSettings
 
     public TimeSpan RetryDelay { get; set; } = TimeSpan.FromSeconds(30);
 
+    public MuleRetryPolicy RetryPolicy { get; set; }
+
     public int Priority { get; set; }
 }

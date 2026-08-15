@@ -9,14 +9,19 @@ internal class EntityFrameworkMuleDiagnostics<TDbContext> : IMuleDiagnostics, ID
 {
     private readonly TDbContext _dbContext;
     private readonly MuleSettings _settings;
+    private readonly MuleRuntimeMetrics _metrics;
 
-    public EntityFrameworkMuleDiagnostics(IMuleDbContextFactory<TDbContext> dbContextFactory, IOptions<MuleSettings> settings)
+    public EntityFrameworkMuleDiagnostics(
+        IMuleDbContextFactory<TDbContext> dbContextFactory,
+        IOptions<MuleSettings> settings,
+        MuleRuntimeMetrics metrics)
     {
         if (dbContextFactory == null)
             throw new ArgumentNullException(nameof(dbContextFactory));
 
         _dbContext = dbContextFactory.CreateDbContext();
         _settings = settings?.Value ?? throw new ArgumentNullException(nameof(settings));
+        _metrics = metrics ?? throw new ArgumentNullException(nameof(metrics));
     }
 
     public async Task<MuleDiagnosticsSnapshot> GetSnapshotAsync(CancellationToken cancellationToken = default)
@@ -25,6 +30,7 @@ internal class EntityFrameworkMuleDiagnostics<TDbContext> : IMuleDiagnostics, ID
         var now = DateTimeOffset.UtcNow;
         var lockExpiration = now.Subtract(GetLockTimeout());
         var throughputSinceUtc = now.AddMinutes(-1);
+        var runtime = _metrics.GetSnapshot(now);
 
         var pendingDates = await actions
             .Where(x => x.Status == DurableActionStatus.Pending)
@@ -88,7 +94,10 @@ internal class EntityFrameworkMuleDiagnostics<TDbContext> : IMuleDiagnostics, ID
             Completed = await actions.CountAsync(x => x.Status == DurableActionStatus.Completed, cancellationToken),
             Failed = await actions.CountAsync(x => x.Status == DurableActionStatus.Failed, cancellationToken),
             LockExpired = lockedDates.Count(x => x <= lockExpiration),
-            ThroughputPerMinute = completedDates.Count(x => x >= throughputSinceUtc),
+            DuplicatesIgnored = runtime.DuplicatesIgnored,
+            ThroughputPerMinute = Math.Max(runtime.ThroughputPerMinute, completedDates.Count(x => x >= throughputSinceUtc)),
+            RuntimeCompleted = runtime.Completed,
+            RuntimeFailed = runtime.Failed,
             OldestPendingOnUtc = oldestPendingOnUtc,
             OldestLockedOnUtc = oldestLockedOnUtc,
             OldestFailedOnUtc = failedDates.Count == 0 ? null : failedDates.Min(),
@@ -128,8 +137,11 @@ internal class EntityFrameworkMuleDiagnostics<TDbContext> : IMuleDiagnostics, ID
 
 internal sealed class EntityFrameworkMuleDiagnostics : EntityFrameworkMuleDiagnostics<MuleDbContext>
 {
-    public EntityFrameworkMuleDiagnostics(IMuleDbContextFactory<MuleDbContext> dbContextFactory, IOptions<MuleSettings> settings)
-        : base(dbContextFactory, settings)
+    public EntityFrameworkMuleDiagnostics(
+        IMuleDbContextFactory<MuleDbContext> dbContextFactory,
+        IOptions<MuleSettings> settings,
+        MuleRuntimeMetrics metrics)
+        : base(dbContextFactory, settings, metrics)
     {
     }
 }

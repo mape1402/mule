@@ -4,6 +4,7 @@ using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Hosting;
 using Mule;
 using Mule.Configuration;
+using Mule.Diagnostics;
 using Mule.Dispatching;
 
 public static class MuleServiceCollectionExtensions
@@ -17,6 +18,7 @@ public static class MuleServiceCollectionExtensions
 
         services.AddOptions<MuleSettings>();
         services.TryAddSingleton<IMuleSerializer, JsonMuleSerializer>();
+        services.TryAddSingleton<MuleRuntimeMetrics>();
         services.TryAddSingleton<MuleActionRegistry>();
         services.TryAddSingleton<IMuleActionRegistry>(provider => provider.GetRequiredService<MuleActionRegistry>());
         services.TryAddSingleton<IMuleDispatchQueue, ChannelMuleDispatchQueue>();

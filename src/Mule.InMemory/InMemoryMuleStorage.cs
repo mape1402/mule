@@ -1,15 +1,18 @@
 namespace Mule.InMemory;
 
 using System.Transactions;
+using Mule.Diagnostics;
 
 internal sealed class InMemoryMuleStorage : IMuleStorage
 {
     private readonly InMemoryMuleStore _store;
+    private readonly MuleRuntimeMetrics _metrics;
     private readonly List<DurableAction> _pendingAdds = new();
 
-    public InMemoryMuleStorage(InMemoryMuleStore store)
+    public InMemoryMuleStorage(InMemoryMuleStore store, MuleRuntimeMetrics metrics)
     {
         _store = store ?? throw new ArgumentNullException(nameof(store));
+        _metrics = metrics ?? throw new ArgumentNullException(nameof(metrics));
     }
 
     public Task AddAsync(DurableAction action, CancellationToken cancellationToken = default)
@@ -88,6 +91,9 @@ internal sealed class InMemoryMuleStorage : IMuleStorage
     private void Commit(IEnumerable<DurableAction> actions)
     {
         foreach (var action in actions)
-            _store.Add(action);
+        {
+            if (!_store.Add(action))
+                _metrics.RecordDuplicateIgnored();
+        }
     }
 }

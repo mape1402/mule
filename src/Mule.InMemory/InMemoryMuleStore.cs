@@ -6,7 +6,6 @@ internal sealed class InMemoryMuleStore
 {
     private readonly object _gate = new();
     private readonly List<DurableAction> _actions = new();
-    private int _duplicatesIgnored;
 
     public IReadOnlyCollection<DurableAction> Actions
     {
@@ -17,18 +16,16 @@ internal sealed class InMemoryMuleStore
         }
     }
 
-    public void Add(DurableAction action)
+    public bool Add(DurableAction action)
     {
         lock (_gate)
         {
             if (!string.IsNullOrWhiteSpace(action.DeduplicationKey) &&
                 _actions.Any(x => x.Key == action.Key && x.DeduplicationKey == action.DeduplicationKey))
-            {
-                _duplicatesIgnored++;
-                return;
-            }
+                return false;
 
             _actions.Add(Clone(action));
+            return true;
         }
     }
 
@@ -166,7 +163,7 @@ internal sealed class InMemoryMuleStore
         }
     }
 
-    public MuleDiagnosticsSnapshot GetSnapshot(TimeSpan lockTimeout)
+    public MuleDiagnosticsSnapshot GetSnapshot(TimeSpan lockTimeout, MuleRuntimeMetricsSnapshot runtime)
     {
         lock (_gate)
         {
@@ -191,8 +188,12 @@ internal sealed class InMemoryMuleStore
                 Completed = _actions.Count(x => x.Status == DurableActionStatus.Completed),
                 Failed = _actions.Count(x => x.Status == DurableActionStatus.Failed),
                 LockExpired = _actions.Count(x => x.Status == DurableActionStatus.Locked && x.LockedOnUtc <= lockExpiration),
-                DuplicatesIgnored = _duplicatesIgnored,
-                ThroughputPerMinute = _actions.Count(x => x.Status == DurableActionStatus.Completed && x.CompletedOnUtc >= throughputSinceUtc),
+                DuplicatesIgnored = runtime.DuplicatesIgnored,
+                ThroughputPerMinute = Math.Max(
+                    runtime.ThroughputPerMinute,
+                    _actions.Count(x => x.Status == DurableActionStatus.Completed && x.CompletedOnUtc >= throughputSinceUtc)),
+                RuntimeCompleted = runtime.Completed,
+                RuntimeFailed = runtime.Failed,
                 OldestPendingOnUtc = oldestPendingOnUtc,
                 OldestLockedOnUtc = oldestLockedOnUtc,
                 OldestFailedOnUtc = _actions
