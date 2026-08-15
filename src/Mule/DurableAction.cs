@@ -6,6 +6,8 @@ public sealed class DurableAction
 
     public ActionKey Key { get; set; }
 
+    public string Lane { get; set; } = MuleSettings.DefaultLane;
+
     public string Payload { get; set; }
 
     public string PayloadType { get; set; }
@@ -26,7 +28,11 @@ public sealed class DurableAction
 
     public DateTimeOffset? LockedOnUtc { get; set; }
 
+    public DateTimeOffset? StartedOnUtc { get; set; }
+
     public DateTimeOffset? NextAttemptOnUtc { get; set; }
 
     public DateTimeOffset? CompletedOnUtc { get; set; }
+
+    public DateTimeOffset? TerminalOnUtc { get; set; }
 }

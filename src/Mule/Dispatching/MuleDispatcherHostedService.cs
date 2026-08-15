@@ -12,6 +12,8 @@ internal sealed class MuleDispatcherHostedService : BackgroundService
     private readonly MuleSchedulerSignal _schedulerSignal;
     private readonly MuleSettings _settings;
     private readonly ILogger<MuleDispatcherHostedService> _logger;
+    private readonly Dictionary<string, SemaphoreSlim> _laneSemaphores;
+    private readonly object _laneSemaphoreGate = new();
 
     public MuleDispatcherHostedService(
         IServiceScopeFactory scopeFactory,
@@ -25,11 +27,19 @@ internal sealed class MuleDispatcherHostedService : BackgroundService
         _schedulerSignal = schedulerSignal ?? throw new ArgumentNullException(nameof(schedulerSignal));
         _settings = settings?.Value ?? throw new ArgumentNullException(nameof(settings));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        _laneSemaphores = GetLaneNames()
+            .ToDictionary(
+                lane => lane,
+                lane => new SemaphoreSlim(GetMaxDegreeOfParallelism(lane)),
+                StringComparer.OrdinalIgnoreCase);
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        var queueWorker = ProcessQueuedActionsAsync(stoppingToken);
+        var queueWorkers = Enumerable
+            .Range(0, GetWorkerCount(MuleSettings.DefaultLane))
+            .Select(_ => ProcessQueuedActionsAsync(stoppingToken))
+            .ToArray();
         var recoveryWorker = _settings.RecoveryMode == MuleRecoveryMode.Scheduled
             ? RecoverPendingActionsOnScheduleAsync(stoppingToken)
             : RecoverPendingActionsByPollingAsync(stoppingToken);
@@ -40,7 +50,7 @@ internal sealed class MuleDispatcherHostedService : BackgroundService
             _ => CleanCompletedByPollingAsync(stoppingToken)
         };
 
-        await Task.WhenAll(queueWorker, recoveryWorker, cleanupWorker);
+        await Task.WhenAll(queueWorkers.Append(recoveryWorker).Append(cleanupWorker));
     }
 
     private async Task ProcessQueuedActionsAsync(CancellationToken cancellationToken)
@@ -50,7 +60,7 @@ internal sealed class MuleDispatcherHostedService : BackgroundService
             try
             {
                 var actionId = await _dispatchQueue.DequeueAsync(cancellationToken);
-                await DispatchActionAsync(actionId, cancellationToken);
+                await DispatchQueuedActionAsync(actionId, cancellationToken);
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
@@ -69,7 +79,7 @@ internal sealed class MuleDispatcherHostedService : BackgroundService
         {
             try
             {
-                await QueuePendingActionsAsync(cancellationToken);
+                await ClaimAndDispatchPendingActionsAsync(cancellationToken);
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
@@ -90,7 +100,7 @@ internal sealed class MuleDispatcherHostedService : BackgroundService
         {
             try
             {
-                await QueuePendingActionsAsync(cancellationToken);
+                await ClaimAndDispatchPendingActionsAsync(cancellationToken);
                 var nextPendingOnUtc = await GetNextPendingOnUtcAsync(cancellationToken);
                 await WaitForRecoveryAsync(nextPendingOnUtc, cancellationToken);
             }
@@ -149,14 +159,24 @@ internal sealed class MuleDispatcherHostedService : BackgroundService
         }
     }
 
-    private async Task QueuePendingActionsAsync(CancellationToken cancellationToken)
+    private async Task ClaimAndDispatchPendingActionsAsync(CancellationToken cancellationToken)
+    {
+        var tasks = GetLaneNames()
+            .SelectMany(lane => Enumerable
+                .Range(0, GetWorkerCount(lane))
+                .Select(_ => ClaimAndDispatchLaneAsync(lane, cancellationToken)))
+            .ToArray();
+
+        await Task.WhenAll(tasks);
+    }
+
+    private async Task ClaimAndDispatchLaneAsync(string lane, CancellationToken cancellationToken)
     {
         using var scope = _scopeFactory.CreateScope();
         var storage = scope.ServiceProvider.GetRequiredService<IMuleStorage>();
-        var actions = await storage.LockPendingAsync(GetDispatchBatchSize(), GetLockTimeout(), DateTimeOffset.UtcNow, cancellationToken);
+        var actions = await storage.ClaimPendingAsync(lane, GetDispatchBatchSize(lane), GetLockTimeout(), DateTimeOffset.UtcNow, cancellationToken);
 
-        foreach (var action in actions)
-            await _dispatchQueue.EnqueueAsync(action.Id, cancellationToken);
+        await Task.WhenAll(actions.Select(action => DispatchClaimedActionAsync(action, cancellationToken)));
     }
 
     private async Task<DateTimeOffset?> GetNextPendingOnUtcAsync(CancellationToken cancellationToken)
@@ -166,7 +186,7 @@ internal sealed class MuleDispatcherHostedService : BackgroundService
         return await storage.GetNextPendingOnUtcAsync(GetLockTimeout(), DateTimeOffset.UtcNow, cancellationToken);
     }
 
-    private async Task DispatchActionAsync(Guid actionId, CancellationToken cancellationToken)
+    private async Task DispatchQueuedActionAsync(Guid actionId, CancellationToken cancellationToken)
     {
         using var scope = _scopeFactory.CreateScope();
         var storage = scope.ServiceProvider.GetRequiredService<IMuleStorage>();
@@ -177,6 +197,36 @@ internal sealed class MuleDispatcherHostedService : BackgroundService
 
         await storage.SaveChangesAsync(cancellationToken);
 
+        await DispatchActionAsync(action, cancellationToken);
+    }
+
+    private async Task DispatchClaimedActionAsync(DurableAction action, CancellationToken cancellationToken)
+    {
+        if (action == null)
+            return;
+
+        await DispatchActionAsync(action, cancellationToken);
+    }
+
+    private async Task DispatchActionAsync(DurableAction action, CancellationToken cancellationToken)
+    {
+        var semaphore = GetLaneSemaphore(action.Lane);
+        await semaphore.WaitAsync(cancellationToken);
+
+        try
+        {
+            await ExecuteActionAsync(action, cancellationToken);
+        }
+        finally
+        {
+            semaphore.Release();
+        }
+    }
+
+    private async Task ExecuteActionAsync(DurableAction action, CancellationToken cancellationToken)
+    {
+        using var scope = _scopeFactory.CreateScope();
+        var storage = scope.ServiceProvider.GetRequiredService<IMuleStorage>();
         var registry = scope.ServiceProvider.GetRequiredService<MuleActionRegistry>();
         DateTimeOffset? nextAttemptOnUtc = null;
         DateTimeOffset? completedOnUtc = null;
@@ -192,9 +242,9 @@ internal sealed class MuleDispatcherHostedService : BackgroundService
         }
         catch (Exception ex)
         {
-            nextAttemptOnUtc = action.Attempts + 1 >= GetMaxAttempts()
+            nextAttemptOnUtc = action.Attempts + 1 >= GetMaxAttempts(action.Lane)
                 ? null
-                : DateTimeOffset.UtcNow.Add(GetRetryDelay());
+                : DateTimeOffset.UtcNow.Add(GetRetryDelay(action.Lane));
 
             await storage.MarkFailedAsync(action.Id, ex.ToString(), DateTimeOffset.UtcNow, nextAttemptOnUtc, cancellationToken);
             _logger.LogError(ex, "Mule action {MuleActionId} failed.", action.Id);
@@ -288,18 +338,58 @@ internal sealed class MuleDispatcherHostedService : BackgroundService
     private TimeSpan GetCompletedRetention()
         => _settings.CompletedRetention <= TimeSpan.Zero ? TimeSpan.FromDays(1) : _settings.CompletedRetention;
 
-    private int GetDispatchBatchSize()
-        => Math.Max(1, _settings.DispatchBatchSize);
+    private IReadOnlyCollection<string> GetLaneNames()
+        => new[] { MuleSettings.DefaultLane }
+            .Concat(_settings.Lanes.Keys)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderByDescending(GetPriority)
+            .ThenBy(x => x, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+    private MuleLaneSettings GetLaneSettings(string lane)
+        => _settings.Lanes.TryGetValue(NormalizeLane(lane), out var settings) ? settings : null;
+
+    private SemaphoreSlim GetLaneSemaphore(string lane)
+    {
+        lane = NormalizeLane(lane);
+        lock (_laneSemaphoreGate)
+        {
+            if (_laneSemaphores.TryGetValue(lane, out var semaphore))
+                return semaphore;
+
+            semaphore = new SemaphoreSlim(GetMaxDegreeOfParallelism(lane));
+            _laneSemaphores[lane] = semaphore;
+            return semaphore;
+        }
+    }
+
+    private int GetWorkerCount(string lane)
+        => Math.Max(1, GetLaneSettings(lane)?.WorkerCount ?? _settings.WorkerCount);
+
+    private int GetMaxDegreeOfParallelism(string lane)
+        => Math.Max(1, GetLaneSettings(lane)?.MaxDegreeOfParallelism ?? _settings.MaxDegreeOfParallelism);
+
+    private int GetDispatchBatchSize(string lane)
+        => Math.Max(1, GetLaneSettings(lane)?.DispatchBatchSize ?? _settings.DispatchBatchSize);
+
+    private int GetPriority(string lane)
+        => GetLaneSettings(lane)?.Priority ?? 0;
 
     private int GetCleanupBatchSize()
         => Math.Max(1, _settings.CleanupBatchSize);
 
-    private int GetMaxAttempts()
-        => Math.Max(1, _settings.MaxAttempts);
+    private int GetMaxAttempts(string lane)
+        => Math.Max(1, GetLaneSettings(lane)?.MaxAttempts ?? _settings.MaxAttempts);
 
-    private TimeSpan GetRetryDelay()
-        => _settings.RetryDelay <= TimeSpan.Zero ? TimeSpan.FromSeconds(30) : _settings.RetryDelay;
+    private TimeSpan GetRetryDelay(string lane)
+    {
+        var retryDelay = GetLaneSettings(lane)?.RetryDelay ?? _settings.RetryDelay;
+        return retryDelay <= TimeSpan.Zero ? TimeSpan.FromSeconds(30) : retryDelay;
+    }
 
     private TimeSpan GetLockTimeout()
         => _settings.LockTimeout <= TimeSpan.Zero ? TimeSpan.FromMinutes(5) : _settings.LockTimeout;
+
+    private static string NormalizeLane(string lane)
+        => string.IsNullOrWhiteSpace(lane) ? MuleSettings.DefaultLane : lane;
 }

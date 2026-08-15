@@ -15,12 +15,12 @@ internal sealed class ChannelMuleDispatchQueue : IMuleDispatchQueue
             ? Channel.CreateBounded<Guid>(new BoundedChannelOptions(capacity)
             {
                 FullMode = BoundedChannelFullMode.Wait,
-                SingleReader = true,
+                SingleReader = false,
                 SingleWriter = false
             })
             : Channel.CreateUnbounded<Guid>(new UnboundedChannelOptions
             {
-                SingleReader = true,
+                SingleReader = false,
                 SingleWriter = false
             });
     }

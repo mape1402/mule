@@ -22,6 +22,9 @@ public static class MuleModelBuilderExtensions
                 .HasConversion(actionKeyConverter)
                 .HasMaxLength(256)
                 .IsRequired();
+            entity.Property(x => x.Lane)
+                .HasMaxLength(128)
+                .IsRequired();
             entity.Property(x => x.Payload).IsRequired();
             entity.Property(x => x.PayloadType).HasMaxLength(1024).IsRequired();
             entity.Property(x => x.Metadata);
@@ -29,9 +32,13 @@ public static class MuleModelBuilderExtensions
             entity.Property(x => x.DeduplicationKey).HasMaxLength(512);
             entity.Property(x => x.Status).IsRequired();
             entity.Property(x => x.LastError);
-            entity.HasIndex(x => new { x.Status, x.NextAttemptOnUtc, x.CreatedOnUtc });
+            entity.Property(x => x.StartedOnUtc);
+            entity.Property(x => x.TerminalOnUtc);
+            entity.HasIndex(x => new { x.Lane, x.Status, x.NextAttemptOnUtc, x.CreatedOnUtc });
             entity.HasIndex(x => x.LockedOnUtc);
-            entity.HasIndex(x => new { x.Key, x.DeduplicationKey });
+            entity.HasIndex(x => new { x.Key, x.DeduplicationKey })
+                .IsUnique()
+                .HasFilter("[DeduplicationKey] IS NOT NULL");
         });
 
         return modelBuilder;

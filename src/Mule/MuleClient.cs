@@ -41,6 +41,7 @@ internal sealed class MuleClient : IMuleClient
         {
             Id = Guid.NewGuid(),
             Key = key,
+            Lane = string.IsNullOrWhiteSpace(options.Lane) ? MuleSettings.DefaultLane : options.Lane,
             Payload = _serializer.Serialize(payload),
             PayloadType = payload.GetType().AssemblyQualifiedName,
             Metadata = options.Metadata.Count == 0 ? null : JsonSerializer.Serialize(options.Metadata),

@@ -36,7 +36,8 @@ internal class EntityFrameworkMuleStorage<TDbContext> : IMuleStorage, IDisposabl
         await Actions.AddAsync(action, cancellationToken);
     }
 
-    public async Task<IReadOnlyCollection<DurableAction>> LockPendingAsync(
+    public async Task<IReadOnlyCollection<DurableAction>> ClaimPendingAsync(
+        string lane,
         int batchSize,
         TimeSpan lockTimeout,
         DateTimeOffset now,
@@ -44,34 +45,10 @@ internal class EntityFrameworkMuleStorage<TDbContext> : IMuleStorage, IDisposabl
     {
         var lockExpiration = now.Subtract(lockTimeout);
 
-        var candidates = await Actions
-            .Where(x =>
-                x.Status == DurableActionStatus.Pending && (x.NextAttemptOnUtc == null || x.NextAttemptOnUtc <= now) ||
-                x.Status == DurableActionStatus.Locked && x.LockedOnUtc <= lockExpiration)
-            .AsNoTracking()
-            .ToListAsync(cancellationToken);
+        if (IsSqlServer())
+            return await ClaimSqlServerAsync(lane, batchSize, lockExpiration, now, cancellationToken);
 
-        return candidates
-            .OrderBy(x => x.CreatedOnUtc)
-            .Take(batchSize)
-            .ToArray();
-    }
-
-    public async Task<DurableAction> LockAsync(
-        Guid id,
-        TimeSpan lockTimeout,
-        DateTimeOffset now,
-        CancellationToken cancellationToken = default)
-    {
-        var lockExpiration = now.Subtract(lockTimeout);
-        var locked = _dbContext.Database.IsRelational()
-            ? await LockRelationalAsync(id, lockExpiration, now, cancellationToken)
-            : await LockTrackedAsync(id, lockExpiration, now, cancellationToken);
-
-        if (locked == 0)
-            return null;
-
-        return await Actions.FindAsync(new object[] { id }, cancellationToken);
+        return await ClaimTrackedAsync(lane, batchSize, lockExpiration, now, cancellationToken);
     }
 
     public async Task<DateTimeOffset?> GetNextPendingOnUtcAsync(
@@ -109,11 +86,39 @@ internal class EntityFrameworkMuleStorage<TDbContext> : IMuleStorage, IDisposabl
             .FirstOrDefault();
     }
 
+    private async Task<IReadOnlyCollection<DurableAction>> ClaimTrackedAsync(
+        string lane,
+        int batchSize,
+        DateTimeOffset lockExpiration,
+        DateTimeOffset now,
+        CancellationToken cancellationToken)
+    {
+        var candidates = await Actions
+            .Where(x =>
+                x.Lane == NormalizeLane(lane) &&
+                (x.Status == DurableActionStatus.Pending && (x.NextAttemptOnUtc == null || x.NextAttemptOnUtc <= now) ||
+                x.Status == DurableActionStatus.Locked && x.LockedOnUtc <= lockExpiration))
+            .OrderBy(x => x.CreatedOnUtc)
+            .Take(batchSize)
+            .ToListAsync(cancellationToken);
+
+        foreach (var action in candidates)
+        {
+            action.Status = DurableActionStatus.Locked;
+            action.LockedOnUtc = now;
+            action.StartedOnUtc ??= now;
+        }
+
+        await _dbContext.SaveChangesAsync(cancellationToken);
+        return candidates.ToArray();
+    }
+
     public async Task MarkCompletedAsync(Guid id, DateTimeOffset completedOnUtc, CancellationToken cancellationToken = default)
     {
         var action = await FindAsync(id, cancellationToken);
         action.Status = DurableActionStatus.Completed;
         action.CompletedOnUtc = completedOnUtc;
+        action.TerminalOnUtc = completedOnUtc;
         action.LockedOnUtc = null;
         action.NextAttemptOnUtc = null;
         action.LastError = null;
@@ -132,6 +137,7 @@ internal class EntityFrameworkMuleStorage<TDbContext> : IMuleStorage, IDisposabl
         action.LastError = error;
         action.LockedOnUtc = null;
         action.NextAttemptOnUtc = nextAttemptOnUtc;
+        action.TerminalOnUtc = nextAttemptOnUtc == null ? now : null;
     }
 
     public async Task<int> CleanCompletedAsync(DateTimeOffset olderThanUtc, int batchSize, CancellationToken cancellationToken = default)
@@ -157,10 +163,78 @@ internal class EntityFrameworkMuleStorage<TDbContext> : IMuleStorage, IDisposabl
             .Select(x => x.CompletedOnUtc)
             .FirstOrDefaultAsync(cancellationToken);
 
-    public Task SaveChangesAsync(CancellationToken cancellationToken = default)
-        => _dbContext.SaveChangesAsync(cancellationToken);
+    public async Task SaveChangesAsync(CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            await _dbContext.SaveChangesAsync(cancellationToken);
+        }
+        catch (DbUpdateException ex) when (IsUniqueConstraintViolation(ex))
+        {
+            foreach (var entry in _dbContext.ChangeTracker.Entries<DurableAction>().Where(x => x.State == EntityState.Added))
+                entry.State = EntityState.Detached;
+        }
+    }
 
     protected DbSet<DurableAction> Actions => _dbContext.Set<DurableAction>();
+
+    private async Task<IReadOnlyCollection<DurableAction>> ClaimSqlServerAsync(
+        string lane,
+        int batchSize,
+        DateTimeOffset lockExpiration,
+        DateTimeOffset now,
+        CancellationToken cancellationToken)
+    {
+        var names = GetActionStoreNames();
+        var sql = $$"""
+WITH MuleClaim AS (
+    SELECT TOP ({0}) *
+    FROM {{names.Table}} WITH (UPDLOCK, READPAST, ROWLOCK)
+    WHERE {{names.Lane}} = {3}
+      AND (
+          ({{names.Status}} = {4} AND ({{names.NextAttemptOnUtc}} IS NULL OR {{names.NextAttemptOnUtc}} <= {5}))
+          OR ({{names.Status}} = {6} AND {{names.LockedOnUtc}} <= {7})
+      )
+    ORDER BY COALESCE({{names.NextAttemptOnUtc}}, {{names.CreatedOnUtc}}), {{names.CreatedOnUtc}}
+)
+UPDATE MuleClaim
+SET {{names.Status}} = {1},
+    {{names.LockedOnUtc}} = {2},
+    {{names.StartedOnUtc}} = COALESCE({{names.StartedOnUtc}}, {2})
+OUTPUT INSERTED.*
+""";
+
+        return await Actions
+            .FromSqlRaw(
+                sql,
+                batchSize,
+                (int)DurableActionStatus.Locked,
+                now,
+                NormalizeLane(lane),
+                (int)DurableActionStatus.Pending,
+                now,
+                (int)DurableActionStatus.Locked,
+                lockExpiration)
+            .AsNoTracking()
+            .ToListAsync(cancellationToken);
+    }
+
+    public async Task<DurableAction> LockAsync(
+        Guid id,
+        TimeSpan lockTimeout,
+        DateTimeOffset now,
+        CancellationToken cancellationToken = default)
+    {
+        var lockExpiration = now.Subtract(lockTimeout);
+        var locked = _dbContext.Database.IsRelational()
+            ? await LockRelationalAsync(id, lockExpiration, now, cancellationToken)
+            : await LockTrackedAsync(id, lockExpiration, now, cancellationToken);
+
+        if (locked == 0)
+            return null;
+
+        return await Actions.FindAsync(new object[] { id }, cancellationToken);
+    }
 
     private async Task<int> LockRelationalAsync(
         Guid id,
@@ -172,7 +246,8 @@ internal class EntityFrameworkMuleStorage<TDbContext> : IMuleStorage, IDisposabl
         var sql = $$"""
 UPDATE {{names.Table}}
 SET {{names.Status}} = {0},
-    {{names.LockedOnUtc}} = {1}
+    {{names.LockedOnUtc}} = {1},
+    {{names.StartedOnUtc}} = COALESCE({{names.StartedOnUtc}}, {1})
 WHERE {{names.Id}} = {2}
   AND (
       ({{names.Status}} = {3} AND ({{names.NextAttemptOnUtc}} IS NULL OR {{names.NextAttemptOnUtc}} <= {4}))
@@ -214,6 +289,7 @@ WHERE {{names.Id}} = {2}
 
         action.Status = DurableActionStatus.Locked;
         action.LockedOnUtc = now;
+        action.StartedOnUtc ??= now;
         await _dbContext.SaveChangesAsync(cancellationToken);
         return 1;
     }
@@ -238,8 +314,11 @@ WHERE {{names.Id}} = {2}
         return new ActionStoreNames(
             helper.DelimitIdentifier(tableName, schema),
             Column(nameof(DurableAction.Id)),
+            Column(nameof(DurableAction.Lane)),
             Column(nameof(DurableAction.Status)),
             Column(nameof(DurableAction.LockedOnUtc)),
+            Column(nameof(DurableAction.StartedOnUtc)),
+            Column(nameof(DurableAction.CreatedOnUtc)),
             Column(nameof(DurableAction.NextAttemptOnUtc)));
     }
 
@@ -253,11 +332,24 @@ WHERE {{names.Id}} = {2}
     public ValueTask DisposeAsync()
         => _dbContext.DisposeAsync();
 
+    private static string NormalizeLane(string lane)
+        => string.IsNullOrWhiteSpace(lane) ? MuleSettings.DefaultLane : lane;
+
+    private static bool IsUniqueConstraintViolation(DbUpdateException exception)
+        => exception.InnerException?.Message.Contains("unique", StringComparison.OrdinalIgnoreCase) == true ||
+           exception.InnerException?.Message.Contains("duplicate", StringComparison.OrdinalIgnoreCase) == true;
+
+    private bool IsSqlServer()
+        => _dbContext.Database.ProviderName?.Contains("SqlServer", StringComparison.OrdinalIgnoreCase) == true;
+
     private sealed record ActionStoreNames(
         string Table,
         string Id,
+        string Lane,
         string Status,
         string LockedOnUtc,
+        string StartedOnUtc,
+        string CreatedOnUtc,
         string NextAttemptOnUtc);
 }
 

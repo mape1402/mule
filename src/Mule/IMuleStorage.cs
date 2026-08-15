@@ -4,7 +4,8 @@ public interface IMuleStorage
 {
     Task AddAsync(DurableAction action, CancellationToken cancellationToken = default);
 
-    Task<IReadOnlyCollection<DurableAction>> LockPendingAsync(
+    Task<IReadOnlyCollection<DurableAction>> ClaimPendingAsync(
+        string lane,
         int batchSize,
         TimeSpan lockTimeout,
         DateTimeOffset now,
