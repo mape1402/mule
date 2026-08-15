@@ -2,6 +2,23 @@
 
 All notable changes to Mule packages will be documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- Added durable action lanes with lane-level worker, batch, parallelism, retry, and priority settings.
+- Added `EnqueueOptions.Lane` and `MuleActionContext.Lane`.
+- Added concurrent dispatcher workers with configurable maximum parallelism.
+- Added extended diagnostics for expired locks, duplicate enqueues, backlog, retries, failures, and latency.
+- Added `StartedOnUtc` and `TerminalOnUtc` tracking for latency diagnostics.
+
+### Changed
+
+- Changed pending recovery to claim and lock batches atomically before execution.
+- Changed the in-memory dispatch queue to support multiple concurrent readers.
+- Changed EF Core storage to use a unique deduplication index for `ActionKey` and `DeduplicationKey`.
+- Changed SQL Server batch claims to use an ordered CTE with `UPDLOCK`, `READPAST`, `ROWLOCK`, and `OUTPUT INSERTED`.
+
 ## [v1.1.1] - 2026-08-09
 
 ### Added

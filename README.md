@@ -160,11 +160,24 @@ await mule.EnqueueAsync(
     new CapturePayment(orderId, amount),
     options =>
     {
+        options.Lane = "payments";
         options.CorrelationId = correlationId;
         options.DeduplicationKey = orderId;
         options.Metadata["source"] = "checkout";
     },
     cancellationToken);
+```
+
+### Lane
+
+Use `Lane` to place work in a logical partition. Lanes let slow or low-priority work run with different worker counts, batch sizes, retry settings, and parallelism than critical work.
+
+If no lane is provided, Mule uses `default`.
+
+The lane is stored with the durable action and is available through `MuleActionContext<TPayload>`:
+
+```csharp
+logger.LogInformation("Executing {ActionKey} on lane {Lane}.", context.Key, context.Lane);
 ```
 
 ### CorrelationId
@@ -208,6 +221,8 @@ Common examples:
 - Use a command id when retrying a submitted command from the foreground.
 
 The deduplication key should be stable and domain-owned. Avoid timestamps, random values, or generated ids when the goal is to prevent duplicate work.
+
+Storage providers enforce deduplication at write time. When a duplicate is detected, Mule treats the enqueue as an idempotent success and keeps the existing durable action.
 
 ### Metadata
 
@@ -285,7 +300,7 @@ await db.Database.EnsureCreatedAsync();
 
 ## Dispatcher Settings
 
-Configure retry, recovery, locking, and cleanup through `MuleSettings`:
+Configure concurrency, retry, recovery, locking, and cleanup through `MuleSettings`:
 
 ```csharp
 services.AddMule(mule => mule
@@ -296,15 +311,47 @@ services.AddMule(mule => mule
         settings.RecoveryMode = MuleRecoveryMode.Scheduled;
         settings.DispatchInterval = TimeSpan.FromSeconds(5);
         settings.DispatchBatchSize = 50;
+        settings.WorkerCount = 2;
+        settings.MaxDegreeOfParallelism = 8;
         settings.MaxAttempts = 10;
         settings.RetryDelay = TimeSpan.FromSeconds(30);
         settings.LockTimeout = TimeSpan.FromMinutes(5);
         settings.CleanupMode = MuleCleanupMode.Scheduled;
         settings.CleanupInterval = TimeSpan.FromMinutes(10);
         settings.CompletedRetention = TimeSpan.FromDays(1);
+
+        settings.Lanes["payments"] = new MuleLaneSettings
+        {
+            WorkerCount = 2,
+            MaxDegreeOfParallelism = 8,
+            DispatchBatchSize = 100,
+            RetryDelay = TimeSpan.FromSeconds(10),
+            MaxAttempts = 12,
+            Priority = 10
+        };
+
+        settings.Lanes["notifications"] = new MuleLaneSettings
+        {
+            WorkerCount = 1,
+            MaxDegreeOfParallelism = 2,
+            DispatchBatchSize = 25,
+            RetryDelay = TimeSpan.FromMinutes(1)
+        };
     })
     .AddActionsFromAssemblyContaining<SendReceiptAction>());
 ```
+
+`WorkerCount` controls how many workers try to claim batches.
+
+`MaxDegreeOfParallelism` controls how many actions from the same lane can execute at the same time inside a process.
+
+`DispatchBatchSize` controls how many eligible actions a worker claims in one storage operation.
+
+`DispatchQueueCapacity` controls the in-memory immediate dispatch queue capacity. Use `0` for an unbounded queue.
+
+`LockTimeout` is the lease duration. If a process dies while an action is locked, the action becomes claimable again after the lock expires.
+
+Lane settings override the global worker count, batch size, parallelism, retry delay, max attempts, and priority for actions enqueued into that lane.
 
 `RecoveryMode` controls how pending work is recovered:
 
@@ -317,7 +364,7 @@ services.AddMule(mule => mule
 - `Polling`: cleanup runs every `CleanupInterval`.
 - `Scheduled`: cleanup wakes when completed actions reach `CompletedRetention`.
 
-Mule uses storage locks so multiple service replicas can run workers at the same time without intentionally executing the same locked action concurrently. Actions should still be idempotent because Mule provides at-least-once execution.
+Mule uses atomic storage claims and locks so multiple service replicas can run workers at the same time without intentionally executing the same locked action concurrently. Actions should still be idempotent because Mule provides at-least-once execution.
 
 ## Diagnostics
 
@@ -334,8 +381,21 @@ The snapshot includes:
 - locked count
 - completed count
 - failed count
+- expired lock count
+- duplicates ignored by idempotency
+- throughput per minute
 - oldest pending timestamp
+- oldest locked timestamp
 - oldest failed timestamp
+- oldest pending age
+- oldest locked age
+- average enqueue-to-execution latency
+- average execution latency
+- average enqueue-to-terminal latency
+- backlog by lane
+- backlog by action key
+- failures by action key
+- retries by action key
 
 ## Testing
 

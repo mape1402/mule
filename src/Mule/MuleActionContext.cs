@@ -16,6 +16,8 @@ public class MuleActionContext
 
     public ActionKey Key => Action.Key;
 
+    public string Lane => Action.Lane;
+
     public Guid Id => Action.Id;
 
     public string CorrelationId => Action.CorrelationId;

@@ -21,12 +21,13 @@ internal sealed class InMemoryMuleStorage : IMuleStorage
         return Task.CompletedTask;
     }
 
-    public Task<IReadOnlyCollection<DurableAction>> LockPendingAsync(
+    public Task<IReadOnlyCollection<DurableAction>> ClaimPendingAsync(
+        string lane,
         int batchSize,
         TimeSpan lockTimeout,
         DateTimeOffset now,
         CancellationToken cancellationToken = default)
-        => Task.FromResult(_store.GetPending(batchSize, lockTimeout, now));
+        => Task.FromResult(_store.ClaimPending(lane, batchSize, lockTimeout, now));
 
     public Task<DateTimeOffset?> GetNextPendingOnUtcAsync(
         TimeSpan lockTimeout,

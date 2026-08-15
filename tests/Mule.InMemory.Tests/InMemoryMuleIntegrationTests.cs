@@ -1,7 +1,9 @@
 namespace Mule.InMemory.Tests;
 
+using System.Collections.Concurrent;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
+using Mule.Diagnostics;
 
 public sealed class InMemoryMuleIntegrationTests
 {
@@ -157,6 +159,101 @@ public sealed class InMemoryMuleIntegrationTests
         Assert.Empty(host.Services.GetRequiredService<IInMemoryMule>().Actions);
     }
 
+    [Fact]
+    public async Task EnqueueAsync_Should_Ignore_Concurrent_Duplicates()
+    {
+        using var host = CreateHost();
+        var scopeFactory = host.Services.GetRequiredService<IServiceScopeFactory>();
+
+        await Task.WhenAll(Enumerable.Range(0, 25).Select(_ =>
+        {
+            using var scope = scopeFactory.CreateScope();
+            var client = scope.ServiceProvider.GetRequiredService<IMuleClient>();
+            return client.EnqueueAsync(
+                    Key,
+                    new TestPayload("duplicate"),
+                    options => options.DeduplicationKey = "order-1001")
+                .AsTask();
+        }));
+
+        var actions = host.Services.GetRequiredService<IInMemoryMule>().Actions;
+        var diagnostics = await host.Services.GetRequiredService<IMuleDiagnostics>().GetSnapshotAsync();
+
+        Assert.Single(actions);
+        Assert.Equal(24, diagnostics.DuplicatesIgnored);
+    }
+
+    [Fact]
+    public async Task HostedService_Should_Execute_Actions_In_Parallel()
+    {
+        using var host = CreateHost(configureSettings: settings =>
+        {
+            settings.WorkerCount = 4;
+            settings.MaxDegreeOfParallelism = 4;
+        });
+        await host.StartAsync();
+
+        using var scope = host.Services.CreateScope();
+        var client = scope.ServiceProvider.GetRequiredService<IMuleClient>();
+        var startedOnUtc = DateTimeOffset.UtcNow;
+
+        await Task.WhenAll(Enumerable.Range(0, 4).Select(index =>
+            client.EnqueueAsync(Key, new TestPayload($"parallel-{index}", 250)).AsTask()));
+
+        var probe = host.Services.GetRequiredService<TestProbe>();
+        await probe.WaitForCountAsync(4);
+        var elapsed = DateTimeOffset.UtcNow - startedOnUtc;
+        await host.StopAsync();
+
+        Assert.True(elapsed < TimeSpan.FromMilliseconds(900), $"Expected parallel execution, but elapsed time was {elapsed}.");
+        Assert.Equal(4, probe.Values.Count);
+    }
+
+    [Fact]
+    public async Task Lanes_Should_Allow_Fast_Lane_To_Progress_When_Slow_Lane_Is_Busy()
+    {
+        using var host = CreateHost(configureSettings: settings =>
+        {
+            settings.ImmediateDispatch = false;
+            settings.RecoveryMode = MuleRecoveryMode.Polling;
+            settings.DispatchInterval = TimeSpan.FromMilliseconds(25);
+            settings.Lanes["slow"] = new MuleLaneSettings
+            {
+                WorkerCount = 1,
+                MaxDegreeOfParallelism = 1,
+                DispatchBatchSize = 1
+            };
+            settings.Lanes["fast"] = new MuleLaneSettings
+            {
+                WorkerCount = 1,
+                MaxDegreeOfParallelism = 1,
+                DispatchBatchSize = 1,
+                Priority = 10
+            };
+        });
+        await host.StartAsync();
+
+        using var scope = host.Services.CreateScope();
+        var client = scope.ServiceProvider.GetRequiredService<IMuleClient>();
+        var startedOnUtc = DateTimeOffset.UtcNow;
+
+        await client.EnqueueAsync(
+            Key,
+            new TestPayload("slow", 500),
+            options => options.Lane = "slow");
+        await client.EnqueueAsync(
+            Key,
+            new TestPayload("fast", 0),
+            options => options.Lane = "fast");
+
+        var probe = host.Services.GetRequiredService<TestProbe>();
+        await probe.WaitForValueAsync("fast");
+        var elapsed = DateTimeOffset.UtcNow - startedOnUtc;
+        await host.StopAsync();
+
+        Assert.True(elapsed < TimeSpan.FromMilliseconds(450), $"Fast lane was blocked by slow lane for {elapsed}.");
+    }
+
     private static IHost CreateHost(
         bool fail = false,
         bool failOnce = false,
@@ -192,7 +289,7 @@ public sealed class InMemoryMuleIntegrationTests
         }
     }
 
-    private sealed record TestPayload(string Value);
+    private sealed record TestPayload(string Value, int DelayMilliseconds = 0);
 
     [MuleAction("tests.capture.v1")]
     private sealed class CaptureTestPayloadAction : IMuleAction<TestPayload>
@@ -204,20 +301,23 @@ public sealed class InMemoryMuleIntegrationTests
             _probe = probe;
         }
 
-        public ValueTask ExecuteAsync(MuleActionContext<TestPayload> context, CancellationToken cancellationToken)
+        public async ValueTask ExecuteAsync(MuleActionContext<TestPayload> context, CancellationToken cancellationToken)
         {
             if (_probe.ShouldFail())
                 throw new InvalidOperationException("planned failure");
 
+            if (context.Payload.DelayMilliseconds > 0)
+                await Task.Delay(context.Payload.DelayMilliseconds, cancellationToken);
+
             _probe.Values.Add(context.Payload.Value);
-            _probe.Signal();
-            return ValueTask.CompletedTask;
+            _probe.Signal(context.Payload.Value);
         }
     }
 
     private sealed class TestProbe
     {
         private readonly TaskCompletionSource _completion = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly ConcurrentDictionary<string, TaskCompletionSource> _valueCompletions = new(StringComparer.Ordinal);
         private int _remainingFailures;
 
         public TestProbe(bool fail, bool failOnce)
@@ -228,7 +328,7 @@ public sealed class InMemoryMuleIntegrationTests
 
         public bool Fail { get; }
 
-        public List<string> Values { get; } = new();
+        public ConcurrentBag<string> Values { get; } = new();
 
         public bool ShouldFail()
         {
@@ -238,7 +338,37 @@ public sealed class InMemoryMuleIntegrationTests
             return _remainingFailures > 0 && Interlocked.Decrement(ref _remainingFailures) >= 0;
         }
 
-        public void Signal()
+        public void Signal(string value)
+        {
+            _completion.TrySetResult();
+            _valueCompletions
+                .GetOrAdd(value, _ => new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously))
+                .TrySetResult();
+        }
+
+        public async Task WaitForCountAsync(int count)
+        {
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+
+            while (!timeout.IsCancellationRequested)
+            {
+                if (Values.Count >= count)
+                    return;
+
+                await Task.Delay(25, timeout.Token);
+            }
+        }
+
+        public async Task WaitForValueAsync(string value)
+        {
+            var completion = _valueCompletions.GetOrAdd(
+                value,
+                _ => new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously));
+
+            await completion.Task.WaitAsync(TimeSpan.FromSeconds(3));
+        }
+
+        private void Signal()
             => _completion.TrySetResult();
 
         public async Task WaitAsync()

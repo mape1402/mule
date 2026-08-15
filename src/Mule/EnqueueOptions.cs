@@ -2,6 +2,8 @@ namespace Mule;
 
 public sealed class EnqueueOptions
 {
+    public string Lane { get; set; } = MuleSettings.DefaultLane;
+
     public string CorrelationId { get; set; }
 
     public string DeduplicationKey { get; set; }
