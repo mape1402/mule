@@ -34,11 +34,13 @@ public static class MuleModelBuilderExtensions
             entity.Property(x => x.LastError);
             entity.Property(x => x.StartedOnUtc);
             entity.Property(x => x.TerminalOnUtc);
-            entity.HasIndex(x => new { x.Lane, x.Status, x.NextAttemptOnUtc, x.CreatedOnUtc });
+            entity.HasIndex(x => new { x.Lane, x.Status, x.NextAttemptOnUtc, x.CreatedOnUtc })
+                .HasDatabaseName("IX_MuleActions_Lane_Status_NextAttemptOnUtc_CreatedOnUtc");
             entity.HasIndex(x => x.LockedOnUtc);
             entity.HasIndex(x => new { x.Key, x.DeduplicationKey })
                 .IsUnique()
-                .HasFilter("[DeduplicationKey] IS NOT NULL");
+                .HasFilter("[DeduplicationKey] IS NOT NULL")
+                .HasDatabaseName("UX_MuleActions_Key_DeduplicationKey");
         });
 
         return modelBuilder;

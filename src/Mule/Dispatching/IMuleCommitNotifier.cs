@@ -2,5 +2,5 @@ namespace Mule.Dispatching;
 
 public interface IMuleCommitNotifier
 {
-    ValueTask NotifySavedAsync(Guid actionId, CancellationToken cancellationToken = default);
+    ValueTask NotifySavedAsync(Guid actionId, string lane, CancellationToken cancellationToken = default);
 }

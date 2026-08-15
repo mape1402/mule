@@ -2,19 +2,19 @@ namespace Mule;
 
 public sealed class MuleLaneSettings
 {
-    public int WorkerCount { get; set; } = 1;
+    public int WorkerCount { get; set; }
 
-    public int MaxDegreeOfParallelism { get; set; } = 1;
+    public int MaxDegreeOfParallelism { get; set; }
 
-    public int DispatchBatchSize { get; set; } = 50;
+    public int DispatchBatchSize { get; set; }
 
     public int DispatchQueueCapacity { get; set; }
 
-    public TimeSpan PollingInterval { get; set; } = TimeSpan.FromMinutes(1);
+    public TimeSpan PollingInterval { get; set; }
 
-    public int MaxAttempts { get; set; } = 10;
+    public int MaxAttempts { get; set; }
 
-    public TimeSpan RetryDelay { get; set; } = TimeSpan.FromSeconds(30);
+    public TimeSpan RetryDelay { get; set; }
 
     public MuleRetryPolicy RetryPolicy { get; set; }
 

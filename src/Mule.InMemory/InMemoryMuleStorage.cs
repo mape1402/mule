@@ -24,6 +24,12 @@ internal sealed class InMemoryMuleStorage : IMuleStorage
         return Task.CompletedTask;
     }
 
+    public Task<Guid?> FindByDeduplicationKeyAsync(
+        ActionKey key,
+        string deduplicationKey,
+        CancellationToken cancellationToken = default)
+        => Task.FromResult(_store.FindByDeduplicationKey(key, deduplicationKey));
+
     public Task<IReadOnlyCollection<DurableAction>> ClaimPendingAsync(
         string lane,
         int batchSize,

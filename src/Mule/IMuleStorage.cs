@@ -4,6 +4,11 @@ public interface IMuleStorage
 {
     Task AddAsync(DurableAction action, CancellationToken cancellationToken = default);
 
+    Task<Guid?> FindByDeduplicationKeyAsync(
+        ActionKey key,
+        string deduplicationKey,
+        CancellationToken cancellationToken = default);
+
     Task<IReadOnlyCollection<DurableAction>> ClaimPendingAsync(
         string lane,
         int batchSize,
