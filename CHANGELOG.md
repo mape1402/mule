@@ -4,6 +4,24 @@ All notable changes to Mule packages will be documented in this file.
 
 ## [Unreleased]
 
+## [v1.3.0] - 2026-08-16
+
+### Added
+
+- Added weighted fair lane scheduling so priority influences throughput without starving lower-priority lanes.
+- Added lane-specific immediate dispatch workers for configured lanes, plus fallback workers for unconfigured lanes.
+- Added configurable drain cycles with `MaxDrainBatchesPerCycle`, `MaxDrainActionsPerCycle`, `DrainUntilEmpty`, and `YieldBetweenDrainBatches`.
+- Added lane-level drain overrides on `MuleLaneSettings`.
+- Added `MuleLaneSettings.Weight` for weighted scheduling.
+- Added `ConfigureHighThroughputRuntime()` and `ConfigureLane(...)` registration helpers.
+- Added runtime completed-per-minute and failure metrics by lane and action key.
+- Added in-memory integration coverage for independent immediate lane workers and drain-until-empty recovery.
+
+### Changed
+
+- Changed immediate dispatch queue draining to use weighted round-robin lane scans instead of strict priority scans.
+- Changed recovery cycles to drain configured batches continuously when enabled instead of always claiming a single batch per cycle.
+
 ## [v1.2.0] - 2026-08-15
 
 ### Added

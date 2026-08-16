@@ -109,7 +109,11 @@ internal class EntityFrameworkMuleDiagnostics<TDbContext> : IMuleDiagnostics, ID
             BacklogByLane = backlogByLane.ToDictionary(x => NormalizeLane(x.Lane), x => x.Count, StringComparer.OrdinalIgnoreCase),
             BacklogByActionKey = backlogByActionKey.ToDictionary(x => x.Key, x => x.Count),
             FailuresByActionKey = failuresByActionKey.ToDictionary(x => x.Key, x => x.Count),
-            RetriesByActionKey = retriesByActionKey.ToDictionary(x => x.Key, x => x.Count)
+            RetriesByActionKey = retriesByActionKey.ToDictionary(x => x.Key, x => x.Count),
+            CompletedPerMinuteByLane = runtime.CompletedPerMinuteByLane,
+            CompletedPerMinuteByActionKey = runtime.CompletedPerMinuteByActionKey,
+            RuntimeFailedByLane = runtime.RuntimeFailedByLane,
+            RuntimeFailedByActionKey = runtime.RuntimeFailedByActionKey
         };
     }
 

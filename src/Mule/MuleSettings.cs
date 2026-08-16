@@ -24,6 +24,14 @@ public sealed class MuleSettings
 
     public int DispatchBatchSize { get; set; } = 50;
 
+    public int MaxDrainBatchesPerCycle { get; set; } = 1;
+
+    public int MaxDrainActionsPerCycle { get; set; }
+
+    public bool DrainUntilEmpty { get; set; }
+
+    public TimeSpan YieldBetweenDrainBatches { get; set; }
+
     public int CleanupBatchSize { get; set; } = 500;
 
     public int MaxAttempts { get; set; } = 10;

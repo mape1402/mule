@@ -43,4 +43,12 @@ public sealed class MuleDiagnosticsSnapshot
     public IReadOnlyDictionary<ActionKey, int> FailuresByActionKey { get; init; } = new Dictionary<ActionKey, int>();
 
     public IReadOnlyDictionary<ActionKey, int> RetriesByActionKey { get; init; } = new Dictionary<ActionKey, int>();
+
+    public IReadOnlyDictionary<string, int> CompletedPerMinuteByLane { get; init; } = new Dictionary<string, int>();
+
+    public IReadOnlyDictionary<ActionKey, int> CompletedPerMinuteByActionKey { get; init; } = new Dictionary<ActionKey, int>();
+
+    public IReadOnlyDictionary<string, int> RuntimeFailedByLane { get; init; } = new Dictionary<string, int>();
+
+    public IReadOnlyDictionary<ActionKey, int> RuntimeFailedByActionKey { get; init; } = new Dictionary<ActionKey, int>();
 }
