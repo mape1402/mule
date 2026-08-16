@@ -17,6 +17,7 @@ internal sealed class MuleDispatcherHostedService : BackgroundService
     private readonly Dictionary<string, SemaphoreSlim> _laneSemaphores;
     private readonly object _laneSemaphoreGate = new();
     private readonly Dictionary<string, DateTimeOffset> _nextLanePollingOnUtc = new(StringComparer.OrdinalIgnoreCase);
+    private int _fairScheduleCursor;
 
     public MuleDispatcherHostedService(
         IServiceScopeFactory scopeFactory,
@@ -41,9 +42,14 @@ internal sealed class MuleDispatcherHostedService : BackgroundService
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        var queueWorkers = Enumerable
-            .Range(0, GetWorkerCount(MuleSettings.DefaultLane))
-            .Select(_ => ProcessQueuedActionsAsync(stoppingToken))
+        var assignedLanes = GetLaneNames().ToArray();
+        var queueWorkers = assignedLanes
+            .SelectMany(lane => Enumerable
+                .Range(0, GetWorkerCount(lane))
+                .Select(_ => ProcessQueuedActionsAsync(lane, stoppingToken)))
+            .Concat(Enumerable
+                .Range(0, GetWorkerCount(MuleSettings.DefaultLane))
+                .Select(_ => ProcessUnassignedQueuedActionsAsync(assignedLanes, stoppingToken)))
             .ToArray();
         var recoveryWorker = _settings.RecoveryMode == MuleRecoveryMode.Scheduled
             ? RecoverPendingActionsOnScheduleAsync(stoppingToken)
@@ -58,13 +64,13 @@ internal sealed class MuleDispatcherHostedService : BackgroundService
         await Task.WhenAll(queueWorkers.Append(recoveryWorker).Append(cleanupWorker));
     }
 
-    private async Task ProcessQueuedActionsAsync(CancellationToken cancellationToken)
+    private async Task ProcessQueuedActionsAsync(string lane, CancellationToken cancellationToken)
     {
         while (!cancellationToken.IsCancellationRequested)
         {
             try
             {
-                var item = await _dispatchQueue.DequeueAsync(cancellationToken);
+                var item = await _dispatchQueue.DequeueAsync(lane, cancellationToken);
                 await DispatchQueuedActionAsync(item.ActionId, cancellationToken);
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -74,6 +80,28 @@ internal sealed class MuleDispatcherHostedService : BackgroundService
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Mule queue dispatcher failed.");
+            }
+        }
+    }
+
+    private async Task ProcessUnassignedQueuedActionsAsync(
+        IReadOnlyCollection<string> assignedLanes,
+        CancellationToken cancellationToken)
+    {
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            try
+            {
+                var item = await _dispatchQueue.DequeueUnassignedAsync(assignedLanes, cancellationToken);
+                await DispatchQueuedActionAsync(item.ActionId, cancellationToken);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                break;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Mule fallback queue dispatcher failed.");
             }
         }
     }
@@ -184,23 +212,20 @@ internal sealed class MuleDispatcherHostedService : BackgroundService
 
     private async Task ClaimAndDispatchLanesAsync(IEnumerable<string> lanes, CancellationToken cancellationToken)
     {
-        foreach (var priorityGroup in GetLaneNames().GroupBy(GetPriority).OrderByDescending(x => x.Key))
-        {
-            var lanesInPriority = priorityGroup
-                .Where(lane => lanes.Contains(lane, StringComparer.OrdinalIgnoreCase))
-                .ToArray();
+        var selectedLanes = new HashSet<string>(
+            lanes.Select(NormalizeLane),
+            StringComparer.OrdinalIgnoreCase);
 
-            if (lanesInPriority.Length == 0)
-                continue;
+        var tasks = GetFairLaneNames()
+            .Where(selectedLanes.Contains)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .SelectMany(lane => Enumerable
+                .Range(0, GetWorkerCount(lane))
+                .Select(_ => ClaimAndDispatchLaneAsync(lane, cancellationToken)))
+            .ToArray();
 
-            var tasks = lanesInPriority
-                .SelectMany(lane => Enumerable
-                    .Range(0, GetWorkerCount(lane))
-                    .Select(_ => ClaimAndDispatchLaneAsync(lane, cancellationToken)))
-                .ToArray();
-
+        if (tasks.Length > 0)
             await Task.WhenAll(tasks);
-        }
     }
 
     private bool IsLaneDueForPolling(string lane, DateTimeOffset now)
@@ -224,11 +249,42 @@ internal sealed class MuleDispatcherHostedService : BackgroundService
 
     private async Task ClaimAndDispatchLaneAsync(string lane, CancellationToken cancellationToken)
     {
-        using var scope = _scopeFactory.CreateScope();
-        var storage = scope.ServiceProvider.GetRequiredService<IMuleStorage>();
-        var actions = await storage.ClaimPendingAsync(lane, GetDispatchBatchSize(lane), GetLockTimeout(), DateTimeOffset.UtcNow, cancellationToken);
+        var batches = 0;
+        var actionsClaimed = 0;
 
-        await Task.WhenAll(actions.Select(action => DispatchClaimedActionAsync(action, cancellationToken)));
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            if (batches >= GetMaxDrainBatchesPerCycle(lane))
+                return;
+
+            var remainingActions = GetRemainingDrainActions(lane, actionsClaimed);
+            if (remainingActions == 0)
+                return;
+
+            using var scope = _scopeFactory.CreateScope();
+            var storage = scope.ServiceProvider.GetRequiredService<IMuleStorage>();
+            var batchSize = remainingActions == null
+                ? GetDispatchBatchSize(lane)
+                : Math.Min(GetDispatchBatchSize(lane), remainingActions.Value);
+            var actions = await storage.ClaimPendingAsync(lane, batchSize, GetLockTimeout(), DateTimeOffset.UtcNow, cancellationToken);
+
+            if (actions.Count == 0)
+                return;
+
+            batches++;
+            actionsClaimed += actions.Count;
+
+            await Task.WhenAll(actions.Select(action => DispatchClaimedActionAsync(action, cancellationToken)));
+
+            if (!GetDrainUntilEmpty(lane))
+                return;
+
+            var yield = GetYieldBetweenDrainBatches(lane);
+            if (yield > TimeSpan.Zero)
+                await Task.Delay(yield, cancellationToken);
+            else
+                await Task.Yield();
+        }
     }
 
     private async Task<DateTimeOffset?> GetNextPendingOnUtcAsync(CancellationToken cancellationToken)
@@ -291,7 +347,7 @@ internal sealed class MuleDispatcherHostedService : BackgroundService
             await handler.ExecuteAsync(action, scope.ServiceProvider, cancellationToken);
             completedOnUtc = DateTimeOffset.UtcNow;
             await storage.MarkCompletedAsync(action.Id, completedOnUtc.Value, cancellationToken);
-            _metrics.RecordCompleted(completedOnUtc.Value);
+            _metrics.RecordCompleted(action.Lane, action.Key, completedOnUtc.Value);
         }
         catch (Exception ex)
         {
@@ -303,7 +359,7 @@ internal sealed class MuleDispatcherHostedService : BackgroundService
 
             await storage.MarkFailedAsync(action.Id, ex.ToString(), DateTimeOffset.UtcNow, nextAttemptOnUtc, cancellationToken);
             if (nextAttemptOnUtc == null)
-                _metrics.RecordFailed();
+                _metrics.RecordFailed(action.Lane, action.Key);
             _logger.LogError(ex, "Mule action {MuleActionId} failed.", action.Id);
         }
 
@@ -403,6 +459,24 @@ internal sealed class MuleDispatcherHostedService : BackgroundService
             .ThenBy(x => x, StringComparer.OrdinalIgnoreCase)
             .ToArray();
 
+    private IReadOnlyCollection<string> GetFairLaneNames()
+    {
+        var lanes = GetLaneNames();
+        var schedule = lanes
+            .SelectMany(lane => Enumerable.Repeat(lane, GetWeight(lane)))
+            .ToArray();
+
+        if (schedule.Length == 0)
+            return lanes;
+
+        var start = Math.Abs(Interlocked.Increment(ref _fairScheduleCursor) % schedule.Length);
+        return schedule
+            .Skip(start)
+            .Concat(schedule.Take(start))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+    }
+
     private MuleLaneSettings GetLaneSettings(string lane)
         => _settings.Lanes.TryGetValue(NormalizeLane(lane), out var settings) ? settings : null;
 
@@ -440,6 +514,44 @@ internal sealed class MuleDispatcherHostedService : BackgroundService
 
     private int GetPriority(string lane)
         => GetLaneSettings(lane)?.Priority ?? 0;
+
+    private int GetWeight(string lane)
+    {
+        var settings = GetLaneSettings(lane);
+        var weight = settings?.Weight > 0 ? settings.Weight : Math.Max(1, settings?.Priority ?? 1);
+        return Math.Clamp(weight, 1, 100);
+    }
+
+    private int GetMaxDrainBatchesPerCycle(string lane)
+    {
+        var laneValue = GetLaneSettings(lane)?.MaxDrainBatchesPerCycle;
+        var configured = laneValue > 0 ? laneValue.Value : _settings.MaxDrainBatchesPerCycle;
+
+        if (GetDrainUntilEmpty(lane) && configured <= 1)
+            return int.MaxValue;
+
+        return Math.Max(1, configured);
+    }
+
+    private int? GetRemainingDrainActions(string lane, int actionsClaimed)
+    {
+        var laneValue = GetLaneSettings(lane)?.MaxDrainActionsPerCycle;
+        var maxActions = laneValue > 0 ? laneValue.Value : _settings.MaxDrainActionsPerCycle;
+
+        if (maxActions <= 0)
+            return null;
+
+        return Math.Max(0, maxActions - actionsClaimed);
+    }
+
+    private bool GetDrainUntilEmpty(string lane)
+        => GetLaneSettings(lane)?.DrainUntilEmpty ?? _settings.DrainUntilEmpty;
+
+    private TimeSpan GetYieldBetweenDrainBatches(string lane)
+    {
+        var laneValue = GetLaneSettings(lane)?.YieldBetweenDrainBatches;
+        return laneValue > TimeSpan.Zero ? laneValue.Value : _settings.YieldBetweenDrainBatches;
+    }
 
     private TimeSpan GetPollingInterval(string lane)
     {

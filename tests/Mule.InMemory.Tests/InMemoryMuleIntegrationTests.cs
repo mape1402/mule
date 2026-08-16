@@ -46,6 +46,8 @@ public sealed class InMemoryMuleIntegrationTests
         var diagnostics = await host.Services.GetRequiredService<IMuleDiagnostics>().GetSnapshotAsync();
         Assert.True(diagnostics.ThroughputPerMinute >= 1);
         Assert.True(diagnostics.RuntimeCompleted >= 1);
+        Assert.True(diagnostics.CompletedPerMinuteByLane[MuleSettings.DefaultLane] >= 1);
+        Assert.True(diagnostics.CompletedPerMinuteByActionKey[Key] >= 1);
     }
 
     [Fact]
@@ -258,6 +260,76 @@ public sealed class InMemoryMuleIntegrationTests
         await host.StopAsync();
 
         Assert.True(elapsed < TimeSpan.FromMilliseconds(450), $"Fast lane was blocked by slow lane for {elapsed}.");
+    }
+
+    [Fact]
+    public async Task ImmediateDispatch_Should_Run_Configured_Lane_Workers_Independently()
+    {
+        using var host = CreateHost(configureSettings: settings =>
+        {
+            settings.Lanes["slow"] = new MuleLaneSettings
+            {
+                WorkerCount = 1,
+                MaxDegreeOfParallelism = 1
+            };
+            settings.Lanes["fast"] = new MuleLaneSettings
+            {
+                WorkerCount = 1,
+                MaxDegreeOfParallelism = 1,
+                Priority = 10,
+                Weight = 5
+            };
+        });
+        await host.StartAsync();
+
+        using var scope = host.Services.CreateScope();
+        var client = scope.ServiceProvider.GetRequiredService<IMuleClient>();
+        var startedOnUtc = DateTimeOffset.UtcNow;
+
+        await client.EnqueueAsync(
+            Key,
+            new TestPayload("slow-immediate", 500),
+            options => options.Lane = "slow");
+        await client.EnqueueAsync(
+            Key,
+            new TestPayload("fast-immediate", 0),
+            options => options.Lane = "fast");
+
+        var probe = host.Services.GetRequiredService<TestProbe>();
+        await probe.WaitForValueAsync("fast-immediate");
+        var elapsed = DateTimeOffset.UtcNow - startedOnUtc;
+        await host.StopAsync();
+
+        Assert.True(elapsed < TimeSpan.FromMilliseconds(450), $"Fast lane immediate worker was blocked for {elapsed}.");
+    }
+
+    [Fact]
+    public async Task ScheduledRecovery_Should_Drain_Until_Empty_When_Configured()
+    {
+        using var host = CreateHost(configureSettings: settings =>
+        {
+            settings.ImmediateDispatch = false;
+            settings.RecoveryMode = MuleRecoveryMode.Scheduled;
+            settings.DispatchInterval = TimeSpan.FromHours(1);
+            settings.DispatchBatchSize = 1;
+            settings.DrainUntilEmpty = true;
+            settings.MaxDrainActionsPerCycle = 10;
+        });
+
+        using (var scope = host.Services.CreateScope())
+        {
+            var client = scope.ServiceProvider.GetRequiredService<IMuleClient>();
+            for (var index = 0; index < 5; index++)
+                await client.EnqueueAsync(Key, new TestPayload($"drain-{index}"));
+        }
+
+        await host.StartAsync();
+
+        var probe = host.Services.GetRequiredService<TestProbe>();
+        await probe.WaitForCountAsync(5);
+        await host.StopAsync();
+
+        Assert.Equal(5, probe.Values.Count);
     }
 
     [Fact]

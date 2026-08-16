@@ -13,6 +13,7 @@ internal sealed class ChannelMuleDispatchQueue : IMuleDispatchQueue
         SingleWriter = false
     });
     private readonly MuleSettings _settings;
+    private int _fairScheduleCursor;
 
     public ChannelMuleDispatchQueue(IOptions<MuleSettings> settings)
     {
@@ -27,10 +28,50 @@ internal sealed class ChannelMuleDispatchQueue : IMuleDispatchQueue
     }
 
     public async ValueTask<MuleDispatchItem> DequeueAsync(CancellationToken cancellationToken = default)
+        => await DequeueFromLanesAsync(
+            () => GetFairLaneNames(),
+            cancellationToken);
+
+    public async ValueTask<MuleDispatchItem> DequeueAsync(string lane, CancellationToken cancellationToken = default)
+    {
+        lane = NormalizeLane(lane);
+        var channel = GetChannel(lane);
+
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            if (!await channel.Reader.WaitToReadAsync(cancellationToken))
+                continue;
+
+            if (channel.Reader.TryRead(out var actionId))
+                return new MuleDispatchItem(actionId, lane);
+        }
+
+        throw new OperationCanceledException(cancellationToken);
+    }
+
+    public async ValueTask<MuleDispatchItem> DequeueUnassignedAsync(
+        IReadOnlyCollection<string> assignedLanes,
+        CancellationToken cancellationToken = default)
+        => await DequeueFromLanesAsync(
+            () =>
+            {
+                var assigned = new HashSet<string>(
+                    assignedLanes.Select(NormalizeLane),
+                    StringComparer.OrdinalIgnoreCase);
+
+                return GetFairLaneNames()
+                    .Where(lane => !assigned.Contains(lane))
+                    .ToArray();
+            },
+            cancellationToken);
+
+    private async ValueTask<MuleDispatchItem> DequeueFromLanesAsync(
+        Func<IReadOnlyCollection<string>> getLanes,
+        CancellationToken cancellationToken)
     {
         while (!cancellationToken.IsCancellationRequested)
         {
-            foreach (var lane in GetLaneNames())
+            foreach (var lane in getLanes())
             {
                 if (GetChannel(lane).Reader.TryRead(out var actionId))
                     return new MuleDispatchItem(actionId, lane);
@@ -74,16 +115,30 @@ internal sealed class ChannelMuleDispatchQueue : IMuleDispatchQueue
         });
     }
 
-    private IReadOnlyCollection<string> GetLaneNames()
+    private IReadOnlyCollection<string> GetFairLaneNames()
     {
         lock (_gate)
         {
-            return new[] { MuleSettings.DefaultLane }
+            var lanes = new[] { MuleSettings.DefaultLane }
                 .Concat(_settings.Lanes.Keys)
                 .Concat(_channels.Keys)
                 .Distinct(StringComparer.OrdinalIgnoreCase)
                 .OrderByDescending(GetPriority)
                 .ThenBy(x => x, StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+
+            var schedule = lanes
+                .SelectMany(lane => Enumerable.Repeat(lane, GetWeight(lane)))
+                .ToArray();
+
+            if (schedule.Length == 0)
+                return lanes;
+
+            var start = Math.Abs(_fairScheduleCursor++ % schedule.Length);
+            return schedule
+                .Skip(start)
+                .Concat(schedule.Take(start))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
                 .ToArray();
         }
     }
@@ -96,6 +151,13 @@ internal sealed class ChannelMuleDispatchQueue : IMuleDispatchQueue
 
     private int GetPriority(string lane)
         => GetLaneSettings(lane)?.Priority ?? 0;
+
+    private int GetWeight(string lane)
+    {
+        var settings = GetLaneSettings(lane);
+        var weight = settings?.Weight > 0 ? settings.Weight : Math.Max(1, settings?.Priority ?? 1);
+        return Math.Clamp(weight, 1, 100);
+    }
 
     private MuleLaneSettings GetLaneSettings(string lane)
         => _settings.Lanes.TryGetValue(NormalizeLane(lane), out var settings) ? settings : null;

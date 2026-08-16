@@ -235,7 +235,11 @@ internal sealed class InMemoryMuleStore
                 RetriesByActionKey = _actions
                     .Where(x => x.Attempts > 0)
                     .GroupBy(x => x.Key)
-                    .ToDictionary(x => x.Key, x => x.Sum(action => action.Attempts))
+                    .ToDictionary(x => x.Key, x => x.Sum(action => action.Attempts)),
+                CompletedPerMinuteByLane = runtime.CompletedPerMinuteByLane,
+                CompletedPerMinuteByActionKey = runtime.CompletedPerMinuteByActionKey,
+                RuntimeFailedByLane = runtime.RuntimeFailedByLane,
+                RuntimeFailedByActionKey = runtime.RuntimeFailedByActionKey
             };
         }
     }

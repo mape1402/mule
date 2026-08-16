@@ -8,6 +8,14 @@ public sealed class MuleLaneSettings
 
     public int DispatchBatchSize { get; set; }
 
+    public int MaxDrainBatchesPerCycle { get; set; }
+
+    public int MaxDrainActionsPerCycle { get; set; }
+
+    public bool? DrainUntilEmpty { get; set; }
+
+    public TimeSpan YieldBetweenDrainBatches { get; set; }
+
     public int DispatchQueueCapacity { get; set; }
 
     public TimeSpan PollingInterval { get; set; }
@@ -19,4 +27,6 @@ public sealed class MuleLaneSettings
     public MuleRetryPolicy RetryPolicy { get; set; }
 
     public int Priority { get; set; }
+
+    public int Weight { get; set; }
 }

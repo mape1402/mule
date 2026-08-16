@@ -24,6 +24,7 @@ Package IDs are descriptive, but namespaces stay short:
 
 ```csharp
 using Mule;
+using Mule.Configuration;
 using Mule.InMemory;
 using Mule.EntityFrameworkCore;
 using Mule.Testing;
@@ -315,6 +316,10 @@ services.AddMule(mule => mule
         settings.RecoveryMode = MuleRecoveryMode.Scheduled;
         settings.DispatchInterval = TimeSpan.FromSeconds(5);
         settings.DispatchBatchSize = 50;
+        settings.MaxDrainBatchesPerCycle = 4;
+        settings.MaxDrainActionsPerCycle = 1_000;
+        settings.DrainUntilEmpty = false;
+        settings.YieldBetweenDrainBatches = TimeSpan.FromMilliseconds(1);
         settings.WorkerCount = 2;
         settings.MaxDegreeOfParallelism = 8;
         settings.MaxAttempts = 10;
@@ -331,6 +336,10 @@ services.AddMule(mule => mule
             DispatchBatchSize = 100,
             DispatchQueueCapacity = 1_000,
             PollingInterval = TimeSpan.FromSeconds(2),
+            MaxDrainBatchesPerCycle = 8,
+            MaxDrainActionsPerCycle = 2_000,
+            DrainUntilEmpty = true,
+            YieldBetweenDrainBatches = TimeSpan.FromMilliseconds(1),
             RetryPolicy = new MuleRetryPolicy
             {
                 MaxAttempts = 12,
@@ -339,7 +348,8 @@ services.AddMule(mule => mule
                 Backoff = MuleRetryBackoff.Exponential,
                 JitterRatio = 0.10
             },
-            Priority = 10
+            Priority = 10,
+            Weight = 5
         };
 
         settings.Lanes["notifications"] = new MuleLaneSettings
@@ -359,6 +369,14 @@ services.AddMule(mule => mule
 
 `DispatchBatchSize` controls how many eligible actions a worker claims in one storage operation.
 
+`MaxDrainBatchesPerCycle` controls how many claim batches a worker can drain from a lane before yielding to the next recovery cycle.
+
+`MaxDrainActionsPerCycle` caps the total actions claimed from a lane in one drain cycle. Use `0` for no action cap.
+
+`DrainUntilEmpty` lets recovery continue claiming from a lane until storage returns no due work or another drain cap is reached.
+
+`YieldBetweenDrainBatches` inserts a small delay between drain batches so high-throughput recovery does not monopolize CPU or storage connections.
+
 `DispatchQueueCapacity` controls the in-memory immediate dispatch queue capacity. Use `0` for an unbounded queue.
 
 Lane-level `DispatchQueueCapacity` lets a busy lane absorb foreground enqueue bursts without letting that lane consume the full process queue. If omitted or set to `0`, the lane uses the global queue capacity.
@@ -367,7 +385,7 @@ Lane-level `PollingInterval` controls how often that lane checks durable storage
 
 `LockTimeout` is the lease duration. If a process dies while an action is locked, the action becomes claimable again after the lock expires.
 
-Lane settings override the global worker count, batch size, queue capacity, polling interval, parallelism, retry delay, max attempts, and priority for actions enqueued into that lane.
+Lane settings override the global worker count, batch size, drain limits, queue capacity, polling interval, parallelism, retry delay, max attempts, priority, and scheduling weight for actions enqueued into that lane.
 
 `RetryPolicy` can be configured globally or per lane. It supports fixed, linear, and exponential backoff, optional max delay, and optional jitter:
 
@@ -384,7 +402,35 @@ settings.RetryPolicy = new MuleRetryPolicy
 
 The older `MaxAttempts` and `RetryDelay` settings remain supported. Mule uses them when no `RetryPolicy` is configured.
 
-Lanes with higher `Priority` are claimed before lower-priority lanes during recovery cycles. Lanes with the same priority are processed together.
+`Priority` and `Weight` guide lane scheduling. Higher-priority lanes get more opportunities, but Mule uses weighted fair scheduling so lower-priority lanes still receive turns while high-priority lanes have constant backlog.
+
+Immediate dispatch starts workers for each configured lane using that lane's `WorkerCount`. Mule also keeps fallback workers for lanes that are used without explicit lane configuration, so simple applications can keep using the `default` lane only.
+
+`ConfigureHighThroughputRuntime()` applies productive generic defaults for durable inbox/outbox-style workloads. `ConfigureLane(...)` is a chainable helper for lane-specific tuning:
+
+```csharp
+services.AddMule(mule => mule
+    .UseEntityFrameworkCore<AppDbContext>()
+    .ConfigureHighThroughputRuntime()
+    .ConfigureLane("responses", lane =>
+    {
+        lane.Priority = 100;
+        lane.Weight = 10;
+        lane.WorkerCount = 16;
+        lane.MaxDegreeOfParallelism = 128;
+        lane.DispatchBatchSize = 500;
+        lane.DispatchQueueCapacity = 10_000;
+        lane.DrainUntilEmpty = true;
+    })
+    .ConfigureLane("dispatches", lane =>
+    {
+        lane.Priority = 50;
+        lane.Weight = 5;
+        lane.WorkerCount = 8;
+        lane.MaxDegreeOfParallelism = 64;
+    })
+    .AddActionsFromAssemblyContaining<SendReceiptAction>());
+```
 
 `RecoveryMode` controls how pending work is recovered:
 
@@ -421,8 +467,12 @@ The snapshot includes:
 - expired lock count
 - duplicates ignored by idempotency
 - throughput per minute
+- completed per minute by lane
+- completed per minute by action key
 - runtime completed count
 - runtime failed count
+- runtime failed count by lane
+- runtime failed count by action key
 - oldest pending timestamp
 - oldest locked timestamp
 - oldest failed timestamp
