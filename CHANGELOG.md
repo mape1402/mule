@@ -4,6 +4,18 @@ All notable changes to Mule packages will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- Added a bounded lane action executor that separates reading/claiming from action execution.
+- Added `ExecutionQueueCapacity` globally and per lane for claimed actions waiting on execution slots.
+- Added executor diagnostics for claimed actions, waiting execution count, executing count, saturation, and oldest waiting execution age by lane.
+- Added integration coverage for non-blocking queue readers, real `MaxDegreeOfParallelism` enforcement, recovery through the executor, and bounded executor backpressure.
+
+### Changed
+
+- Changed immediate dispatch and recovery workers to lock/claim actions, enqueue them into the lane executor, and continue admitting work instead of executing actions inline.
+- Changed `WorkerCount` semantics to represent readers/claimers per lane while `MaxDegreeOfParallelism` controls actual concurrent execution.
+
 ## [v1.3.0] - 2026-08-16
 
 ### Added

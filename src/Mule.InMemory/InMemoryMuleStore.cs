@@ -239,7 +239,12 @@ internal sealed class InMemoryMuleStore
                 CompletedPerMinuteByLane = runtime.CompletedPerMinuteByLane,
                 CompletedPerMinuteByActionKey = runtime.CompletedPerMinuteByActionKey,
                 RuntimeFailedByLane = runtime.RuntimeFailedByLane,
-                RuntimeFailedByActionKey = runtime.RuntimeFailedByActionKey
+                RuntimeFailedByActionKey = runtime.RuntimeFailedByActionKey,
+                ClaimedByLane = runtime.ClaimedByLane,
+                WaitingExecutionByLane = runtime.WaitingExecutionByLane,
+                ExecutingByLane = runtime.ExecutingByLane,
+                ExecutorSaturationByLane = runtime.ExecutorSaturationByLane,
+                OldestWaitingExecutionAgeByLane = runtime.OldestWaitingExecutionAgeByLane
             };
         }
     }

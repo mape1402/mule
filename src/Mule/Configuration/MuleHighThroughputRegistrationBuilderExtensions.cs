@@ -14,6 +14,7 @@ public static class MuleHighThroughputRegistrationBuilderExtensions
             settings.WorkerCount = Math.Max(settings.WorkerCount, Environment.ProcessorCount);
             settings.MaxDegreeOfParallelism = Math.Max(settings.MaxDegreeOfParallelism, Environment.ProcessorCount * 8);
             settings.DispatchBatchSize = Math.Max(settings.DispatchBatchSize, 250);
+            settings.ExecutionQueueCapacity = Math.Max(settings.ExecutionQueueCapacity, 10_000);
             settings.MaxDrainBatchesPerCycle = Math.Max(settings.MaxDrainBatchesPerCycle, 8);
             settings.MaxDrainActionsPerCycle = Math.Max(settings.MaxDrainActionsPerCycle, 2_000);
             settings.YieldBetweenDrainBatches = settings.YieldBetweenDrainBatches <= TimeSpan.Zero

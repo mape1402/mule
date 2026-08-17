@@ -320,6 +320,7 @@ services.AddMule(mule => mule
         settings.MaxDrainActionsPerCycle = 1_000;
         settings.DrainUntilEmpty = false;
         settings.YieldBetweenDrainBatches = TimeSpan.FromMilliseconds(1);
+        settings.ExecutionQueueCapacity = 10_000;
         settings.WorkerCount = 2;
         settings.MaxDegreeOfParallelism = 8;
         settings.MaxAttempts = 10;
@@ -335,6 +336,7 @@ services.AddMule(mule => mule
             MaxDegreeOfParallelism = 8,
             DispatchBatchSize = 100,
             DispatchQueueCapacity = 1_000,
+            ExecutionQueueCapacity = 5_000,
             PollingInterval = TimeSpan.FromSeconds(2),
             MaxDrainBatchesPerCycle = 8,
             MaxDrainActionsPerCycle = 2_000,
@@ -363,9 +365,11 @@ services.AddMule(mule => mule
     .AddActionsFromAssemblyContaining<SendReceiptAction>());
 ```
 
-`WorkerCount` controls how many workers try to claim batches.
+`WorkerCount` controls how many readers/claimers admit work for a lane.
 
-`MaxDegreeOfParallelism` controls how many actions from the same lane can execute at the same time inside a process.
+`MaxDegreeOfParallelism` controls how many already-claimed actions from the same lane can execute at the same time inside a process.
+
+Readers and claimers do not execute actions inline. They lock or claim durable actions, enqueue them into a bounded lane executor, and immediately continue admitting more work unless the lane executor applies backpressure.
 
 `DispatchBatchSize` controls how many eligible actions a worker claims in one storage operation.
 
@@ -380,6 +384,8 @@ services.AddMule(mule => mule
 `DispatchQueueCapacity` controls the in-memory immediate dispatch queue capacity. Use `0` for an unbounded queue.
 
 Lane-level `DispatchQueueCapacity` lets a busy lane absorb foreground enqueue bursts without letting that lane consume the full process queue. If omitted or set to `0`, the lane uses the global queue capacity.
+
+`ExecutionQueueCapacity` controls the per-lane queue of locked or claimed actions waiting for an execution slot. Use a bounded value for high-volume workloads so memory cannot grow without limit. When the execution queue is saturated, Mule readers wait before taking more durable locks whenever possible.
 
 Lane-level `PollingInterval` controls how often that lane checks durable storage when `RecoveryMode` is `Polling`. If omitted or set to `TimeSpan.Zero`, the lane uses the global `DispatchInterval`.
 
@@ -420,6 +426,7 @@ services.AddMule(mule => mule
         lane.MaxDegreeOfParallelism = 128;
         lane.DispatchBatchSize = 500;
         lane.DispatchQueueCapacity = 10_000;
+        lane.ExecutionQueueCapacity = 20_000;
         lane.DrainUntilEmpty = true;
     })
     .ConfigureLane("dispatches", lane =>
@@ -447,6 +454,8 @@ Use `Polling` when another process may insert work without notifying the current
 
 Mule uses atomic storage claims and locks so multiple service replicas can run workers at the same time without intentionally executing the same locked action concurrently. Actions should still be idempotent because Mule provides at-least-once execution.
 
+For large workloads, tune `WorkerCount` and `MaxDegreeOfParallelism` independently. Increase `WorkerCount` when storage admission is slow. Increase `MaxDegreeOfParallelism` when handlers are the bottleneck. Use `ExecutionQueueCapacity` to bound claimed work waiting behind slow handlers.
+
 SQL Server claims use update locks with `READPAST`, so a replica may skip rows that another replica is locking at that exact moment. That is expected: later waves or later polling cycles can claim the remaining rows without duplicating work.
 
 ## Diagnostics
@@ -473,6 +482,11 @@ The snapshot includes:
 - runtime failed count
 - runtime failed count by lane
 - runtime failed count by action key
+- claimed count by lane
+- waiting execution count by lane
+- executing count by lane
+- executor saturation count by lane
+- oldest waiting execution age by lane
 - oldest pending timestamp
 - oldest locked timestamp
 - oldest failed timestamp
