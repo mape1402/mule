@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <IsPackable>true</IsPackable>
+    <PackageId>Mule.DurableActions.FastLane.InMemory</PackageId>
+    <Title>Mule Durable Actions FastLane In-Memory Buffer</Title>
+    <PackageType>Dependency</PackageType>
+    <Description>Optional in-memory FastLane buffer for Mule durable actions, reducing foreground persistence latency by batching durable flushes.</Description>
+    <PackageTags>$(PackageTags);fastlane;buffering;batching;in-memory</PackageTags>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Mule\Mule.csproj" />
+  </ItemGroup>
+
+</Project>

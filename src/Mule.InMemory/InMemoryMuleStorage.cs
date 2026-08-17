@@ -3,7 +3,7 @@ namespace Mule.InMemory;
 using System.Transactions;
 using Mule.Diagnostics;
 
-internal sealed class InMemoryMuleStorage : IMuleStorage
+internal sealed class InMemoryMuleStorage : IMuleDurableStorage
 {
     private readonly InMemoryMuleStore _store;
     private readonly MuleRuntimeMetrics _metrics;

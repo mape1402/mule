@@ -12,12 +12,14 @@ Mule provides **at-least-once execution**. Actions should be idempotent, or you 
 dotnet add package Mule.DurableActions
 dotnet add package Mule.DurableActions.InMemory
 dotnet add package Mule.DurableActions.EntityFrameworkCore
+dotnet add package Mule.DurableActions.FastLane.InMemory
 dotnet add package Mule.DurableActions.Testing
 ```
 
 - `Mule.DurableActions`: core API, dispatcher, registration, serialization, and contracts.
 - `Mule.DurableActions.InMemory`: in-memory provider for tests, samples, and local experiments.
 - `Mule.DurableActions.EntityFrameworkCore`: EF Core provider for durable storage.
+- `Mule.DurableActions.FastLane.InMemory`: optional in-memory buffer that accepts foreground work quickly and flushes durable storage in batches.
 - `Mule.DurableActions.Testing`: test harness helpers for durable action assertions.
 
 Package IDs are descriptive, but namespaces stay short:
@@ -27,6 +29,7 @@ using Mule;
 using Mule.Configuration;
 using Mule.InMemory;
 using Mule.EntityFrameworkCore;
+using Mule.FastLane.InMemory;
 using Mule.Testing;
 ```
 
@@ -327,6 +330,26 @@ await db.Database.EnsureCreatedAsync();
 `UseEntityFrameworkMule(...)` and `MuleDbContext` remain available for standalone storage, but `UseEntityFrameworkCore<TDbContext>()` is the recommended integration for applications that already have a DbContext.
 
 For existing SQL Server installations upgrading to the lane and latency model, use [docs/sql-server-upgrade-1.2.0.sql](/C:/elysium/mule/docs/sql-server-upgrade-1.2.0.sql) as the reference migration. It adds lane and runtime timestamp columns, creates the filtered deduplication constraint, and adds the lane/status/due-date index used by the dispatcher.
+
+### FastLane InMemory
+
+FastLane InMemory is an optional buffer for high-throughput producers:
+
+```csharp
+services.AddMule(mule => mule
+    .UseEntityFrameworkCore<AppDbContext>()
+    .UseFastLaneInMemory(options =>
+    {
+        options.IntentFlushSize = 500;
+        options.CompletionFlushSize = 1_000;
+        options.FlushInterval = TimeSpan.FromMilliseconds(50);
+    })
+    .AddActionsFromAssemblyContaining<SendReceiptAction>());
+```
+
+With FastLane InMemory, `EnqueueAsync` and `EnqueueManyAsync` acknowledge after the intent is accepted by the in-process buffer. Mule can execute that buffered work immediately, while a background flusher persists intents to the durable provider in batches. Terminal states are also buffered and flushed after their intents have been persisted, so durable storage observes the intent before `Completed` or `Failed`.
+
+This mode is faster than direct EF Core writes, but it is intentionally less durable. If the process exits before a flush, buffered intents or terminal updates that have not reached the durable provider can be lost. Use it when the producer can tolerate that window.
 
 ## Dispatcher Settings
 
