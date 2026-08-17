@@ -19,7 +19,9 @@ public static class EntityFrameworkMuleServiceCollectionExtensions
         {
             services.AddMuleDbContextOptions<TDbContext>();
             services.TryAddScoped<IMuleDbContextFactory<TDbContext>, MuleDbContextFactory<TDbContext>>();
-            services.TryAddScoped<IMuleStorage, EntityFrameworkMuleStorage<TDbContext>>();
+            services.TryAddScoped<EntityFrameworkMuleStorage<TDbContext>>();
+            services.TryAddScoped<IMuleDurableStorage>(provider => provider.GetRequiredService<EntityFrameworkMuleStorage<TDbContext>>());
+            services.TryAddScoped<IMuleStorage>(provider => provider.GetRequiredService<EntityFrameworkMuleStorage<TDbContext>>());
             services.TryAddScoped<IMuleDiagnostics, EntityFrameworkMuleDiagnostics<TDbContext>>();
         });
     }
@@ -37,7 +39,9 @@ public static class EntityFrameworkMuleServiceCollectionExtensions
         services.AddDbContext<MuleDbContext>(configure);
         services.AddMuleDbContextOptions<MuleDbContext>();
         services.TryAddScoped<IMuleDbContextFactory<MuleDbContext>, MuleDbContextFactory<MuleDbContext>>();
-        services.TryAddScoped<IMuleStorage, EntityFrameworkMuleStorage>();
+        services.TryAddScoped<EntityFrameworkMuleStorage>();
+        services.TryAddScoped<IMuleDurableStorage>(provider => provider.GetRequiredService<EntityFrameworkMuleStorage>());
+        services.TryAddScoped<IMuleStorage>(provider => provider.GetRequiredService<EntityFrameworkMuleStorage>());
         services.TryAddScoped<IMuleDiagnostics, EntityFrameworkMuleDiagnostics>();
 
         return services;

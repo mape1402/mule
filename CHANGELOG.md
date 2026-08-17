@@ -13,6 +13,9 @@ All notable changes to Mule packages will be documented in this file.
 - Added `MuleIntent` and `IMuleClient.EnqueueManyAsync(...)` for registering multiple durable intents with a single client call.
 - Added batch storage insertion support for Mule storage providers.
 - Added SQL Server integration coverage for batch enqueue, direct completion updates, and batch cleanup deletes.
+- Added `Mule.DurableActions.FastLane.InMemory`, an optional in-process buffer that acknowledges enqueue after buffer write and flushes intents and terminal states to durable storage in batches.
+- Added `IMuleDurableStorage` so optional buffering providers can decorate active storage without losing access to the final durable provider.
+- Added FastLane InMemory integration coverage for buffered execution and ordered intent-before-terminal durable flushes.
 
 ### Changed
 

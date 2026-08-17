@@ -23,7 +23,9 @@ public static class InMemoryMuleServiceCollectionExtensions
 
         services.TryAddSingleton<InMemoryMuleStore>();
         services.TryAddSingleton<IInMemoryMule, InMemoryMule>();
-        services.TryAddScoped<IMuleStorage, InMemoryMuleStorage>();
+        services.TryAddScoped<InMemoryMuleStorage>();
+        services.TryAddScoped<IMuleDurableStorage>(provider => provider.GetRequiredService<InMemoryMuleStorage>());
+        services.TryAddScoped<IMuleStorage>(provider => provider.GetRequiredService<InMemoryMuleStorage>());
         services.TryAddSingleton<IMuleDiagnostics, InMemoryMuleDiagnostics>();
 
         return services;

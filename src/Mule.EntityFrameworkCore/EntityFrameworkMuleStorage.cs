@@ -6,7 +6,7 @@ using Microsoft.EntityFrameworkCore.Metadata;
 using Microsoft.EntityFrameworkCore.Storage;
 using Mule.Diagnostics;
 
-internal class EntityFrameworkMuleStorage<TDbContext> : IMuleStorage, IDisposable, IAsyncDisposable
+internal class EntityFrameworkMuleStorage<TDbContext> : IMuleDurableStorage, IDisposable, IAsyncDisposable
     where TDbContext : DbContext
 {
     private readonly TDbContext _dbContext;
@@ -161,14 +161,21 @@ internal class EntityFrameworkMuleStorage<TDbContext> : IMuleStorage, IDisposabl
         DateTimeOffset now,
         CancellationToken cancellationToken)
     {
+        var normalizedLane = NormalizeLane(lane);
         var candidates = await Actions
             .Where(x =>
-                x.Lane == NormalizeLane(lane) &&
-                (x.Status == DurableActionStatus.Pending && (x.NextAttemptOnUtc == null || x.NextAttemptOnUtc <= now) ||
-                x.Status == DurableActionStatus.Locked && x.LockedOnUtc <= lockExpiration))
-            .OrderBy(x => x.CreatedOnUtc)
-            .Take(batchSize)
+                x.Lane == normalizedLane &&
+                (x.Status == DurableActionStatus.Pending || x.Status == DurableActionStatus.Locked))
             .ToListAsync(cancellationToken);
+
+        candidates = candidates
+            .Where(x =>
+                x.Status == DurableActionStatus.Pending && (x.NextAttemptOnUtc == null || x.NextAttemptOnUtc <= now) ||
+                x.Status == DurableActionStatus.Locked && x.LockedOnUtc <= lockExpiration)
+            .OrderBy(x => x.NextAttemptOnUtc ?? x.CreatedOnUtc)
+            .ThenBy(x => x.CreatedOnUtc)
+            .Take(batchSize)
+            .ToList();
 
         foreach (var action in candidates)
         {
