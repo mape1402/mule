@@ -275,8 +275,7 @@ internal sealed class MuleDispatcherHostedService : BackgroundService
             actionsClaimed += actions.Count;
             _metrics.RecordClaimed(lane, actions.Count);
 
-            foreach (var action in actions)
-                await _executor.EnqueueAsync(action, cancellationToken);
+            await _executor.EnqueueRangeAsync(actions, cancellationToken);
 
             if (!GetDrainUntilEmpty(lane))
                 return;

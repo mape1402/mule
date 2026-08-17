@@ -25,6 +25,24 @@ public sealed class InMemoryMuleIntegrationTests
     }
 
     [Fact]
+    public async Task EnqueueManyAsync_Should_Store_Actions()
+    {
+        using var host = CreateHost();
+        using var scope = host.Services.CreateScope();
+        var client = scope.ServiceProvider.GetRequiredService<IMuleClient>();
+
+        var ids = await client.EnqueueManyAsync(Enumerable.Range(0, 10)
+            .Select(index => MuleIntent.For(Key, new TestPayload($"stored-{index}"))));
+
+        var mule = host.Services.GetRequiredService<IInMemoryMule>();
+
+        Assert.Equal(10, ids.Count);
+        Assert.Equal(10, ids.Distinct().Count());
+        Assert.Equal(10, mule.Actions.Count);
+        Assert.All(mule.Actions, action => Assert.Equal(DurableActionStatus.Pending, action.Status));
+    }
+
+    [Fact]
     public async Task HostedService_Should_Execute_Queued_Action()
     {
         using var host = CreateHost();

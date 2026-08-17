@@ -24,6 +24,22 @@ internal sealed class InMemoryMuleStorage : IMuleStorage
         return Task.CompletedTask;
     }
 
+    public Task AddRangeAsync(IReadOnlyCollection<DurableAction> actions, CancellationToken cancellationToken = default)
+    {
+        if (actions == null)
+            throw new ArgumentNullException(nameof(actions));
+
+        foreach (var action in actions)
+        {
+            if (action == null)
+                throw new ArgumentException("Action collection cannot contain null values.", nameof(actions));
+
+            _pendingAdds.Add(action);
+        }
+
+        return Task.CompletedTask;
+    }
+
     public Task<Guid?> FindByDeduplicationKeyAsync(
         ActionKey key,
         string deduplicationKey,
