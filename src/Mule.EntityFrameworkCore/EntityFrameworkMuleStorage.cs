@@ -26,20 +26,67 @@ internal class EntityFrameworkMuleStorage<TDbContext> : IMuleStorage, IDisposabl
         if (action == null)
             throw new ArgumentNullException(nameof(action));
 
-        if (!string.IsNullOrWhiteSpace(action.DeduplicationKey))
-        {
-            var exists = await Actions.AnyAsync(
-                x => x.Key == action.Key && x.DeduplicationKey == action.DeduplicationKey,
-                cancellationToken);
+        await AddRangeAsync([action], cancellationToken);
+    }
 
-            if (exists)
-            {
-                _metrics.RecordDuplicateIgnored();
-                return;
-            }
+    public async Task AddRangeAsync(IReadOnlyCollection<DurableAction> actions, CancellationToken cancellationToken = default)
+    {
+        if (actions == null)
+            throw new ArgumentNullException(nameof(actions));
+
+        if (actions.Count == 0)
+            return;
+
+        foreach (var action in actions)
+        {
+            if (action == null)
+                throw new ArgumentException("Action collection cannot contain null values.", nameof(actions));
         }
 
-        await Actions.AddAsync(action, cancellationToken);
+        var deduplicatedActions = actions
+            .Where(x => !string.IsNullOrWhiteSpace(x.DeduplicationKey))
+            .ToArray();
+
+        if (deduplicatedActions.Length > 0)
+        {
+            var keys = deduplicatedActions
+                .Select(x => x.Key)
+                .Distinct()
+                .ToArray();
+            var deduplicationKeys = deduplicatedActions
+                .Select(x => x.DeduplicationKey)
+                .Distinct(StringComparer.Ordinal)
+                .ToArray();
+            var existing = await Actions
+                .AsNoTracking()
+                .Where(x => keys.Contains(x.Key) && deduplicationKeys.Contains(x.DeduplicationKey))
+                .Select(x => new { x.Key, x.DeduplicationKey })
+                .ToListAsync(cancellationToken);
+            var existingKeys = existing
+                .Select(x => (x.Key, x.DeduplicationKey))
+                .ToHashSet();
+
+            var newKeys = new HashSet<(ActionKey Key, string DeduplicationKey)>();
+            foreach (var action in deduplicatedActions)
+            {
+                var key = (action.Key, action.DeduplicationKey);
+                if (existingKeys.Contains(key) || !newKeys.Add(key))
+                {
+                    _metrics.RecordDuplicateIgnored();
+                    continue;
+                }
+
+                await Actions.AddAsync(action, cancellationToken);
+            }
+
+            var nonDeduplicatedActions = actions
+                .Where(x => string.IsNullOrWhiteSpace(x.DeduplicationKey))
+                .ToArray();
+            await Actions.AddRangeAsync(nonDeduplicatedActions, cancellationToken);
+            return;
+        }
+
+        await Actions.AddRangeAsync(actions, cancellationToken);
     }
 
     public async Task<Guid?> FindByDeduplicationKeyAsync(
@@ -136,6 +183,12 @@ internal class EntityFrameworkMuleStorage<TDbContext> : IMuleStorage, IDisposabl
 
     public async Task MarkCompletedAsync(Guid id, DateTimeOffset completedOnUtc, CancellationToken cancellationToken = default)
     {
+        if (IsSqlServer())
+        {
+            await MarkCompletedSqlServerAsync(id, completedOnUtc, cancellationToken);
+            return;
+        }
+
         var action = await FindAsync(id, cancellationToken);
         action.Status = DurableActionStatus.Completed;
         action.CompletedOnUtc = completedOnUtc;
@@ -152,6 +205,12 @@ internal class EntityFrameworkMuleStorage<TDbContext> : IMuleStorage, IDisposabl
         DateTimeOffset? nextAttemptOnUtc,
         CancellationToken cancellationToken = default)
     {
+        if (IsSqlServer())
+        {
+            await MarkFailedSqlServerAsync(id, error, now, nextAttemptOnUtc, cancellationToken);
+            return;
+        }
+
         var action = await FindAsync(id, cancellationToken);
         action.Attempts++;
         action.Status = nextAttemptOnUtc == null ? DurableActionStatus.Failed : DurableActionStatus.Pending;
@@ -163,6 +222,9 @@ internal class EntityFrameworkMuleStorage<TDbContext> : IMuleStorage, IDisposabl
 
     public async Task<int> CleanCompletedAsync(DateTimeOffset olderThanUtc, int batchSize, CancellationToken cancellationToken = default)
     {
+        if (IsSqlServer())
+            return await CleanCompletedSqlServerAsync(olderThanUtc, batchSize, cancellationToken);
+
         var candidates = await Actions
             .Where(x => x.Status == DurableActionStatus.Completed && x.CompletedOnUtc <= olderThanUtc)
             .ToListAsync(cancellationToken);
@@ -317,6 +379,87 @@ WHERE {{names.Id}} = {2}
         return 1;
     }
 
+    private async Task MarkCompletedSqlServerAsync(
+        Guid id,
+        DateTimeOffset completedOnUtc,
+        CancellationToken cancellationToken)
+    {
+        var names = GetActionStoreNames();
+        var sql = $$"""
+UPDATE {{names.Table}}
+SET {{names.Status}} = {0},
+    {{names.CompletedOnUtc}} = {1},
+    {{names.TerminalOnUtc}} = {1},
+    {{names.LockedOnUtc}} = NULL,
+    {{names.NextAttemptOnUtc}} = NULL,
+    {{names.LastError}} = NULL
+WHERE {{names.Id}} = {2}
+""";
+
+        await _dbContext.Database.ExecuteSqlRawAsync(
+            sql,
+            [
+                (int)DurableActionStatus.Completed,
+                completedOnUtc,
+                id
+            ],
+            cancellationToken);
+    }
+
+    private async Task MarkFailedSqlServerAsync(
+        Guid id,
+        string error,
+        DateTimeOffset now,
+        DateTimeOffset? nextAttemptOnUtc,
+        CancellationToken cancellationToken)
+    {
+        var names = GetActionStoreNames();
+        var sql = $$"""
+UPDATE {{names.Table}}
+SET {{names.Attempts}} = {{names.Attempts}} + 1,
+    {{names.Status}} = {0},
+    {{names.LastError}} = {1},
+    {{names.LockedOnUtc}} = NULL,
+    {{names.NextAttemptOnUtc}} = {2},
+    {{names.TerminalOnUtc}} = {3}
+WHERE {{names.Id}} = {4}
+""";
+
+        await _dbContext.Database.ExecuteSqlRawAsync(
+            sql,
+            [
+                (int)(nextAttemptOnUtc == null ? DurableActionStatus.Failed : DurableActionStatus.Pending),
+                error,
+                nextAttemptOnUtc,
+                nextAttemptOnUtc == null ? now : null,
+                id
+            ],
+            cancellationToken);
+    }
+
+    private async Task<int> CleanCompletedSqlServerAsync(
+        DateTimeOffset olderThanUtc,
+        int batchSize,
+        CancellationToken cancellationToken)
+    {
+        var names = GetActionStoreNames();
+        var sql = $$"""
+DELETE TOP ({0})
+FROM {{names.Table}}
+WHERE {{names.Status}} = {1}
+  AND {{names.CompletedOnUtc}} <= {2}
+""";
+
+        return await _dbContext.Database.ExecuteSqlRawAsync(
+            sql,
+            [
+                Math.Max(1, batchSize),
+                (int)DurableActionStatus.Completed,
+                olderThanUtc
+            ],
+            cancellationToken);
+    }
+
     private ActionStoreNames GetActionStoreNames()
     {
         var entity = _dbContext.Model.FindEntityType(typeof(DurableAction))
@@ -342,7 +485,11 @@ WHERE {{names.Id}} = {2}
             Column(nameof(DurableAction.LockedOnUtc)),
             Column(nameof(DurableAction.StartedOnUtc)),
             Column(nameof(DurableAction.CreatedOnUtc)),
-            Column(nameof(DurableAction.NextAttemptOnUtc)));
+            Column(nameof(DurableAction.NextAttemptOnUtc)),
+            Column(nameof(DurableAction.CompletedOnUtc)),
+            Column(nameof(DurableAction.TerminalOnUtc)),
+            Column(nameof(DurableAction.LastError)),
+            Column(nameof(DurableAction.Attempts)));
     }
 
     private async Task<DurableAction> FindAsync(Guid id, CancellationToken cancellationToken)
@@ -373,7 +520,11 @@ WHERE {{names.Id}} = {2}
         string LockedOnUtc,
         string StartedOnUtc,
         string CreatedOnUtc,
-        string NextAttemptOnUtc);
+        string NextAttemptOnUtc,
+        string CompletedOnUtc,
+        string TerminalOnUtc,
+        string LastError,
+        string Attempts);
 }
 
 internal sealed class EntityFrameworkMuleStorage : EntityFrameworkMuleStorage<MuleDbContext>

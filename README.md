@@ -94,6 +94,31 @@ await mule.EnqueueAsync(
 
 Mule persists the intent, queues it for background execution, and retries it if the action fails.
 
+### Batch Enqueue
+
+Use `EnqueueManyAsync` when a foreground workflow needs to register many durable intents at once:
+
+```csharp
+var ids = await mule.EnqueueManyAsync([
+    MuleIntent.For(
+        BillingActionKeys.CapturePayment,
+        new CapturePayment("order-1001", 120.00m),
+        options =>
+        {
+            options.Lane = "payments";
+            options.DeduplicationKey = "payment-intent-1001";
+        }),
+    MuleIntent.For(
+        ReceiptActionKeys.SendReceipt,
+        new SendReceipt("order-1001", "mario@example.com"),
+        options => options.CorrelationId = "checkout-1001")
+], cancellationToken);
+```
+
+`EnqueueManyAsync` stores the intents in one storage save operation where the provider supports it, then notifies Mule to dispatch each accepted action. Each `MuleIntent` carries its own `ActionKey`, payload, lane, correlation id, deduplication key, and metadata.
+
+The returned ids match the input order. If an intent uses a deduplication key and the work already exists, Mule returns the existing durable action id for that item.
+
 ## Action Discovery
 
 The recommended registration style is assembly discovery:
@@ -371,7 +396,7 @@ services.AddMule(mule => mule
 
 Readers and claimers do not execute actions inline. They lock or claim durable actions, enqueue them into a bounded lane executor, and immediately continue admitting more work unless the lane executor applies backpressure.
 
-`DispatchBatchSize` controls how many eligible actions a worker claims in one storage operation.
+`DispatchBatchSize` controls how many eligible actions a worker claims in one storage operation. Recovery workers claim pending work in batches and dispatch those batches to the lane executor instead of claiming and executing one action at a time.
 
 `MaxDrainBatchesPerCycle` controls how many claim batches a worker can drain from a lane before yielding to the next recovery cycle.
 
@@ -451,6 +476,8 @@ Use `Polling` when another process may insert work without notifying the current
 - `Disabled`: completed actions are kept for audit/history.
 - `Polling`: cleanup runs every `CleanupInterval`.
 - `Scheduled`: cleanup wakes when completed actions reach `CompletedRetention`.
+
+Cleanup is batch-oriented. `CleanupBatchSize` controls how many completed actions can be removed per storage operation. SQL Server uses direct batch delete statements for completed actions instead of loading entities one by one.
 
 Mule uses atomic storage claims and locks so multiple service replicas can run workers at the same time without intentionally executing the same locked action concurrently. Actions should still be idempotent because Mule provides at-least-once execution.
 

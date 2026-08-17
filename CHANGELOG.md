@@ -10,11 +10,17 @@ All notable changes to Mule packages will be documented in this file.
 - Added `ExecutionQueueCapacity` globally and per lane for claimed actions waiting on execution slots.
 - Added executor diagnostics for claimed actions, waiting execution count, executing count, saturation, and oldest waiting execution age by lane.
 - Added integration coverage for non-blocking queue readers, real `MaxDegreeOfParallelism` enforcement, recovery through the executor, and bounded executor backpressure.
+- Added `MuleIntent` and `IMuleClient.EnqueueManyAsync(...)` for registering multiple durable intents with a single client call.
+- Added batch storage insertion support for Mule storage providers.
+- Added SQL Server integration coverage for batch enqueue, direct completion updates, and batch cleanup deletes.
 
 ### Changed
 
 - Changed immediate dispatch and recovery workers to lock/claim actions, enqueue them into the lane executor, and continue admitting work instead of executing actions inline.
 - Changed `WorkerCount` semantics to represent readers/claimers per lane while `MaxDegreeOfParallelism` controls actual concurrent execution.
+- Changed recovery dispatch to pass claimed actions to the lane executor as a batch.
+- Changed SQL Server completion, failure, and cleanup paths to use direct SQL statements instead of loading tracked entities for each operation.
+- Changed EF Core indexes to include status-based locked recovery and completed cleanup paths.
 
 ## [v1.3.0] - 2026-08-16
 

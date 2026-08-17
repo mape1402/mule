@@ -110,6 +110,33 @@ public sealed class EntityFrameworkMuleTests
     }
 
     [Fact]
+    public async Task EnqueueManyAsync_Should_Persist_Actions()
+    {
+        using var host = CreateHost(out var databasePath);
+        await EnsureDatabaseAsync(host);
+
+        using var scope = host.Services.CreateScope();
+        var client = scope.ServiceProvider.GetRequiredService<IMuleClient>();
+
+        var ids = await client.EnqueueManyAsync(Enumerable.Range(0, 10)
+            .Select(index => MuleIntent.For(
+                Key,
+                new TestPayload($"stored-{index}"),
+                options => options.CorrelationId = $"batch-{index}")));
+
+        using var verificationScope = host.Services.CreateScope();
+        var db = verificationScope.ServiceProvider.GetRequiredService<MuleDbContext>();
+        var actions = await db.Actions.AsNoTracking().OrderBy(x => x.CorrelationId).ToArrayAsync();
+
+        Assert.Equal(10, ids.Count);
+        Assert.Equal(10, ids.Distinct().Count());
+        Assert.Equal(10, actions.Length);
+        Assert.Equal("batch-0", actions[0].CorrelationId);
+
+        TryDelete(databasePath);
+    }
+
+    [Fact]
     public async Task Diagnostics_Should_Report_State_Counts()
     {
         using var host = CreateHost(out var databasePath);
