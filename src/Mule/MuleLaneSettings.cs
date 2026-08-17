@@ -18,6 +18,8 @@ public sealed class MuleLaneSettings
 
     public int DispatchQueueCapacity { get; set; }
 
+    public int ExecutionQueueCapacity { get; set; }
+
     public TimeSpan PollingInterval { get; set; }
 
     public int MaxAttempts { get; set; }

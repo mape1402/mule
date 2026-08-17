@@ -10,18 +10,18 @@ internal sealed class MuleDispatcherHostedService : BackgroundService
 {
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly IMuleDispatchQueue _dispatchQueue;
+    private readonly MuleActionExecutor _executor;
     private readonly MuleSchedulerSignal _schedulerSignal;
     private readonly MuleSettings _settings;
-    private readonly ILogger<MuleDispatcherHostedService> _logger;
     private readonly MuleRuntimeMetrics _metrics;
-    private readonly Dictionary<string, SemaphoreSlim> _laneSemaphores;
-    private readonly object _laneSemaphoreGate = new();
+    private readonly ILogger<MuleDispatcherHostedService> _logger;
     private readonly Dictionary<string, DateTimeOffset> _nextLanePollingOnUtc = new(StringComparer.OrdinalIgnoreCase);
     private int _fairScheduleCursor;
 
     public MuleDispatcherHostedService(
         IServiceScopeFactory scopeFactory,
         IMuleDispatchQueue dispatchQueue,
+        MuleActionExecutor executor,
         MuleSchedulerSignal schedulerSignal,
         IOptions<MuleSettings> settings,
         MuleRuntimeMetrics metrics,
@@ -29,15 +29,11 @@ internal sealed class MuleDispatcherHostedService : BackgroundService
     {
         _scopeFactory = scopeFactory ?? throw new ArgumentNullException(nameof(scopeFactory));
         _dispatchQueue = dispatchQueue ?? throw new ArgumentNullException(nameof(dispatchQueue));
+        _executor = executor ?? throw new ArgumentNullException(nameof(executor));
         _schedulerSignal = schedulerSignal ?? throw new ArgumentNullException(nameof(schedulerSignal));
         _settings = settings?.Value ?? throw new ArgumentNullException(nameof(settings));
         _metrics = metrics ?? throw new ArgumentNullException(nameof(metrics));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
-        _laneSemaphores = GetLaneNames()
-            .ToDictionary(
-                lane => lane,
-                lane => new SemaphoreSlim(GetMaxDegreeOfParallelism(lane)),
-                StringComparer.OrdinalIgnoreCase);
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -60,8 +56,11 @@ internal sealed class MuleDispatcherHostedService : BackgroundService
             MuleCleanupMode.Scheduled => CleanCompletedOnScheduleAsync(stoppingToken),
             _ => CleanCompletedByPollingAsync(stoppingToken)
         };
+        _executor.Start(stoppingToken);
 
-        await Task.WhenAll(queueWorkers.Append(recoveryWorker).Append(cleanupWorker));
+        await Task.WhenAll(queueWorkers
+            .Append(recoveryWorker)
+            .Append(cleanupWorker));
     }
 
     private async Task ProcessQueuedActionsAsync(string lane, CancellationToken cancellationToken)
@@ -71,7 +70,7 @@ internal sealed class MuleDispatcherHostedService : BackgroundService
             try
             {
                 var item = await _dispatchQueue.DequeueAsync(lane, cancellationToken);
-                await DispatchQueuedActionAsync(item.ActionId, cancellationToken);
+                await DispatchQueuedActionAsync(item, cancellationToken);
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
@@ -93,7 +92,7 @@ internal sealed class MuleDispatcherHostedService : BackgroundService
             try
             {
                 var item = await _dispatchQueue.DequeueUnassignedAsync(assignedLanes, cancellationToken);
-                await DispatchQueuedActionAsync(item.ActionId, cancellationToken);
+                await DispatchQueuedActionAsync(item, cancellationToken);
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
@@ -266,6 +265,7 @@ internal sealed class MuleDispatcherHostedService : BackgroundService
             var batchSize = remainingActions == null
                 ? GetDispatchBatchSize(lane)
                 : Math.Min(GetDispatchBatchSize(lane), remainingActions.Value);
+            await _executor.WaitForCapacityAsync(lane, cancellationToken);
             var actions = await storage.ClaimPendingAsync(lane, batchSize, GetLockTimeout(), DateTimeOffset.UtcNow, cancellationToken);
 
             if (actions.Count == 0)
@@ -273,8 +273,10 @@ internal sealed class MuleDispatcherHostedService : BackgroundService
 
             batches++;
             actionsClaimed += actions.Count;
+            _metrics.RecordClaimed(lane, actions.Count);
 
-            await Task.WhenAll(actions.Select(action => DispatchClaimedActionAsync(action, cancellationToken)));
+            foreach (var action in actions)
+                await _executor.EnqueueAsync(action, cancellationToken);
 
             if (!GetDrainUntilEmpty(lane))
                 return;
@@ -294,82 +296,21 @@ internal sealed class MuleDispatcherHostedService : BackgroundService
         return await storage.GetNextPendingOnUtcAsync(GetLockTimeout(), DateTimeOffset.UtcNow, cancellationToken);
     }
 
-    private async Task DispatchQueuedActionAsync(Guid actionId, CancellationToken cancellationToken)
+    private async Task DispatchQueuedActionAsync(MuleDispatchItem item, CancellationToken cancellationToken)
     {
+        await _executor.WaitForCapacityAsync(item.Lane, cancellationToken);
+
         using var scope = _scopeFactory.CreateScope();
         var storage = scope.ServiceProvider.GetRequiredService<IMuleStorage>();
-        var action = await storage.LockAsync(actionId, GetLockTimeout(), DateTimeOffset.UtcNow, cancellationToken);
+        var action = await storage.LockAsync(item.ActionId, GetLockTimeout(), DateTimeOffset.UtcNow, cancellationToken);
 
         if (action == null)
             return;
 
         await storage.SaveChangesAsync(cancellationToken);
+        _metrics.RecordClaimed(action.Lane, 1);
 
-        await DispatchActionAsync(action, cancellationToken);
-    }
-
-    private async Task DispatchClaimedActionAsync(DurableAction action, CancellationToken cancellationToken)
-    {
-        if (action == null)
-            return;
-
-        await DispatchActionAsync(action, cancellationToken);
-    }
-
-    private async Task DispatchActionAsync(DurableAction action, CancellationToken cancellationToken)
-    {
-        var semaphore = GetLaneSemaphore(action.Lane);
-        await semaphore.WaitAsync(cancellationToken);
-
-        try
-        {
-            await ExecuteActionAsync(action, cancellationToken);
-        }
-        finally
-        {
-            semaphore.Release();
-        }
-    }
-
-    private async Task ExecuteActionAsync(DurableAction action, CancellationToken cancellationToken)
-    {
-        using var scope = _scopeFactory.CreateScope();
-        var storage = scope.ServiceProvider.GetRequiredService<IMuleStorage>();
-        var registry = scope.ServiceProvider.GetRequiredService<MuleActionRegistry>();
-        DateTimeOffset? nextAttemptOnUtc = null;
-        DateTimeOffset? completedOnUtc = null;
-
-        try
-        {
-            if (!registry.TryGetHandler(action.Key, out var handler))
-                throw new InvalidOperationException($"No Mule handler is registered for action key '{action.Key}'.");
-
-            await handler.ExecuteAsync(action, scope.ServiceProvider, cancellationToken);
-            completedOnUtc = DateTimeOffset.UtcNow;
-            await storage.MarkCompletedAsync(action.Id, completedOnUtc.Value, cancellationToken);
-            _metrics.RecordCompleted(action.Lane, action.Key, completedOnUtc.Value);
-        }
-        catch (Exception ex)
-        {
-            var nextAttempt = action.Attempts + 1;
-            var retryPolicy = GetRetryPolicy(action.Lane);
-            nextAttemptOnUtc = nextAttempt >= retryPolicy.MaxAttempts
-                ? null
-                : DateTimeOffset.UtcNow.Add(retryPolicy.GetDelay(nextAttempt));
-
-            await storage.MarkFailedAsync(action.Id, ex.ToString(), DateTimeOffset.UtcNow, nextAttemptOnUtc, cancellationToken);
-            if (nextAttemptOnUtc == null)
-                _metrics.RecordFailed(action.Lane, action.Key);
-            _logger.LogError(ex, "Mule action {MuleActionId} failed.", action.Id);
-        }
-
-        await storage.SaveChangesAsync(cancellationToken);
-
-        if (_settings.RecoveryMode == MuleRecoveryMode.Scheduled && nextAttemptOnUtc != null)
-            _schedulerSignal.SignalRecoveryAt(nextAttemptOnUtc.Value);
-
-        if (_settings.CleanupMode == MuleCleanupMode.Scheduled && completedOnUtc != null)
-            _schedulerSignal.SignalCleanupAt(completedOnUtc.Value.Add(GetCompletedRetention()));
+        await _executor.EnqueueAsync(action, cancellationToken);
     }
 
     private async Task CleanCompletedAsync(CancellationToken cancellationToken)
@@ -480,30 +421,10 @@ internal sealed class MuleDispatcherHostedService : BackgroundService
     private MuleLaneSettings GetLaneSettings(string lane)
         => _settings.Lanes.TryGetValue(NormalizeLane(lane), out var settings) ? settings : null;
 
-    private SemaphoreSlim GetLaneSemaphore(string lane)
-    {
-        lane = NormalizeLane(lane);
-        lock (_laneSemaphoreGate)
-        {
-            if (_laneSemaphores.TryGetValue(lane, out var semaphore))
-                return semaphore;
-
-            semaphore = new SemaphoreSlim(GetMaxDegreeOfParallelism(lane));
-            _laneSemaphores[lane] = semaphore;
-            return semaphore;
-        }
-    }
-
     private int GetWorkerCount(string lane)
     {
         var laneValue = GetLaneSettings(lane)?.WorkerCount;
         return Math.Max(1, laneValue > 0 ? laneValue.Value : _settings.WorkerCount);
-    }
-
-    private int GetMaxDegreeOfParallelism(string lane)
-    {
-        var laneValue = GetLaneSettings(lane)?.MaxDegreeOfParallelism;
-        return Math.Max(1, laneValue > 0 ? laneValue.Value : _settings.MaxDegreeOfParallelism);
     }
 
     private int GetDispatchBatchSize(string lane)
@@ -562,34 +483,6 @@ internal sealed class MuleDispatcherHostedService : BackgroundService
 
     private int GetCleanupBatchSize()
         => Math.Max(1, _settings.CleanupBatchSize);
-
-    private MuleRetryPolicy GetRetryPolicy(string lane)
-    {
-        var laneSettings = GetLaneSettings(lane);
-        var retryPolicy = laneSettings?.RetryPolicy ?? _settings.RetryPolicy;
-
-        if (retryPolicy != null)
-            return new MuleRetryPolicy
-            {
-                MaxAttempts = Math.Max(1, retryPolicy.MaxAttempts),
-                Delay = retryPolicy.Delay <= TimeSpan.Zero ? TimeSpan.FromSeconds(30) : retryPolicy.Delay,
-                MaxDelay = retryPolicy.MaxDelay,
-                Backoff = retryPolicy.Backoff,
-                JitterRatio = retryPolicy.JitterRatio
-            };
-
-        return new MuleRetryPolicy
-        {
-            MaxAttempts = Math.Max(1, laneSettings?.MaxAttempts > 0 ? laneSettings.MaxAttempts : _settings.MaxAttempts),
-            Delay = GetLegacyRetryDelay(laneSettings)
-        };
-    }
-
-    private TimeSpan GetLegacyRetryDelay(MuleLaneSettings laneSettings)
-    {
-        var retryDelay = laneSettings?.RetryDelay > TimeSpan.Zero ? laneSettings.RetryDelay : _settings.RetryDelay;
-        return retryDelay <= TimeSpan.Zero ? TimeSpan.FromSeconds(30) : retryDelay;
-    }
 
     private TimeSpan GetLockTimeout()
         => _settings.LockTimeout <= TimeSpan.Zero ? TimeSpan.FromMinutes(5) : _settings.LockTimeout;

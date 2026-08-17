@@ -22,6 +22,8 @@ public static class MuleServiceCollectionExtensions
         services.TryAddSingleton<MuleActionRegistry>();
         services.TryAddSingleton<IMuleActionRegistry>(provider => provider.GetRequiredService<MuleActionRegistry>());
         services.TryAddSingleton<IMuleDispatchQueue, ChannelMuleDispatchQueue>();
+        services.TryAddSingleton<MuleActionExecutor>();
+        services.TryAddSingleton<IMuleActionExecutor>(provider => provider.GetRequiredService<MuleActionExecutor>());
         services.TryAddSingleton<MuleSchedulerSignal>();
         services.TryAddSingleton<IMuleCommitNotifier, AmbientTransactionMuleCommitNotifier>();
         services.TryAddScoped<IMuleClient, MuleClient>();

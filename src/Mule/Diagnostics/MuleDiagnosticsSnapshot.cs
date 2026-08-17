@@ -51,4 +51,14 @@ public sealed class MuleDiagnosticsSnapshot
     public IReadOnlyDictionary<string, int> RuntimeFailedByLane { get; init; } = new Dictionary<string, int>();
 
     public IReadOnlyDictionary<ActionKey, int> RuntimeFailedByActionKey { get; init; } = new Dictionary<ActionKey, int>();
+
+    public IReadOnlyDictionary<string, int> ClaimedByLane { get; init; } = new Dictionary<string, int>();
+
+    public IReadOnlyDictionary<string, int> WaitingExecutionByLane { get; init; } = new Dictionary<string, int>();
+
+    public IReadOnlyDictionary<string, int> ExecutingByLane { get; init; } = new Dictionary<string, int>();
+
+    public IReadOnlyDictionary<string, int> ExecutorSaturationByLane { get; init; } = new Dictionary<string, int>();
+
+    public IReadOnlyDictionary<string, TimeSpan?> OldestWaitingExecutionAgeByLane { get; init; } = new Dictionary<string, TimeSpan?>();
 }

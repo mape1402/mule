@@ -218,6 +218,81 @@ public sealed class InMemoryMuleIntegrationTests
     }
 
     [Fact]
+    public async Task QueueWorkers_Should_Not_Wait_For_Slow_Action_Execution()
+    {
+        using var host = CreateHost(configureSettings: settings =>
+        {
+            settings.WorkerCount = 1;
+            settings.MaxDegreeOfParallelism = 10;
+        });
+        await host.StartAsync();
+
+        using var scope = host.Services.CreateScope();
+        var client = scope.ServiceProvider.GetRequiredService<IMuleClient>();
+        var startedOnUtc = DateTimeOffset.UtcNow;
+
+        await Task.WhenAll(Enumerable.Range(0, 10).Select(index =>
+            client.EnqueueAsync(Key, new TestPayload($"admit-{index}", 500)).AsTask()));
+
+        var probe = host.Services.GetRequiredService<TestProbe>();
+        await probe.WaitForStartedCountAsync(10, TimeSpan.FromSeconds(2));
+        var admissionElapsed = DateTimeOffset.UtcNow - startedOnUtc;
+        await probe.WaitForCountAsync(10, TimeSpan.FromSeconds(3));
+        await host.StopAsync();
+
+        Assert.True(admissionElapsed < TimeSpan.FromMilliseconds(450), $"Reader waited on execution for {admissionElapsed}.");
+    }
+
+    [Fact]
+    public async Task MaxDegreeOfParallelism_Should_Limit_Real_Execution()
+    {
+        using var host = CreateHost(configureSettings: settings =>
+        {
+            settings.WorkerCount = 4;
+            settings.MaxDegreeOfParallelism = 2;
+        });
+        await host.StartAsync();
+
+        using var scope = host.Services.CreateScope();
+        var client = scope.ServiceProvider.GetRequiredService<IMuleClient>();
+
+        await Task.WhenAll(Enumerable.Range(0, 10).Select(index =>
+            client.EnqueueAsync(Key, new TestPayload($"limited-{index}", 100)).AsTask()));
+
+        var probe = host.Services.GetRequiredService<TestProbe>();
+        await probe.WaitForCountAsync(10, TimeSpan.FromSeconds(5));
+        await host.StopAsync();
+
+        Assert.True(probe.MaxExecuting <= 2, $"Expected at most 2 executing actions, but saw {probe.MaxExecuting}.");
+    }
+
+    [Fact]
+    public async Task ExecutionQueueCapacity_Should_Apply_Bounded_Backpressure()
+    {
+        using var host = CreateHost(configureSettings: settings =>
+        {
+            settings.WorkerCount = 4;
+            settings.MaxDegreeOfParallelism = 1;
+            settings.ExecutionQueueCapacity = 5;
+        });
+        await host.StartAsync();
+
+        using var scope = host.Services.CreateScope();
+        var client = scope.ServiceProvider.GetRequiredService<IMuleClient>();
+
+        await Task.WhenAll(Enumerable.Range(0, 25).Select(index =>
+            client.EnqueueAsync(Key, new TestPayload($"backpressure-{index}", 50)).AsTask()));
+
+        var probe = host.Services.GetRequiredService<TestProbe>();
+        await probe.WaitForCountAsync(25, TimeSpan.FromSeconds(5));
+        await host.StopAsync();
+
+        var diagnostics = await host.Services.GetRequiredService<IMuleDiagnostics>().GetSnapshotAsync();
+        Assert.True(diagnostics.ExecutorSaturationByLane[MuleSettings.DefaultLane] > 0);
+        Assert.Equal(25, probe.Values.Count);
+    }
+
+    [Fact]
     public async Task Lanes_Should_Allow_Fast_Lane_To_Progress_When_Slow_Lane_Is_Busy()
     {
         using var host = CreateHost(configureSettings: settings =>
@@ -333,6 +408,38 @@ public sealed class InMemoryMuleIntegrationTests
     }
 
     [Fact]
+    public async Task ScheduledRecovery_Should_Use_Parallel_Executor()
+    {
+        using var host = CreateHost(configureSettings: settings =>
+        {
+            settings.ImmediateDispatch = false;
+            settings.RecoveryMode = MuleRecoveryMode.Scheduled;
+            settings.DispatchInterval = TimeSpan.FromHours(1);
+            settings.WorkerCount = 1;
+            settings.MaxDegreeOfParallelism = 10;
+            settings.DispatchBatchSize = 100;
+        });
+
+        using (var scope = host.Services.CreateScope())
+        {
+            var client = scope.ServiceProvider.GetRequiredService<IMuleClient>();
+            for (var index = 0; index < 100; index++)
+                await client.EnqueueAsync(Key, new TestPayload($"recovery-{index}", 100));
+        }
+
+        await host.StartAsync();
+
+        var probe = host.Services.GetRequiredService<TestProbe>();
+        await probe.WaitForStartedCountAsync(10, TimeSpan.FromSeconds(2));
+        await probe.WaitForCountAsync(100, TimeSpan.FromSeconds(5));
+        await host.StopAsync();
+
+        Assert.True(probe.MaxExecuting > 1);
+        Assert.True(probe.MaxExecuting <= 10);
+    }
+
+
+    [Fact]
     public async Task HostedService_Should_Process_Thousands_Of_Actions()
     {
         using var host = CreateHost(configureSettings: settings =>
@@ -405,14 +512,22 @@ public sealed class InMemoryMuleIntegrationTests
 
         public async ValueTask ExecuteAsync(MuleActionContext<TestPayload> context, CancellationToken cancellationToken)
         {
-            if (_probe.ShouldFail())
-                throw new InvalidOperationException("planned failure");
+            _probe.Started();
+            try
+            {
+                if (_probe.ShouldFail())
+                    throw new InvalidOperationException("planned failure");
 
-            if (context.Payload.DelayMilliseconds > 0)
-                await Task.Delay(context.Payload.DelayMilliseconds, cancellationToken);
+                if (context.Payload.DelayMilliseconds > 0)
+                    await Task.Delay(context.Payload.DelayMilliseconds, cancellationToken);
 
-            _probe.Values.Add(context.Payload.Value);
-            _probe.Signal(context.Payload.Value);
+                _probe.Values.Add(context.Payload.Value);
+                _probe.Signal(context.Payload.Value);
+            }
+            finally
+            {
+                _probe.Finished();
+            }
         }
     }
 
@@ -421,6 +536,9 @@ public sealed class InMemoryMuleIntegrationTests
         private readonly TaskCompletionSource _completion = new(TaskCreationOptions.RunContinuationsAsynchronously);
         private readonly ConcurrentDictionary<string, TaskCompletionSource> _valueCompletions = new(StringComparer.Ordinal);
         private int _remainingFailures;
+        private int _executing;
+        private int _maxExecuting;
+        private int _started;
 
         public TestProbe(bool fail, bool failOnce)
         {
@@ -432,6 +550,8 @@ public sealed class InMemoryMuleIntegrationTests
 
         public ConcurrentBag<string> Values { get; } = new();
 
+        public int MaxExecuting => Volatile.Read(ref _maxExecuting);
+
         public bool ShouldFail()
         {
             if (Fail)
@@ -439,6 +559,23 @@ public sealed class InMemoryMuleIntegrationTests
 
             return _remainingFailures > 0 && Interlocked.Decrement(ref _remainingFailures) >= 0;
         }
+
+        public void Started()
+        {
+            var executing = Interlocked.Increment(ref _executing);
+            Interlocked.Increment(ref _started);
+
+            while (true)
+            {
+                var current = Volatile.Read(ref _maxExecuting);
+                if (executing <= current ||
+                    Interlocked.CompareExchange(ref _maxExecuting, executing, current) == current)
+                    return;
+            }
+        }
+
+        public void Finished()
+            => Interlocked.Decrement(ref _executing);
 
         public void Signal(string value)
         {
@@ -461,6 +598,19 @@ public sealed class InMemoryMuleIntegrationTests
                     return;
 
                 await Task.Delay(25, timeoutSource.Token);
+            }
+        }
+
+        public async Task WaitForStartedCountAsync(int count, TimeSpan timeout)
+        {
+            using var timeoutSource = new CancellationTokenSource(timeout);
+
+            while (!timeoutSource.IsCancellationRequested)
+            {
+                if (Volatile.Read(ref _started) >= count)
+                    return;
+
+                await Task.Delay(10, timeoutSource.Token);
             }
         }
 
