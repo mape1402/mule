@@ -382,6 +382,22 @@ Redis does not replace EF Core durable storage. Treat it as a fast shared front 
 
 For high-throughput workloads, tune `IntentFlushSize` and `CompletionFlushSize` together with `DispatchBatchSize`, `ExecutionQueueCapacity`, and lane `MaxDegreeOfParallelism`. Larger flush batches reduce durable storage round trips; larger dispatch batches reduce Redis claim overhead. Keep `LeaseDuration` comfortably above the normal execution time for an action so another replica does not reclaim work that is still running.
 
+### Local Stress Results
+
+The following local stress run compares direct SQL Server persistence with FastLane Redis in front of SQL Server. These numbers are environment-specific and should be treated as a relative signal, not a benchmark guarantee.
+
+Test shape: .NET 10, local SQL Server test database, local Redis container, `WorkerCount = 4`, `MaxDegreeOfParallelism = 128`, enqueue batch size `500`, cleanup disabled.
+
+| Scenario | Actions | Total Time | Throughput | Enqueue Time | Duplicates |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| SQL Server direct | 1,000 | 3.72s | 268/s | 1.39s | 0 |
+| FastLane Redis + SQL | 1,000 | 1.75s | 569/s | 0.35s | 0 |
+| FastLane Redis + SQL | 10,000 | 5.25s | 1,903/s | 1.92s | 0 |
+| SQL Server direct | 10,000 | 16.90s | 591/s | 10.63s | 0 |
+| FastLane Redis + SQL | 20,000 | 10.22s | 1,956/s | 5.63s | 0 |
+| FastLane Redis + SQL | 50,000 | 22.14s | 2,257/s | 14.22s | 0 |
+| FastLane Redis + SQL, handler 1ms | 50,000 | 23.46s | 2,130/s | 13.77s | 0 |
+
 ## Dispatcher Settings
 
 Configure concurrency, retry, recovery, locking, and cleanup through `MuleSettings`:
