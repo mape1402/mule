@@ -16,6 +16,7 @@ All notable changes to Mule packages will be documented in this file.
 - Added `Mule.DurableActions.FastLane.InMemory`, an optional in-process buffer that acknowledges enqueue after buffer write and flushes intents and terminal states to durable storage in batches.
 - Added `Mule.DurableActions.FastLane.Redis`, an optional Redis-backed FastLane buffer for multi-replica high-throughput workloads.
 - Added `IMuleDurableStorage` so optional buffering providers can decorate active storage without losing access to the final durable provider.
+- Added `IMuleBatchTerminalStorage` so durable providers can persist terminal state transitions in batches.
 - Added FastLane InMemory integration coverage for buffered execution and ordered intent-before-terminal durable flushes.
 - Added optional Redis integration coverage for buffered execution and ordered durable flushes.
 
@@ -26,6 +27,7 @@ All notable changes to Mule packages will be documented in this file.
 - Changed recovery dispatch to pass claimed actions to the lane executor as a batch.
 - Changed SQL Server completion, failure, and cleanup paths to use direct SQL statements instead of loading tracked entities for each operation.
 - Changed EF Core indexes to include status-based locked recovery and completed cleanup paths.
+- Changed FastLane Redis claim and completion paths to use Lua scripts and batched flush confirmation to reduce Redis round trips.
 
 ## [v1.3.0] - 2026-08-16
 

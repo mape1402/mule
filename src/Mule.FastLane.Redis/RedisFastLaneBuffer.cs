@@ -7,6 +7,94 @@ using StackExchange.Redis;
 internal sealed class RedisFastLaneBuffer
 {
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
+    private const string MarkCompletedScript = """
+local payload = redis.call('GET', KEYS[1])
+if not payload then
+    return 0
+end
+local envelope = cjson.decode(payload)
+envelope.status = tonumber(ARGV[1])
+envelope.completedOnUtc = ARGV[2]
+envelope.terminalOnUtc = ARGV[2]
+envelope.lockedOnUtc = cjson.null
+envelope.nextAttemptOnUtc = cjson.null
+envelope.lastError = cjson.null
+envelope.terminalDirty = true
+redis.call('SET', KEYS[1], cjson.encode(envelope))
+redis.call('ZADD', KEYS[2], ARGV[3], ARGV[4])
+redis.call('DEL', KEYS[3])
+return 1
+""";
+
+    private const string ClaimPendingScript = """
+local ids = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, tonumber(ARGV[2]) * 4)
+local claimed = {}
+local count = 0
+for _, id in ipairs(ids) do
+    if count >= tonumber(ARGV[2]) then
+        break
+    end
+
+    local leaseAcquired = redis.call('SET', KEYS[4] .. id, ARGV[3], 'NX', 'PX', ARGV[4])
+    if leaseAcquired then
+        local payload = redis.call('GET', KEYS[3] .. id)
+        if payload then
+            local envelope = cjson.decode(payload)
+            if envelope.status == tonumber(ARGV[5]) then
+                envelope.status = tonumber(ARGV[6])
+                envelope.lockedOnUtc = ARGV[7]
+                if envelope.startedOnUtc == nil or envelope.startedOnUtc == cjson.null then
+                    envelope.startedOnUtc = ARGV[7]
+                end
+                envelope.intentDirty = true
+                local updated = cjson.encode(envelope)
+                redis.call('SET', KEYS[3] .. id, updated)
+                redis.call('ZREM', KEYS[1], id)
+                redis.call('ZADD', KEYS[2], ARGV[1], id)
+                table.insert(claimed, updated)
+                count = count + 1
+            else
+                redis.call('DEL', KEYS[4] .. id)
+            end
+        else
+            redis.call('DEL', KEYS[4] .. id)
+            redis.call('ZREM', KEYS[1], id)
+        end
+    end
+end
+return claimed
+""";
+
+    private const string MarkFailedScript = """
+local payload = redis.call('GET', KEYS[1])
+if not payload then
+    return 0
+end
+local envelope = cjson.decode(payload)
+local retry = ARGV[5] == '1'
+envelope.attempts = (envelope.attempts or 0) + 1
+envelope.status = tonumber(ARGV[1])
+envelope.lastError = ARGV[2]
+envelope.lockedOnUtc = cjson.null
+if retry then
+    envelope.nextAttemptOnUtc = ARGV[6]
+    envelope.terminalOnUtc = cjson.null
+    envelope.intentDirty = true
+    envelope.terminalDirty = false
+    redis.call('ZADD', KEYS[2], ARGV[3], ARGV[4])
+    redis.call('ZADD', KEYS[4], ARGV[7], ARGV[4])
+else
+    envelope.nextAttemptOnUtc = cjson.null
+    envelope.terminalOnUtc = ARGV[6]
+    envelope.intentDirty = false
+    envelope.terminalDirty = true
+    redis.call('ZADD', KEYS[3], ARGV[3], ARGV[4])
+end
+redis.call('SET', KEYS[1], cjson.encode(envelope))
+redis.call('DEL', KEYS[5])
+return 1
+""";
+
     private readonly RedisFastLaneConnection _connection;
     private readonly FastLaneRedisOptions _options;
 
@@ -123,96 +211,31 @@ internal sealed class RedisFastLaneBuffer
     {
         lane = NormalizeLane(lane);
         var database = _connection.Database;
-        var candidateValues = await database.SortedSetRangeByScoreAsync(
-            PendingKey(lane),
-            double.NegativeInfinity,
-            Score(now),
-            Exclude.None,
-            Order.Ascending,
-            0,
-            Math.Max(1, batchSize) * 4);
-        if (candidateValues.Length == 0)
-            return Array.Empty<DurableAction>();
-
-        var candidates = candidateValues
-            .Select(value => Guid.TryParse((string)value, out var id) ? id : (Guid?)null)
-            .Where(id => id != null)
-            .Select(id => id.Value)
-            .ToArray();
-        if (candidates.Length == 0)
-            return Array.Empty<DurableAction>();
-
         var token = Guid.NewGuid().ToString("N");
-        var leaseBatch = database.CreateBatch();
-        var leaseTasks = candidates
-            .Select(id => (Id: id, Task: leaseBatch.StringSetAsync(GetLeaseKey(id), token, GetLeaseDuration(), When.NotExists)))
+        var result = await database.ScriptEvaluateAsync(
+            ClaimPendingScript,
+            [
+                PendingKey(lane),
+                IntentFlushKey,
+                $"{_connection.Prefix}:fastlane:action:",
+                $"{_connection.Prefix}:fastlane:lease:"
+            ],
+            [
+                Score(now),
+                Math.Max(1, batchSize),
+                token,
+                Math.Max(1, (long)GetLeaseDuration().TotalMilliseconds),
+                (int)DurableActionStatus.Pending,
+                (int)DurableActionStatus.Locked,
+                FormatDate(now)
+            ]);
+        var values = (RedisResult[])result;
+
+        return values
+            .Select(value => JsonSerializer.Deserialize<RedisActionEnvelope>((string)(RedisValue)value, JsonOptions))
+            .Where(envelope => envelope != null)
+            .Select(envelope => envelope.ToAction())
             .ToArray();
-        leaseBatch.Execute();
-        await Task.WhenAll(leaseTasks.Select(x => x.Task));
-
-        var acquired = leaseTasks
-            .Where(x => x.Task.Result)
-            .Select(x => x.Id)
-            .ToArray();
-        if (acquired.Length == 0)
-            return Array.Empty<DurableAction>();
-
-        var readBatch = database.CreateBatch();
-        var readTasks = acquired
-            .Select(id => (Id: id, Task: readBatch.StringGetAsync(GetActionKey(id))))
-            .ToArray();
-        readBatch.Execute();
-        await Task.WhenAll(readTasks.Select(x => x.Task));
-
-        var envelopes = new List<RedisActionEnvelope>(Math.Min(batchSize, acquired.Length));
-        var releaseIds = new List<Guid>();
-        foreach (var item in readTasks)
-        {
-            if (envelopes.Count >= batchSize)
-            {
-                releaseIds.Add(item.Id);
-                continue;
-            }
-
-            if (!item.Task.Result.HasValue)
-            {
-                releaseIds.Add(item.Id);
-                continue;
-            }
-
-            var envelope = JsonSerializer.Deserialize<RedisActionEnvelope>((string)item.Task.Result, JsonOptions);
-            if (envelope == null || !CanLock(envelope.ToAction(), lockTimeout, now))
-            {
-                releaseIds.Add(item.Id);
-                continue;
-            }
-
-            envelope.Status = DurableActionStatus.Locked;
-            envelope.LockedOnUtc = now;
-            envelope.StartedOnUtc ??= now;
-            envelope.IntentDirty = true;
-            envelopes.Add(envelope);
-        }
-
-        if (envelopes.Count > 0)
-        {
-            var writeBatch = database.CreateBatch();
-            var writeTasks = new List<Task>(envelopes.Count * 3);
-            foreach (var envelope in envelopes)
-            {
-                writeTasks.Add(writeBatch.StringSetAsync(GetActionKey(envelope.Id), JsonSerializer.Serialize(envelope, JsonOptions)));
-                writeTasks.Add(writeBatch.SortedSetRemoveAsync(PendingKey(NormalizeLane(envelope.Lane)), envelope.Id.ToString("D")));
-                writeTasks.Add(writeBatch.SortedSetAddAsync(IntentFlushKey, envelope.Id.ToString("D"), Score(now)));
-            }
-
-            writeBatch.Execute();
-            await Task.WhenAll(writeTasks);
-        }
-
-        if (releaseIds.Count > 0)
-            await ReleaseLeasesAsync(releaseIds, token);
-
-        return envelopes.Select(x => x.ToAction()).ToArray();
     }
 
     public async Task<DateTimeOffset?> GetNextPendingOnUtcAsync()
@@ -240,21 +263,21 @@ internal sealed class RedisFastLaneBuffer
 
     public async Task<bool> MarkCompletedAsync(Guid id, DateTimeOffset completedOnUtc)
     {
-        var envelope = await GetEnvelopeAsync(id);
-        if (envelope == null)
-            return false;
-
-        envelope.Status = DurableActionStatus.Completed;
-        envelope.CompletedOnUtc = completedOnUtc;
-        envelope.TerminalOnUtc = completedOnUtc;
-        envelope.LockedOnUtc = null;
-        envelope.NextAttemptOnUtc = null;
-        envelope.LastError = null;
-        envelope.TerminalDirty = true;
-        await SaveEnvelopeAsync(envelope);
-        await _connection.Database.SortedSetAddAsync(TerminalFlushKey, id.ToString("D"), Score(completedOnUtc));
-        await ReleaseLeaseAsync(id);
-        return true;
+        var database = _connection.Database;
+        var result = await database.ScriptEvaluateAsync(
+            MarkCompletedScript,
+            [
+                GetActionKey(id),
+                TerminalFlushKey,
+                GetLeaseKey(id)
+            ],
+            [
+                (int)DurableActionStatus.Completed,
+                FormatDate(completedOnUtc),
+                Score(completedOnUtc),
+                id.ToString("D")
+            ]);
+        return (int)result == 1;
     }
 
     public async Task<bool> MarkFailedAsync(Guid id, string error, DateTimeOffset now, DateTimeOffset? nextAttemptOnUtc)
@@ -263,39 +286,52 @@ internal sealed class RedisFastLaneBuffer
         if (envelope == null)
             return false;
 
-        envelope.Attempts++;
-        envelope.Status = nextAttemptOnUtc == null ? DurableActionStatus.Failed : DurableActionStatus.Pending;
-        envelope.LastError = error;
-        envelope.LockedOnUtc = null;
-        envelope.NextAttemptOnUtc = nextAttemptOnUtc;
-        envelope.TerminalOnUtc = nextAttemptOnUtc == null ? now : null;
-        envelope.IntentDirty = nextAttemptOnUtc != null;
-        envelope.TerminalDirty = nextAttemptOnUtc == null;
-        await SaveEnvelopeAsync(envelope);
-
-        if (nextAttemptOnUtc == null)
-            await _connection.Database.SortedSetAddAsync(TerminalFlushKey, id.ToString("D"), Score(now));
-        else
-        {
-            await _connection.Database.SortedSetAddAsync(IntentFlushKey, id.ToString("D"), Score(now));
-            await _connection.Database.SortedSetAddAsync(PendingKey(NormalizeLane(envelope.Lane)), id.ToString("D"), Score(nextAttemptOnUtc.Value));
-        }
-
-        await ReleaseLeaseAsync(id);
-        return true;
+        var database = _connection.Database;
+        var status = nextAttemptOnUtc == null ? DurableActionStatus.Failed : DurableActionStatus.Pending;
+        var result = await database.ScriptEvaluateAsync(
+            MarkFailedScript,
+            [
+                GetActionKey(id),
+                IntentFlushKey,
+                TerminalFlushKey,
+                PendingKey(NormalizeLane(envelope.Lane)),
+                GetLeaseKey(id)
+            ],
+            [
+                (int)status,
+                error ?? string.Empty,
+                Score(now),
+                id.ToString("D"),
+                nextAttemptOnUtc == null ? "0" : "1",
+                FormatDate(nextAttemptOnUtc ?? now),
+                nextAttemptOnUtc == null ? 0 : Score(nextAttemptOnUtc.Value)
+            ]);
+        return (int)result == 1;
     }
 
     public async Task<IReadOnlyCollection<DurableAction>> TakeIntentFlushBatchAsync(int batchSize)
     {
-        var ids = await _connection.Database.SortedSetRangeByRankAsync(IntentFlushKey, 0, Math.Max(0, batchSize - 1));
-        var actions = new List<DurableAction>(ids.Length);
+        var database = _connection.Database;
+        var ids = await database.SortedSetRangeByRankAsync(IntentFlushKey, 0, Math.Max(0, batchSize - 1));
+        if (ids.Length == 0)
+            return Array.Empty<DurableAction>();
 
-        foreach (var value in ids)
+        var batch = database.CreateBatch();
+        var readTasks = ids
+            .Select(value => Guid.TryParse((string)value, out var id) ? (Id: id, Task: batch.StringGetAsync(GetActionKey(id))) : (Id: Guid.Empty, Task: null))
+            .Where(x => x.Task != null)
+            .ToArray();
+        batch.Execute();
+        await Task.WhenAll(readTasks.Select(x => x.Task));
+
+        var actions = new List<DurableAction>(readTasks.Length);
+
+        foreach (var item in readTasks)
         {
-            if (!Guid.TryParse((string)value, out var id))
+            if (!item.Task.Result.HasValue)
                 continue;
 
-            var envelope = await GetEnvelopeAsync(id);
+            var envelope = JsonSerializer.Deserialize<RedisActionEnvelope>((string)item.Task.Result, JsonOptions);
             if (envelope is not { IntentDirty: true })
                 continue;
 
@@ -307,31 +343,62 @@ internal sealed class RedisFastLaneBuffer
 
     public async Task CompleteIntentFlushAsync(IReadOnlyCollection<Guid> ids)
     {
-        foreach (var id in ids)
+        if (ids.Count == 0)
+            return;
+
+        var database = _connection.Database;
+        var readBatch = database.CreateBatch();
+        var readTasks = ids
+            .Select(id => (Id: id, Task: readBatch.StringGetAsync(GetActionKey(id))))
+            .ToArray();
+        readBatch.Execute();
+        await Task.WhenAll(readTasks.Select(x => x.Task));
+
+        var writeBatch = database.CreateBatch();
+        var writeTasks = new List<Task>(ids.Count * 3);
+        foreach (var item in readTasks)
         {
-            var envelope = await GetEnvelopeAsync(id);
+            if (!item.Task.Result.HasValue)
+                continue;
+
+            var envelope = JsonSerializer.Deserialize<RedisActionEnvelope>((string)item.Task.Result, JsonOptions);
             if (envelope == null)
                 continue;
 
             envelope.IntentPersisted = true;
             envelope.IntentDirty = false;
-            await SaveEnvelopeAsync(envelope);
-            await _connection.Database.SortedSetRemoveAsync(IntentFlushKey, id.ToString("D"));
-            await TryRemoveAsync(envelope);
+            AddSaveEnvelope(writeBatch, writeTasks, envelope);
+            writeTasks.Add(writeBatch.SortedSetRemoveAsync(IntentFlushKey, item.Id.ToString("D")));
+            AddTryRemove(writeBatch, writeTasks, envelope);
         }
+
+        writeBatch.Execute();
+        await Task.WhenAll(writeTasks);
     }
 
     public async Task<IReadOnlyCollection<DurableAction>> TakeTerminalFlushBatchAsync(int batchSize)
     {
-        var ids = await _connection.Database.SortedSetRangeByRankAsync(TerminalFlushKey, 0, Math.Max(0, batchSize - 1));
-        var actions = new List<DurableAction>(ids.Length);
+        var database = _connection.Database;
+        var ids = await database.SortedSetRangeByRankAsync(TerminalFlushKey, 0, Math.Max(0, batchSize - 1));
+        if (ids.Length == 0)
+            return Array.Empty<DurableAction>();
 
-        foreach (var value in ids)
+        var batch = database.CreateBatch();
+        var readTasks = ids
+            .Select(value => Guid.TryParse((string)value, out var id) ? (Id: id, Task: batch.StringGetAsync(GetActionKey(id))) : (Id: Guid.Empty, Task: null))
+            .Where(x => x.Task != null)
+            .ToArray();
+        batch.Execute();
+        await Task.WhenAll(readTasks.Select(x => x.Task));
+
+        var actions = new List<DurableAction>(readTasks.Length);
+
+        foreach (var item in readTasks)
         {
-            if (!Guid.TryParse((string)value, out var id))
+            if (!item.Task.Result.HasValue)
                 continue;
 
-            var envelope = await GetEnvelopeAsync(id);
+            var envelope = JsonSerializer.Deserialize<RedisActionEnvelope>((string)item.Task.Result, JsonOptions);
             if (envelope is not { IntentPersisted: true, TerminalDirty: true })
                 continue;
 
@@ -343,18 +410,37 @@ internal sealed class RedisFastLaneBuffer
 
     public async Task CompleteTerminalFlushAsync(IReadOnlyCollection<Guid> ids)
     {
-        foreach (var id in ids)
+        if (ids.Count == 0)
+            return;
+
+        var database = _connection.Database;
+        var readBatch = database.CreateBatch();
+        var readTasks = ids
+            .Select(id => (Id: id, Task: readBatch.StringGetAsync(GetActionKey(id))))
+            .ToArray();
+        readBatch.Execute();
+        await Task.WhenAll(readTasks.Select(x => x.Task));
+
+        var writeBatch = database.CreateBatch();
+        var writeTasks = new List<Task>(ids.Count * 3);
+        foreach (var item in readTasks)
         {
-            var envelope = await GetEnvelopeAsync(id);
+            if (!item.Task.Result.HasValue)
+                continue;
+
+            var envelope = JsonSerializer.Deserialize<RedisActionEnvelope>((string)item.Task.Result, JsonOptions);
             if (envelope == null)
                 continue;
 
             envelope.TerminalDirty = false;
             envelope.TerminalFlushed = true;
-            await SaveEnvelopeAsync(envelope);
-            await _connection.Database.SortedSetRemoveAsync(TerminalFlushKey, id.ToString("D"));
-            await TryRemoveAsync(envelope);
+            AddSaveEnvelope(writeBatch, writeTasks, envelope);
+            writeTasks.Add(writeBatch.SortedSetRemoveAsync(TerminalFlushKey, item.Id.ToString("D")));
+            AddTryRemove(writeBatch, writeTasks, envelope);
         }
+
+        writeBatch.Execute();
+        await Task.WhenAll(writeTasks);
     }
 
     private async Task SaveEnvelopeAsync(RedisActionEnvelope envelope)
@@ -401,6 +487,22 @@ internal sealed class RedisFastLaneBuffer
         await _connection.Database.KeyDeleteAsync(GetActionKey(envelope.Id));
         if (!string.IsNullOrWhiteSpace(envelope.DeduplicationKey))
             await _connection.Database.KeyDeleteAsync(DeduplicationKey(ActionKey.From(envelope.Key), envelope.DeduplicationKey));
+    }
+
+    private void AddSaveEnvelope(IBatch batch, List<Task> tasks, RedisActionEnvelope envelope)
+    {
+        tasks.Add(batch.StringSetAsync(GetActionKey(envelope.Id), JsonSerializer.Serialize(envelope, JsonOptions)));
+        tasks.Add(batch.SetAddAsync(LanesKey, NormalizeLane(envelope.Lane)));
+    }
+
+    private void AddTryRemove(IBatch batch, List<Task> tasks, RedisActionEnvelope envelope)
+    {
+        if (!envelope.IntentPersisted || envelope.IntentDirty || !envelope.TerminalFlushed || envelope.TerminalDirty)
+            return;
+
+        tasks.Add(batch.KeyDeleteAsync(GetActionKey(envelope.Id)));
+        if (!string.IsNullOrWhiteSpace(envelope.DeduplicationKey))
+            tasks.Add(batch.KeyDeleteAsync(DeduplicationKey(ActionKey.From(envelope.Key), envelope.DeduplicationKey)));
     }
 
     private RedisActionEnvelope CloneForDurableIntent(RedisActionEnvelope envelope)
@@ -453,6 +555,9 @@ internal sealed class RedisFastLaneBuffer
 
     private static DateTimeOffset FromScore(double score)
         => DateTimeOffset.FromUnixTimeMilliseconds((long)score);
+
+    private static string FormatDate(DateTimeOffset value)
+        => value.ToUniversalTime().ToString("O");
 
     private static string NormalizeLane(string lane)
         => string.IsNullOrWhiteSpace(lane) ? MuleSettings.DefaultLane : lane;

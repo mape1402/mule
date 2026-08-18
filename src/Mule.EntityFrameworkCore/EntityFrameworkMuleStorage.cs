@@ -6,7 +6,7 @@ using Microsoft.EntityFrameworkCore.Metadata;
 using Microsoft.EntityFrameworkCore.Storage;
 using Mule.Diagnostics;
 
-internal class EntityFrameworkMuleStorage<TDbContext> : IMuleDurableStorage, IDisposable, IAsyncDisposable
+internal class EntityFrameworkMuleStorage<TDbContext> : IMuleDurableStorage, IMuleBatchTerminalStorage, IDisposable, IAsyncDisposable
     where TDbContext : DbContext
 {
     private readonly TDbContext _dbContext;
@@ -203,6 +203,26 @@ internal class EntityFrameworkMuleStorage<TDbContext> : IMuleDurableStorage, IDi
         action.LockedOnUtc = null;
         action.NextAttemptOnUtc = null;
         action.LastError = null;
+    }
+
+    public async Task MarkCompletedRangeAsync(
+        IReadOnlyCollection<MuleCompletedAction> actions,
+        CancellationToken cancellationToken = default)
+    {
+        if (actions == null)
+            throw new ArgumentNullException(nameof(actions));
+
+        if (actions.Count == 0)
+            return;
+
+        if (IsSqlServer())
+        {
+            await MarkCompletedRangeSqlServerAsync(actions, cancellationToken);
+            return;
+        }
+
+        foreach (var completed in actions)
+            await MarkCompletedAsync(completed.Id, completed.CompletedOnUtc, cancellationToken);
     }
 
     public async Task MarkFailedAsync(
@@ -411,6 +431,39 @@ WHERE {{names.Id}} = {2}
                 id
             ],
             cancellationToken);
+    }
+
+    private async Task MarkCompletedRangeSqlServerAsync(
+        IReadOnlyCollection<MuleCompletedAction> actions,
+        CancellationToken cancellationToken)
+    {
+        var names = GetActionStoreNames();
+        var values = new List<string>(actions.Count);
+        var parameters = new object[actions.Count * 2 + 1];
+        var index = 0;
+        parameters[index++] = (int)DurableActionStatus.Completed;
+
+        foreach (var action in actions)
+        {
+            values.Add($"({{{index}}}, {{{index + 1}}})");
+            parameters[index++] = action.Id;
+            parameters[index++] = action.CompletedOnUtc;
+        }
+
+        var sql = $$"""
+UPDATE target
+SET target.{{names.Status}} = {0},
+    target.{{names.CompletedOnUtc}} = source.CompletedOnUtc,
+    target.{{names.TerminalOnUtc}} = source.CompletedOnUtc,
+    target.{{names.LockedOnUtc}} = NULL,
+    target.{{names.NextAttemptOnUtc}} = NULL,
+    target.{{names.LastError}} = NULL
+FROM {{names.Table}} AS target
+INNER JOIN (VALUES {{string.Join(", ", values)}}) AS source(Id, CompletedOnUtc)
+    ON target.{{names.Id}} = source.Id
+""";
+
+        await _dbContext.Database.ExecuteSqlRawAsync(sql, parameters, cancellationToken);
     }
 
     private async Task MarkFailedSqlServerAsync(
