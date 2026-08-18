@@ -4,6 +4,14 @@ All notable changes to Mule packages will be documented in this file.
 
 ## [Unreleased]
 
+## [v1.4.1] - 2026-08-18
+
+### Fixed
+
+- Fixed FastLane Redis flush coordination so multiple replicas cannot flush the same intent or terminal state concurrently.
+- Fixed FastLane Redis terminal flush ordering so completed states are not persisted before the durable intent exists.
+- Fixed completed action cleanup queries for SQL Server ordered batch deletion and non-SQL Server DateTimeOffset filtering.
+
 ## [v1.4.0] - 2026-08-18
 
 ### Added
