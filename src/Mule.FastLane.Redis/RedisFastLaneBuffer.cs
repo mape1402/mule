@@ -26,6 +26,62 @@ redis.call('DEL', KEYS[3])
 return 1
 """;
 
+    private const string TakeIntentFlushScript = """
+local ids = redis.call('ZRANGE', KEYS[1], 0, tonumber(ARGV[1]) * 4 - 1)
+local claimed = {}
+local count = 0
+for _, id in ipairs(ids) do
+    if count >= tonumber(ARGV[1]) then
+        break
+    end
+
+    local payload = redis.call('GET', KEYS[2] .. id)
+    if not payload then
+        redis.call('ZREM', KEYS[1], id)
+    else
+        local envelope = cjson.decode(payload)
+        if envelope.intentDirty == true and envelope.intentFlushing ~= true then
+            envelope.intentFlushing = true
+            local updated = cjson.encode(envelope)
+            redis.call('SET', KEYS[2] .. id, updated)
+            table.insert(claimed, updated)
+            count = count + 1
+        elseif envelope.intentDirty ~= true then
+            redis.call('ZREM', KEYS[1], id)
+        end
+    end
+end
+return claimed
+""";
+
+    private const string TakeTerminalFlushScript = """
+local ids = redis.call('ZRANGE', KEYS[1], 0, tonumber(ARGV[1]) * 4 - 1)
+local claimed = {}
+local count = 0
+for _, id in ipairs(ids) do
+    if count >= tonumber(ARGV[1]) then
+        break
+    end
+
+    local payload = redis.call('GET', KEYS[2] .. id)
+    if not payload then
+        redis.call('ZREM', KEYS[1], id)
+    else
+        local envelope = cjson.decode(payload)
+        if envelope.intentPersisted == true and envelope.terminalDirty == true and envelope.terminalFlushing ~= true then
+            envelope.terminalFlushing = true
+            local updated = cjson.encode(envelope)
+            redis.call('SET', KEYS[2] .. id, updated)
+            table.insert(claimed, updated)
+            count = count + 1
+        elseif envelope.terminalDirty ~= true then
+            redis.call('ZREM', KEYS[1], id)
+        end
+    end
+end
+return claimed
+""";
+
     private const string ClaimPendingScript = """
 local ids = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, tonumber(ARGV[2]) * 4)
 local claimed = {}
@@ -312,33 +368,17 @@ return 1
     public async Task<IReadOnlyCollection<DurableAction>> TakeIntentFlushBatchAsync(int batchSize)
     {
         var database = _connection.Database;
-        var ids = await database.SortedSetRangeByRankAsync(IntentFlushKey, 0, Math.Max(0, batchSize - 1));
-        if (ids.Length == 0)
-            return Array.Empty<DurableAction>();
+        var result = await database.ScriptEvaluateAsync(
+            TakeIntentFlushScript,
+            [IntentFlushKey, $"{_connection.Prefix}:fastlane:action:"],
+            [Math.Max(1, batchSize)]);
+        var values = (RedisResult[])result;
 
-        var batch = database.CreateBatch();
-        var readTasks = ids
-            .Select(value => Guid.TryParse((string)value, out var id) ? (Id: id, Task: batch.StringGetAsync(GetActionKey(id))) : (Id: Guid.Empty, Task: null))
-            .Where(x => x.Task != null)
+        return values
+            .Select(value => JsonSerializer.Deserialize<RedisActionEnvelope>((string)(RedisValue)value, JsonOptions))
+            .Where(envelope => envelope != null)
+            .Select(envelope => CloneForDurableIntent(envelope).ToAction())
             .ToArray();
-        batch.Execute();
-        await Task.WhenAll(readTasks.Select(x => x.Task));
-
-        var actions = new List<DurableAction>(readTasks.Length);
-
-        foreach (var item in readTasks)
-        {
-            if (!item.Task.Result.HasValue)
-                continue;
-
-            var envelope = JsonSerializer.Deserialize<RedisActionEnvelope>((string)item.Task.Result, JsonOptions);
-            if (envelope is not { IntentDirty: true })
-                continue;
-
-            actions.Add(CloneForDurableIntent(envelope).ToAction());
-        }
-
-        return actions;
     }
 
     public async Task CompleteIntentFlushAsync(IReadOnlyCollection<Guid> ids)
@@ -367,6 +407,7 @@ return 1
 
             envelope.IntentPersisted = true;
             envelope.IntentDirty = false;
+            envelope.IntentFlushing = false;
             AddSaveEnvelope(writeBatch, writeTasks, envelope);
             writeTasks.Add(writeBatch.SortedSetRemoveAsync(IntentFlushKey, item.Id.ToString("D")));
             AddTryRemove(writeBatch, writeTasks, envelope);
@@ -376,36 +417,52 @@ return 1
         await Task.WhenAll(writeTasks);
     }
 
-    public async Task<IReadOnlyCollection<DurableAction>> TakeTerminalFlushBatchAsync(int batchSize)
+    public async Task CancelIntentFlushAsync(IReadOnlyCollection<Guid> ids)
     {
-        var database = _connection.Database;
-        var ids = await database.SortedSetRangeByRankAsync(TerminalFlushKey, 0, Math.Max(0, batchSize - 1));
-        if (ids.Length == 0)
-            return Array.Empty<DurableAction>();
+        if (ids.Count == 0)
+            return;
 
-        var batch = database.CreateBatch();
+        var database = _connection.Database;
+        var readBatch = database.CreateBatch();
         var readTasks = ids
-            .Select(value => Guid.TryParse((string)value, out var id) ? (Id: id, Task: batch.StringGetAsync(GetActionKey(id))) : (Id: Guid.Empty, Task: null))
-            .Where(x => x.Task != null)
+            .Select(id => (Id: id, Task: readBatch.StringGetAsync(GetActionKey(id))))
             .ToArray();
-        batch.Execute();
+        readBatch.Execute();
         await Task.WhenAll(readTasks.Select(x => x.Task));
 
-        var actions = new List<DurableAction>(readTasks.Length);
-
+        var writeBatch = database.CreateBatch();
+        var writeTasks = new List<Task>(ids.Count);
         foreach (var item in readTasks)
         {
             if (!item.Task.Result.HasValue)
                 continue;
 
             var envelope = JsonSerializer.Deserialize<RedisActionEnvelope>((string)item.Task.Result, JsonOptions);
-            if (envelope is not { IntentPersisted: true, TerminalDirty: true })
+            if (envelope == null)
                 continue;
 
-            actions.Add(envelope.ToAction());
+            envelope.IntentFlushing = false;
+            AddSaveEnvelope(writeBatch, writeTasks, envelope);
         }
 
-        return actions;
+        writeBatch.Execute();
+        await Task.WhenAll(writeTasks);
+    }
+
+    public async Task<IReadOnlyCollection<DurableAction>> TakeTerminalFlushBatchAsync(int batchSize)
+    {
+        var database = _connection.Database;
+        var result = await database.ScriptEvaluateAsync(
+            TakeTerminalFlushScript,
+            [TerminalFlushKey, $"{_connection.Prefix}:fastlane:action:"],
+            [Math.Max(1, batchSize)]);
+        var values = (RedisResult[])result;
+
+        return values
+            .Select(value => JsonSerializer.Deserialize<RedisActionEnvelope>((string)(RedisValue)value, JsonOptions))
+            .Where(envelope => envelope != null)
+            .Select(envelope => envelope.ToAction())
+            .ToArray();
     }
 
     public async Task CompleteTerminalFlushAsync(IReadOnlyCollection<Guid> ids)
@@ -434,9 +491,42 @@ return 1
 
             envelope.TerminalDirty = false;
             envelope.TerminalFlushed = true;
+            envelope.TerminalFlushing = false;
             AddSaveEnvelope(writeBatch, writeTasks, envelope);
             writeTasks.Add(writeBatch.SortedSetRemoveAsync(TerminalFlushKey, item.Id.ToString("D")));
             AddTryRemove(writeBatch, writeTasks, envelope);
+        }
+
+        writeBatch.Execute();
+        await Task.WhenAll(writeTasks);
+    }
+
+    public async Task CancelTerminalFlushAsync(IReadOnlyCollection<Guid> ids)
+    {
+        if (ids.Count == 0)
+            return;
+
+        var database = _connection.Database;
+        var readBatch = database.CreateBatch();
+        var readTasks = ids
+            .Select(id => (Id: id, Task: readBatch.StringGetAsync(GetActionKey(id))))
+            .ToArray();
+        readBatch.Execute();
+        await Task.WhenAll(readTasks.Select(x => x.Task));
+
+        var writeBatch = database.CreateBatch();
+        var writeTasks = new List<Task>(ids.Count);
+        foreach (var item in readTasks)
+        {
+            if (!item.Task.Result.HasValue)
+                continue;
+
+            var envelope = JsonSerializer.Deserialize<RedisActionEnvelope>((string)item.Task.Result, JsonOptions);
+            if (envelope == null)
+                continue;
+
+            envelope.TerminalFlushing = false;
+            AddSaveEnvelope(writeBatch, writeTasks, envelope);
         }
 
         writeBatch.Execute();
