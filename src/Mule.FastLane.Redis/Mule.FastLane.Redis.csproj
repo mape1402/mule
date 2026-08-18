@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <IsPackable>true</IsPackable>
+    <PackageId>Mule.DurableActions.FastLane.Redis</PackageId>
+    <Title>Mule Durable Actions FastLane Redis Buffer</Title>
+    <PackageType>Dependency</PackageType>
+    <Description>Optional Redis-backed FastLane buffer for Mule durable actions, providing shared buffering, leases, and batch durable flushes for multi-replica .NET workloads.</Description>
+    <PackageTags>$(PackageTags);fastlane;buffering;batching;redis;distributed</PackageTags>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="StackExchange.Redis" Version="2.8.24" />
+    <ProjectReference Include="..\Mule\Mule.csproj" />
+  </ItemGroup>
+
+</Project>
