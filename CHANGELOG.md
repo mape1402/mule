@@ -4,6 +4,8 @@ All notable changes to Mule packages will be documented in this file.
 
 ## [Unreleased]
 
+## [v1.4.0] - 2026-08-18
+
 ### Added
 
 - Added a bounded lane action executor that separates reading/claiming from action execution.

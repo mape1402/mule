@@ -378,6 +378,8 @@ With FastLane Redis, foreground enqueue writes to Redis first and returns withou
 
 Redis does not replace EF Core durable storage. Treat it as a fast shared front buffer in front of the durable provider. If Redis is configured with volatile persistence or data is evicted before Mule flushes it, unflushed intents can be lost. Use Redis persistence and memory policies that match the durability window your workload can tolerate.
 
+For high-throughput workloads, tune `IntentFlushSize` and `CompletionFlushSize` together with `DispatchBatchSize`, `ExecutionQueueCapacity`, and lane `MaxDegreeOfParallelism`. Larger flush batches reduce durable storage round trips; larger dispatch batches reduce Redis claim overhead. Keep `LeaseDuration` comfortably above the normal execution time for an action so another replica does not reclaim work that is still running.
+
 ## Dispatcher Settings
 
 Configure concurrency, retry, recovery, locking, and cleanup through `MuleSettings`:
