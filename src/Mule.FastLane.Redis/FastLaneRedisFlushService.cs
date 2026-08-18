@@ -79,11 +79,22 @@ internal sealed class FastLaneRedisFlushService : BackgroundService
 
         using var scope = _scopeFactory.CreateScope();
         var durableStorage = scope.ServiceProvider.GetRequiredService<IMuleDurableStorage>();
+        var completed = terminals
+            .Where(x => x.Status == DurableActionStatus.Completed)
+            .Select(x => new MuleCompletedAction(x.Id, x.CompletedOnUtc ?? DateTimeOffset.UtcNow))
+            .ToArray();
+        var batchTerminalStorage = durableStorage as IMuleBatchTerminalStorage;
+
+        if (batchTerminalStorage != null && completed.Length > 0)
+            await batchTerminalStorage.MarkCompletedRangeAsync(completed, cancellationToken);
 
         foreach (var action in terminals)
         {
             if (action.Status == DurableActionStatus.Completed)
             {
+                if (batchTerminalStorage != null)
+                    continue;
+
                 await durableStorage.MarkCompletedAsync(
                     action.Id,
                     action.CompletedOnUtc ?? DateTimeOffset.UtcNow,
