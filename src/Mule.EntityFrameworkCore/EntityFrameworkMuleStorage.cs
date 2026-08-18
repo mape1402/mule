@@ -308,10 +308,11 @@ internal class EntityFrameworkMuleStorage<TDbContext> : IMuleDurableStorage, IMu
             return await CleanCompletedSqlServerAsync(olderThanUtc, batchSize, cancellationToken);
 
         var candidates = await Actions
-            .Where(x => x.Status == DurableActionStatus.Completed && x.CompletedOnUtc <= olderThanUtc)
+            .Where(x => x.Status == DurableActionStatus.Completed && x.CompletedOnUtc != null)
             .ToListAsync(cancellationToken);
 
         var actions = candidates
+            .Where(x => x.CompletedOnUtc <= olderThanUtc)
             .OrderBy(x => x.CompletedOnUtc)
             .Take(batchSize)
             .ToArray();
@@ -559,10 +560,14 @@ WHERE {{names.Id}} = {4}
     {
         var names = GetActionStoreNames();
         var sql = $$"""
-DELETE TOP ({0})
-FROM {{names.Table}}
-WHERE {{names.Status}} = {1}
-  AND {{names.CompletedOnUtc}} <= {2}
+WITH MuleCleanup AS (
+    SELECT TOP ({0}) *
+    FROM {{names.Table}} WITH (READPAST, ROWLOCK)
+    WHERE {{names.Status}} = {1}
+      AND {{names.CompletedOnUtc}} <= {2}
+    ORDER BY {{names.CompletedOnUtc}}, {{names.CreatedOnUtc}}
+)
+DELETE FROM MuleCleanup
 """;
 
         return await _dbContext.Database.ExecuteSqlRawAsync(

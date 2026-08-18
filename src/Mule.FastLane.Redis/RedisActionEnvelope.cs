@@ -40,9 +40,13 @@ internal sealed class RedisActionEnvelope
 
     public bool IntentDirty { get; set; } = true;
 
+    public bool IntentFlushing { get; set; }
+
     public bool TerminalDirty { get; set; }
 
     public bool TerminalFlushed { get; set; }
+
+    public bool TerminalFlushing { get; set; }
 
     public DurableAction ToAction()
         => new()

@@ -64,11 +64,20 @@ internal sealed class FastLaneRedisFlushService : BackgroundService
         if (intents.Count == 0)
             return;
 
-        using var scope = _scopeFactory.CreateScope();
-        var durableStorage = scope.ServiceProvider.GetRequiredService<IMuleDurableStorage>();
-        await durableStorage.AddRangeAsync(intents, cancellationToken);
-        await durableStorage.SaveChangesAsync(cancellationToken);
-        await _buffer.CompleteIntentFlushAsync(intents.Select(x => x.Id).ToArray());
+        var ids = intents.Select(x => x.Id).ToArray();
+        try
+        {
+            using var scope = _scopeFactory.CreateScope();
+            var durableStorage = scope.ServiceProvider.GetRequiredService<IMuleDurableStorage>();
+            await durableStorage.AddRangeAsync(intents, cancellationToken);
+            await durableStorage.SaveChangesAsync(cancellationToken);
+            await _buffer.CompleteIntentFlushAsync(ids);
+        }
+        catch
+        {
+            await _buffer.CancelIntentFlushAsync(ids);
+            throw;
+        }
     }
 
     private async Task FlushTerminalsAsync(CancellationToken cancellationToken)
@@ -77,44 +86,53 @@ internal sealed class FastLaneRedisFlushService : BackgroundService
         if (terminals.Count == 0)
             return;
 
-        using var scope = _scopeFactory.CreateScope();
-        var durableStorage = scope.ServiceProvider.GetRequiredService<IMuleDurableStorage>();
-        var completed = terminals
-            .Where(x => x.Status == DurableActionStatus.Completed)
-            .Select(x => new MuleCompletedAction(x.Id, x.CompletedOnUtc ?? DateTimeOffset.UtcNow))
-            .ToArray();
-        var batchTerminalStorage = durableStorage as IMuleBatchTerminalStorage;
-
-        if (batchTerminalStorage != null && completed.Length > 0)
-            await batchTerminalStorage.MarkCompletedRangeAsync(completed, cancellationToken);
-
-        foreach (var action in terminals)
+        var ids = terminals.Select(x => x.Id).ToArray();
+        try
         {
-            if (action.Status == DurableActionStatus.Completed)
+            using var scope = _scopeFactory.CreateScope();
+            var durableStorage = scope.ServiceProvider.GetRequiredService<IMuleDurableStorage>();
+            var completed = terminals
+                .Where(x => x.Status == DurableActionStatus.Completed)
+                .Select(x => new MuleCompletedAction(x.Id, x.CompletedOnUtc ?? DateTimeOffset.UtcNow))
+                .ToArray();
+            var batchTerminalStorage = durableStorage as IMuleBatchTerminalStorage;
+
+            if (batchTerminalStorage != null && completed.Length > 0)
+                await batchTerminalStorage.MarkCompletedRangeAsync(completed, cancellationToken);
+
+            foreach (var action in terminals)
             {
-                if (batchTerminalStorage != null)
+                if (action.Status == DurableActionStatus.Completed)
+                {
+                    if (batchTerminalStorage != null)
+                        continue;
+
+                    await durableStorage.MarkCompletedAsync(
+                        action.Id,
+                        action.CompletedOnUtc ?? DateTimeOffset.UtcNow,
+                        cancellationToken);
                     continue;
+                }
 
-                await durableStorage.MarkCompletedAsync(
-                    action.Id,
-                    action.CompletedOnUtc ?? DateTimeOffset.UtcNow,
-                    cancellationToken);
-                continue;
+                if (action.Status == DurableActionStatus.Failed)
+                {
+                    await durableStorage.MarkFailedAsync(
+                        action.Id,
+                        action.LastError,
+                        action.TerminalOnUtc ?? DateTimeOffset.UtcNow,
+                        null,
+                        cancellationToken);
+                }
             }
 
-            if (action.Status == DurableActionStatus.Failed)
-            {
-                await durableStorage.MarkFailedAsync(
-                    action.Id,
-                    action.LastError,
-                    action.TerminalOnUtc ?? DateTimeOffset.UtcNow,
-                    null,
-                    cancellationToken);
-            }
+            await durableStorage.SaveChangesAsync(cancellationToken);
+            await _buffer.CompleteTerminalFlushAsync(ids);
         }
-
-        await durableStorage.SaveChangesAsync(cancellationToken);
-        await _buffer.CompleteTerminalFlushAsync(terminals.Select(x => x.Id).ToArray());
+        catch
+        {
+            await _buffer.CancelTerminalFlushAsync(ids);
+            throw;
+        }
     }
 
     private int GetIntentFlushSize()
