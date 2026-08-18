@@ -376,6 +376,8 @@ services.AddMule(mule => mule
 
 With FastLane Redis, foreground enqueue writes to Redis first and returns without waiting for an EF Core insert. Mule workers can claim buffered work from Redis immediately, using per-action Redis leases so multiple replicas do not execute the same buffered intent at the same time. A background flusher persists intents to the durable provider in batches, then flushes terminal states only after the intent exists in durable storage.
 
+Intent and terminal flush batches are claimed in Redis before durable storage is touched. This prevents multiple replicas from flushing the same buffered item concurrently, and prevents a terminal state such as `Completed` from being flushed before the original durable intent exists in the durable provider. If durable persistence fails, Mule releases the flush claim so another flush cycle can retry.
+
 Redis does not replace EF Core durable storage. Treat it as a fast shared front buffer in front of the durable provider. If Redis is configured with volatile persistence or data is evicted before Mule flushes it, unflushed intents can be lost. Use Redis persistence and memory policies that match the durability window your workload can tolerate.
 
 For high-throughput workloads, tune `IntentFlushSize` and `CompletionFlushSize` together with `DispatchBatchSize`, `ExecutionQueueCapacity`, and lane `MaxDegreeOfParallelism`. Larger flush batches reduce durable storage round trips; larger dispatch batches reduce Redis claim overhead. Keep `LeaseDuration` comfortably above the normal execution time for an action so another replica does not reclaim work that is still running.
@@ -529,7 +531,7 @@ Use `Polling` when another process may insert work without notifying the current
 - `Polling`: cleanup runs every `CleanupInterval`.
 - `Scheduled`: cleanup wakes when completed actions reach `CompletedRetention`.
 
-Cleanup is batch-oriented. `CleanupBatchSize` controls how many completed actions can be removed per storage operation. SQL Server uses direct batch delete statements for completed actions instead of loading entities one by one.
+Cleanup is batch-oriented. `CleanupBatchSize` controls how many completed actions can be removed per storage operation. SQL Server uses direct ordered batch delete statements for completed actions instead of loading entities one by one.
 
 Mule uses atomic storage claims and locks so multiple service replicas can run workers at the same time without intentionally executing the same locked action concurrently. Actions should still be idempotent because Mule provides at-least-once execution.
 
