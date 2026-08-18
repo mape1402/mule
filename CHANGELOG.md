@@ -14,8 +14,10 @@ All notable changes to Mule packages will be documented in this file.
 - Added batch storage insertion support for Mule storage providers.
 - Added SQL Server integration coverage for batch enqueue, direct completion updates, and batch cleanup deletes.
 - Added `Mule.DurableActions.FastLane.InMemory`, an optional in-process buffer that acknowledges enqueue after buffer write and flushes intents and terminal states to durable storage in batches.
+- Added `Mule.DurableActions.FastLane.Redis`, an optional Redis-backed FastLane buffer for multi-replica high-throughput workloads.
 - Added `IMuleDurableStorage` so optional buffering providers can decorate active storage without losing access to the final durable provider.
 - Added FastLane InMemory integration coverage for buffered execution and ordered intent-before-terminal durable flushes.
+- Added optional Redis integration coverage for buffered execution and ordered durable flushes.
 
 ### Changed
 

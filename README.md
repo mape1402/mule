@@ -13,6 +13,7 @@ dotnet add package Mule.DurableActions
 dotnet add package Mule.DurableActions.InMemory
 dotnet add package Mule.DurableActions.EntityFrameworkCore
 dotnet add package Mule.DurableActions.FastLane.InMemory
+dotnet add package Mule.DurableActions.FastLane.Redis
 dotnet add package Mule.DurableActions.Testing
 ```
 
@@ -20,6 +21,7 @@ dotnet add package Mule.DurableActions.Testing
 - `Mule.DurableActions.InMemory`: in-memory provider for tests, samples, and local experiments.
 - `Mule.DurableActions.EntityFrameworkCore`: EF Core provider for durable storage.
 - `Mule.DurableActions.FastLane.InMemory`: optional in-memory buffer that accepts foreground work quickly and flushes durable storage in batches.
+- `Mule.DurableActions.FastLane.Redis`: optional Redis-backed buffer for high-throughput, multi-replica foreground work.
 - `Mule.DurableActions.Testing`: test harness helpers for durable action assertions.
 
 Package IDs are descriptive, but namespaces stay short:
@@ -30,6 +32,7 @@ using Mule.Configuration;
 using Mule.InMemory;
 using Mule.EntityFrameworkCore;
 using Mule.FastLane.InMemory;
+using Mule.FastLane.Redis;
 using Mule.Testing;
 ```
 
@@ -350,6 +353,30 @@ services.AddMule(mule => mule
 With FastLane InMemory, `EnqueueAsync` and `EnqueueManyAsync` acknowledge after the intent is accepted by the in-process buffer. Mule can execute that buffered work immediately, while a background flusher persists intents to the durable provider in batches. Terminal states are also buffered and flushed after their intents have been persisted, so durable storage observes the intent before `Completed` or `Failed`.
 
 This mode is faster than direct EF Core writes, but it is intentionally less durable. If the process exits before a flush, buffered intents or terminal updates that have not reached the durable provider can be lost. Use it when the producer can tolerate that window.
+
+### FastLane Redis
+
+FastLane Redis is an optional shared buffer for high-throughput services running with multiple replicas:
+
+```csharp
+services.AddMule(mule => mule
+    .UseEntityFrameworkCore<AppDbContext>()
+    .UseFastLaneRedis(options =>
+    {
+        options.ConnectionString = redisConnectionString;
+        options.KeyPrefix = "checkout";
+        options.IntentFlushSize = 1_000;
+        options.CompletionFlushSize = 2_000;
+        options.FlushInterval = TimeSpan.FromMilliseconds(25);
+        options.LeaseDuration = TimeSpan.FromMinutes(2);
+        options.DeduplicationRetention = TimeSpan.FromDays(7);
+    })
+    .AddActionsFromAssemblyContaining<SendReceiptAction>());
+```
+
+With FastLane Redis, foreground enqueue writes to Redis first and returns without waiting for an EF Core insert. Mule workers can claim buffered work from Redis immediately, using per-action Redis leases so multiple replicas do not execute the same buffered intent at the same time. A background flusher persists intents to the durable provider in batches, then flushes terminal states only after the intent exists in durable storage.
+
+Redis does not replace EF Core durable storage. Treat it as a fast shared front buffer in front of the durable provider. If Redis is configured with volatile persistence or data is evicted before Mule flushes it, unflushed intents can be lost. Use Redis persistence and memory policies that match the durability window your workload can tolerate.
 
 ## Dispatcher Settings
 
