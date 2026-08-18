@@ -116,6 +116,9 @@ internal class EntityFrameworkMuleStorage<TDbContext> : IMuleDurableStorage, IMu
         if (IsSqlServer())
             return await ClaimSqlServerAsync(lane, batchSize, lockExpiration, now, cancellationToken);
 
+        if (_dbContext.Database.IsRelational())
+            return await ClaimRelationalAsync(lane, batchSize, lockExpiration, now, cancellationToken);
+
         return await ClaimTrackedAsync(lane, batchSize, lockExpiration, now, cancellationToken);
     }
 
@@ -186,6 +189,58 @@ internal class EntityFrameworkMuleStorage<TDbContext> : IMuleDurableStorage, IMu
 
         await _dbContext.SaveChangesAsync(cancellationToken);
         return candidates.ToArray();
+    }
+
+    private async Task<IReadOnlyCollection<DurableAction>> ClaimRelationalAsync(
+        string lane,
+        int batchSize,
+        DateTimeOffset lockExpiration,
+        DateTimeOffset now,
+        CancellationToken cancellationToken)
+    {
+        var normalizedLane = NormalizeLane(lane);
+        var candidates = await Actions
+            .AsNoTracking()
+            .Where(x =>
+                x.Lane == normalizedLane &&
+                (x.Status == DurableActionStatus.Pending || x.Status == DurableActionStatus.Locked))
+            .Select(x => new
+            {
+                x.Id,
+                x.Status,
+                x.CreatedOnUtc,
+                x.LockedOnUtc,
+                x.NextAttemptOnUtc
+            })
+            .ToListAsync(cancellationToken);
+
+        var candidateIds = candidates
+            .Where(x =>
+                x.Status == DurableActionStatus.Pending && (x.NextAttemptOnUtc == null || x.NextAttemptOnUtc <= now) ||
+                x.Status == DurableActionStatus.Locked && x.LockedOnUtc <= lockExpiration)
+            .OrderBy(x => x.NextAttemptOnUtc ?? x.CreatedOnUtc)
+            .ThenBy(x => x.CreatedOnUtc)
+            .Select(x => x.Id)
+            .Take(batchSize)
+            .ToArray();
+
+        if (candidateIds.Length == 0)
+            return Array.Empty<DurableAction>();
+
+        var claimed = new List<DurableAction>(candidateIds.Length);
+        foreach (var id in candidateIds)
+        {
+            var locked = await LockRelationalAsync(id, lockExpiration, now, cancellationToken);
+            if (locked == 0)
+                continue;
+
+            var action = await Actions
+                .AsNoTracking()
+                .SingleAsync(x => x.Id == id, cancellationToken);
+            claimed.Add(action);
+        }
+
+        return claimed;
     }
 
     public async Task MarkCompletedAsync(Guid id, DateTimeOffset completedOnUtc, CancellationToken cancellationToken = default)
