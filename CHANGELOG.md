@@ -4,6 +4,21 @@ All notable changes to Mule packages will be documented in this file.
 
 ## [Unreleased]
 
+## [v1.5.0] - 2026-09-24
+
+### Added
+
+- Added flexible FastLane Redis connection setup with `ConfigurationOptions` and `ConnectionFactory` support.
+- Added `DisposeConnection` so applications can control ownership when supplying a shared `IConnectionMultiplexer`.
+- Added README documentation for advanced Redis connection setup without requiring Mule to know how Redis authenticates.
+- Added a visible nice-to-have document for future Mule extension points.
+- Added Redis integration coverage for `ConfigurationOptions` and externally supplied connection factories.
+
+### Fixed
+
+- Fixed FastLane durable flush recovery when an intent already exists in durable storage but Redis has not yet marked it as persisted.
+- Fixed duplicate durable inserts by action id for EF Core and in-memory storage providers.
+
 ## [v1.4.1] - 2026-08-18
 
 ### Fixed

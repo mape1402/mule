@@ -176,7 +176,7 @@ return 1
         if (actions.Count == 0)
             return Array.Empty<Guid>();
 
-        var database = _connection.Database;
+        var database = await _connection.GetDatabaseAsync();
         var dedupeTasks = new List<(DurableAction Action, Task<bool> Task)>();
         var deduplicationRetention = GetDeduplicationRetention();
         var batch = database.CreateBatch();
@@ -232,7 +232,8 @@ return 1
         if (string.IsNullOrWhiteSpace(deduplicationKey))
             return null;
 
-        var value = await _connection.Database.StringGetAsync(DeduplicationKey(key, deduplicationKey));
+        var database = await _connection.GetDatabaseAsync();
+        var value = await database.StringGetAsync(DeduplicationKey(key, deduplicationKey));
         return Guid.TryParse((string)value, out var id) ? id : null;
     }
 
@@ -254,8 +255,9 @@ return 1
         envelope.StartedOnUtc ??= now;
         envelope.IntentDirty = true;
         await SaveEnvelopeAsync(envelope);
-        await _connection.Database.SortedSetRemoveAsync(PendingKey(NormalizeLane(envelope.Lane)), id.ToString("D"));
-        await _connection.Database.SortedSetAddAsync(IntentFlushKey, id.ToString("D"), Score(now));
+        var database = await _connection.GetDatabaseAsync();
+        await database.SortedSetRemoveAsync(PendingKey(NormalizeLane(envelope.Lane)), id.ToString("D"));
+        await database.SortedSetAddAsync(IntentFlushKey, id.ToString("D"), Score(now));
         return envelope.ToAction();
     }
 
@@ -266,7 +268,7 @@ return 1
         DateTimeOffset now)
     {
         lane = NormalizeLane(lane);
-        var database = _connection.Database;
+        var database = await _connection.GetDatabaseAsync();
         var token = Guid.NewGuid().ToString("N");
         var result = await database.ScriptEvaluateAsync(
             ClaimPendingScript,
@@ -296,12 +298,13 @@ return 1
 
     public async Task<DateTimeOffset?> GetNextPendingOnUtcAsync()
     {
-        var lanes = await _connection.Database.SetMembersAsync(LanesKey);
+        var database = await _connection.GetDatabaseAsync();
+        var lanes = await database.SetMembersAsync(LanesKey);
         DateTimeOffset? next = null;
 
         foreach (var lane in lanes)
         {
-            var values = await _connection.Database.SortedSetRangeByRankWithScoresAsync(
+            var values = await database.SortedSetRangeByRankWithScoresAsync(
                 PendingKey((string)lane),
                 0,
                 0,
@@ -319,7 +322,7 @@ return 1
 
     public async Task<bool> MarkCompletedAsync(Guid id, DateTimeOffset completedOnUtc)
     {
-        var database = _connection.Database;
+        var database = await _connection.GetDatabaseAsync();
         var result = await database.ScriptEvaluateAsync(
             MarkCompletedScript,
             [
@@ -342,7 +345,7 @@ return 1
         if (envelope == null)
             return false;
 
-        var database = _connection.Database;
+        var database = await _connection.GetDatabaseAsync();
         var status = nextAttemptOnUtc == null ? DurableActionStatus.Failed : DurableActionStatus.Pending;
         var result = await database.ScriptEvaluateAsync(
             MarkFailedScript,
@@ -367,7 +370,7 @@ return 1
 
     public async Task<IReadOnlyCollection<DurableAction>> TakeIntentFlushBatchAsync(int batchSize)
     {
-        var database = _connection.Database;
+        var database = await _connection.GetDatabaseAsync();
         var result = await database.ScriptEvaluateAsync(
             TakeIntentFlushScript,
             [IntentFlushKey, $"{_connection.Prefix}:fastlane:action:"],
@@ -386,7 +389,7 @@ return 1
         if (ids.Count == 0)
             return;
 
-        var database = _connection.Database;
+        var database = await _connection.GetDatabaseAsync();
         var readBatch = database.CreateBatch();
         var readTasks = ids
             .Select(id => (Id: id, Task: readBatch.StringGetAsync(GetActionKey(id))))
@@ -422,7 +425,7 @@ return 1
         if (ids.Count == 0)
             return;
 
-        var database = _connection.Database;
+        var database = await _connection.GetDatabaseAsync();
         var readBatch = database.CreateBatch();
         var readTasks = ids
             .Select(id => (Id: id, Task: readBatch.StringGetAsync(GetActionKey(id))))
@@ -451,7 +454,7 @@ return 1
 
     public async Task<IReadOnlyCollection<DurableAction>> TakeTerminalFlushBatchAsync(int batchSize)
     {
-        var database = _connection.Database;
+        var database = await _connection.GetDatabaseAsync();
         var result = await database.ScriptEvaluateAsync(
             TakeTerminalFlushScript,
             [TerminalFlushKey, $"{_connection.Prefix}:fastlane:action:"],
@@ -470,7 +473,7 @@ return 1
         if (ids.Count == 0)
             return;
 
-        var database = _connection.Database;
+        var database = await _connection.GetDatabaseAsync();
         var readBatch = database.CreateBatch();
         var readTasks = ids
             .Select(id => (Id: id, Task: readBatch.StringGetAsync(GetActionKey(id))))
@@ -506,7 +509,7 @@ return 1
         if (ids.Count == 0)
             return;
 
-        var database = _connection.Database;
+        var database = await _connection.GetDatabaseAsync();
         var readBatch = database.CreateBatch();
         var readTasks = ids
             .Select(id => (Id: id, Task: readBatch.StringGetAsync(GetActionKey(id))))
@@ -535,32 +538,39 @@ return 1
 
     private async Task SaveEnvelopeAsync(RedisActionEnvelope envelope)
     {
-        await _connection.Database.StringSetAsync(GetActionKey(envelope.Id), JsonSerializer.Serialize(envelope, JsonOptions));
-        await _connection.Database.SetAddAsync(LanesKey, NormalizeLane(envelope.Lane));
+        var database = await _connection.GetDatabaseAsync();
+        await database.StringSetAsync(GetActionKey(envelope.Id), JsonSerializer.Serialize(envelope, JsonOptions));
+        await database.SetAddAsync(LanesKey, NormalizeLane(envelope.Lane));
     }
 
     private async Task<RedisActionEnvelope> GetEnvelopeAsync(Guid id)
     {
-        var value = await _connection.Database.StringGetAsync(GetActionKey(id));
+        var database = await _connection.GetDatabaseAsync();
+        var value = await database.StringGetAsync(GetActionKey(id));
         return value.HasValue
             ? JsonSerializer.Deserialize<RedisActionEnvelope>((string)value, JsonOptions)
             : null;
     }
 
     private async Task<bool> TryAcquireLeaseAsync(Guid id, string token)
-        => await _connection.Database.StringSetAsync(GetLeaseKey(id), token, GetLeaseDuration(), When.NotExists);
+    {
+        var database = await _connection.GetDatabaseAsync();
+        return await database.StringSetAsync(GetLeaseKey(id), token, GetLeaseDuration(), When.NotExists);
+    }
 
     private async Task ReleaseLeaseAsync(Guid id, string token = null)
     {
         if (token == null)
         {
-            await _connection.Database.KeyDeleteAsync(GetLeaseKey(id));
+            var database = await _connection.GetDatabaseAsync();
+            await database.KeyDeleteAsync(GetLeaseKey(id));
             return;
         }
 
-        var value = await _connection.Database.StringGetAsync(GetLeaseKey(id));
+        var databaseWithLease = await _connection.GetDatabaseAsync();
+        var value = await databaseWithLease.StringGetAsync(GetLeaseKey(id));
         if (value == token)
-            await _connection.Database.KeyDeleteAsync(GetLeaseKey(id));
+            await databaseWithLease.KeyDeleteAsync(GetLeaseKey(id));
     }
 
     private async Task ReleaseLeasesAsync(IReadOnlyCollection<Guid> ids, string token)
@@ -574,9 +584,10 @@ return 1
         if (!envelope.IntentPersisted || envelope.IntentDirty || !envelope.TerminalFlushed || envelope.TerminalDirty)
             return;
 
-        await _connection.Database.KeyDeleteAsync(GetActionKey(envelope.Id));
+        var database = await _connection.GetDatabaseAsync();
+        await database.KeyDeleteAsync(GetActionKey(envelope.Id));
         if (!string.IsNullOrWhiteSpace(envelope.DeduplicationKey))
-            await _connection.Database.KeyDeleteAsync(DeduplicationKey(ActionKey.From(envelope.Key), envelope.DeduplicationKey));
+            await database.KeyDeleteAsync(DeduplicationKey(ActionKey.From(envelope.Key), envelope.DeduplicationKey));
     }
 
     private void AddSaveEnvelope(IBatch batch, List<Task> tasks, RedisActionEnvelope envelope)

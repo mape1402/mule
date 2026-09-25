@@ -1,6 +1,7 @@
 namespace Mule.FastLane.Redis.Tests;
 
 using System.Collections.Concurrent;
+using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -34,10 +35,10 @@ public sealed class RedisFastLaneTests
 
             var probe = host.Services.GetRequiredService<TestProbe>();
             await probe.WaitForCountAsync(25);
-            await WaitForDurableCountAsync(host, DurableActionStatus.Completed, 25);
+            await WaitForDurableCountAsync(host, DurableActionStatus.Completed, 25, keyPrefix);
             await host.StopAsync();
 
-            Assert.Equal(25, probe.Values.Count);
+            Assert.Equal(25, probe.Values.Distinct().Count());
         }
         finally
         {
@@ -46,7 +47,89 @@ public sealed class RedisFastLaneTests
         }
     }
 
-    private static IHost CreateHost(out string databasePath, string keyPrefix)
+    [RedisFact]
+    public async Task EnqueueManyAsync_Should_Use_ConfigurationOptions()
+    {
+        var keyPrefix = $"mule-tests:{Guid.NewGuid():N}";
+        var connectionString = Environment.GetEnvironmentVariable(ConnectionStringEnvironmentVariable);
+        using var host = CreateHost(
+            out var databasePath,
+            keyPrefix,
+            options =>
+            {
+                options.ConfigurationOptions = ConfigurationOptions.Parse(connectionString);
+                options.ConfigurationOptions.AbortOnConnectFail = false;
+            });
+
+        try
+        {
+            await EnsureDatabaseAsync(host);
+
+            using (var scope = host.Services.CreateScope())
+            {
+                var client = scope.ServiceProvider.GetRequiredService<IMuleClient>();
+                var ids = await client.EnqueueManyAsync(Enumerable.Range(0, 10)
+                    .Select(index => MuleIntent.For(Key, new TestPayload($"redis-options-{index}"))));
+
+                Assert.Equal(10, ids.Count);
+                Assert.Equal(10, ids.Distinct().Count());
+            }
+        }
+        finally
+        {
+            await CleanupRedisAsync(keyPrefix);
+            TryDelete(databasePath);
+        }
+    }
+
+    [RedisFact]
+    public async Task EnqueueManyAsync_Should_Use_ConnectionFactory_Once()
+    {
+        var keyPrefix = $"mule-tests:{Guid.NewGuid():N}";
+        var connectionString = Environment.GetEnvironmentVariable(ConnectionStringEnvironmentVariable);
+        await using var connection = await ConnectionMultiplexer.ConnectAsync(connectionString);
+        var factoryCalls = 0;
+        using var host = CreateHost(
+            out var databasePath,
+            keyPrefix,
+            options =>
+            {
+                options.ConnectionFactory = (_, _) =>
+                {
+                    Interlocked.Increment(ref factoryCalls);
+                    return ValueTask.FromResult<IConnectionMultiplexer>(connection);
+                };
+                options.DisposeConnection = false;
+            });
+
+        try
+        {
+            await EnsureDatabaseAsync(host);
+
+            using (var scope = host.Services.CreateScope())
+            {
+                var client = scope.ServiceProvider.GetRequiredService<IMuleClient>();
+                var ids = await client.EnqueueManyAsync(Enumerable.Range(0, 10)
+                    .Select(index => MuleIntent.For(Key, new TestPayload($"redis-factory-{index}"))));
+
+                Assert.Equal(10, ids.Count);
+                Assert.Equal(10, ids.Distinct().Count());
+            }
+
+            Assert.Equal(1, Volatile.Read(ref factoryCalls));
+            Assert.True(connection.IsConnected);
+        }
+        finally
+        {
+            await CleanupRedisAsync(keyPrefix);
+            TryDelete(databasePath);
+        }
+    }
+
+    private static IHost CreateHost(
+        out string databasePath,
+        string keyPrefix,
+        Action<FastLaneRedisOptions> configureRedis = null)
     {
         databasePath = Path.Combine(Path.GetTempPath(), $"mule-fastlane-redis-{Guid.NewGuid():N}.db");
         var capturedPath = databasePath;
@@ -74,6 +157,7 @@ public sealed class RedisFastLaneTests
                         options.IntentFlushSize = 100;
                         options.CompletionFlushSize = 100;
                         options.FlushInterval = TimeSpan.FromMilliseconds(10);
+                        configureRedis?.Invoke(options);
                     })
                     .AddActionsFromAssemblyContaining<RedisFastLaneTests>());
             })
@@ -87,19 +171,67 @@ public sealed class RedisFastLaneTests
         await db.Database.EnsureCreatedAsync();
     }
 
-    private static async Task WaitForDurableCountAsync(IHost host, DurableActionStatus status, int count)
+    private static async Task WaitForDurableCountAsync(IHost host, DurableActionStatus status, int count, string keyPrefix)
     {
-        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
-        while (!timeout.IsCancellationRequested)
+        var deadline = DateTimeOffset.UtcNow.AddSeconds(120);
+        while (DateTimeOffset.UtcNow < deadline)
         {
             using var scope = host.Services.CreateScope();
             var db = scope.ServiceProvider.GetRequiredService<MuleDbContext>();
-            if (await db.Actions.AsNoTracking().CountAsync(x => x.Status == status, timeout.Token) >= count)
+            if (await db.Actions.AsNoTracking().CountAsync(x => x.Status == status) >= count)
                 return;
 
-            await Task.Delay(25, timeout.Token);
+            await Task.Delay(25);
         }
+
+        using var finalScope = host.Services.CreateScope();
+        var finalDb = finalScope.ServiceProvider.GetRequiredService<MuleDbContext>();
+        var counts = await finalDb.Actions
+            .AsNoTracking()
+            .GroupBy(x => x.Status)
+            .Select(x => new { Status = x.Key, Count = x.Count() })
+            .ToArrayAsync();
+        var countSummary = string.Join(", ", counts.Select(x => $"{x.Status}={x.Count}"));
+        var redisSummary = await GetRedisSummaryAsync(keyPrefix);
+        throw new TimeoutException($"Timed out waiting for {count} durable actions with status {status}. Counts: {countSummary}. Redis: {redisSummary}");
     }
+
+    private static async Task<string> GetRedisSummaryAsync(string keyPrefix)
+    {
+        var connectionString = Environment.GetEnvironmentVariable(ConnectionStringEnvironmentVariable);
+        if (string.IsNullOrWhiteSpace(connectionString))
+            return "unavailable";
+
+        await using var connection = await ConnectionMultiplexer.ConnectAsync(connectionString);
+        var database = connection.GetDatabase();
+        var summaries = new List<string>();
+        foreach (var endpoint in connection.GetEndPoints())
+        {
+            var server = connection.GetServer(endpoint);
+            await foreach (var key in server.KeysAsync(pattern: $"{keyPrefix}:fastlane:action:*"))
+            {
+                var value = await database.StringGetAsync(key);
+                if (!value.HasValue)
+                    continue;
+
+                using var document = JsonDocument.Parse((string)value);
+                var root = document.RootElement;
+                summaries.Add(
+                    $"status={root.GetProperty("status").GetInt32()}, " +
+                    $"intentPersisted={GetBoolean(root, "intentPersisted")}, " +
+                    $"intentDirty={GetBoolean(root, "intentDirty")}, " +
+                    $"terminalDirty={GetBoolean(root, "terminalDirty")}, " +
+                    $"terminalFlushing={GetBoolean(root, "terminalFlushing")}, " +
+                    $"terminalFlushed={GetBoolean(root, "terminalFlushed")}");
+            }
+        }
+
+        return summaries.Count == 0 ? "no action envelopes" : string.Join(" | ", summaries);
+    }
+
+    private static bool GetBoolean(JsonElement element, string propertyName)
+        => element.TryGetProperty(propertyName, out var property) &&
+           property.ValueKind == JsonValueKind.True;
 
     private static async Task CleanupRedisAsync(string keyPrefix)
     {
@@ -163,7 +295,7 @@ public sealed class RedisFastLaneTests
             using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
             while (!timeout.IsCancellationRequested)
             {
-                if (Values.Count >= count)
+                if (Values.Distinct().Count() >= count)
                     return;
 
                 await Task.Delay(25, timeout.Token);

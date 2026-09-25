@@ -20,6 +20,9 @@ internal sealed class InMemoryMuleStore
     {
         lock (_gate)
         {
+            if (_actions.Any(x => x.Id == action.Id))
+                return false;
+
             if (!string.IsNullOrWhiteSpace(action.DeduplicationKey) &&
                 _actions.Any(x => x.Key == action.Key && x.DeduplicationKey == action.DeduplicationKey))
                 return false;
