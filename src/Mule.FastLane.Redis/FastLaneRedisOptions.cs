@@ -1,8 +1,16 @@
 namespace Mule.FastLane.Redis;
 
+using StackExchange.Redis;
+
 public sealed class FastLaneRedisOptions
 {
     public string ConnectionString { get; set; } = "localhost:6379";
+
+    public ConfigurationOptions ConfigurationOptions { get; set; }
+
+    public Func<IServiceProvider, CancellationToken, ValueTask<IConnectionMultiplexer>> ConnectionFactory { get; set; }
+
+    public bool? DisposeConnection { get; set; }
 
     public string KeyPrefix { get; set; } = "mule";
 

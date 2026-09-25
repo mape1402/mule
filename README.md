@@ -34,6 +34,7 @@ using Mule.EntityFrameworkCore;
 using Mule.FastLane.InMemory;
 using Mule.FastLane.Redis;
 using Mule.Testing;
+using StackExchange.Redis;
 ```
 
 ## Concepts
@@ -375,6 +376,46 @@ services.AddMule(mule => mule
 ```
 
 With FastLane Redis, foreground enqueue writes to Redis first and returns without waiting for an EF Core insert. Mule workers can claim buffered work from Redis immediately, using per-action Redis leases so multiple replicas do not execute the same buffered intent at the same time. A background flusher persists intents to the durable provider in batches, then flushes terminal states only after the intent exists in durable storage.
+
+Redis connection setup is intentionally flexible. For simple deployments, keep using `ConnectionString`. For advanced deployments, provide `ConfigurationOptions` or a factory that returns an `IConnectionMultiplexer` created by the application:
+
+```csharp
+services.AddMule(mule => mule
+    .UseEntityFrameworkCore<AppDbContext>()
+    .UseFastLaneRedis(options =>
+    {
+        options.ConfigurationOptions = new ConfigurationOptions
+        {
+            EndPoints = { "redis.example.net:6380" },
+            Ssl = true,
+            AbortOnConnectFail = false
+        };
+        options.KeyPrefix = "checkout";
+    })
+    .AddActionsFromAssemblyContaining<SendReceiptAction>());
+```
+
+```csharp
+services.AddSingleton<IConnectionMultiplexer>(serviceProvider =>
+{
+    // The application owns connection creation and authentication here.
+    // This can use certificates, managed identity, token refresh, or any custom setup.
+    return ConnectionMultiplexer.Connect(redisConfiguration);
+});
+
+services.AddMule(mule => mule
+    .UseEntityFrameworkCore<AppDbContext>()
+    .UseFastLaneRedis(options =>
+    {
+        options.ConnectionFactory = (serviceProvider, cancellationToken) =>
+            ValueTask.FromResult(serviceProvider.GetRequiredService<IConnectionMultiplexer>());
+        options.DisposeConnection = false;
+        options.KeyPrefix = "checkout";
+    })
+    .AddActionsFromAssemblyContaining<SendReceiptAction>());
+```
+
+When multiple connection options are provided, Mule resolves Redis in this order: `ConnectionFactory`, `ConfigurationOptions`, then `ConnectionString`. Mule disposes internally-created connections by default. When using a shared connection from DI, set `DisposeConnection = false` so the application keeps ownership.
 
 Intent and terminal flush batches are claimed in Redis before durable storage is touched. This prevents multiple replicas from flushing the same buffered item concurrently, and prevents a terminal state such as `Completed` from being flushed before the original durable intent exists in the durable provider. If durable persistence fails, Mule releases the flush claim so another flush cycle can retry.
 

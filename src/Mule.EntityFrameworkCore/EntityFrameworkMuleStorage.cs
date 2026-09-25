@@ -43,7 +43,24 @@ internal class EntityFrameworkMuleStorage<TDbContext> : IMuleDurableStorage, IMu
                 throw new ArgumentException("Action collection cannot contain null values.", nameof(actions));
         }
 
-        var deduplicatedActions = actions
+        var ids = actions
+            .Select(x => x.Id)
+            .Distinct()
+            .ToArray();
+        var existingIds = await Actions
+            .AsNoTracking()
+            .Where(x => ids.Contains(x.Id))
+            .Select(x => x.Id)
+            .ToListAsync(cancellationToken);
+        var newActionIds = new HashSet<Guid>();
+        var newActions = actions
+            .Where(x => !existingIds.Contains(x.Id) && newActionIds.Add(x.Id))
+            .ToArray();
+
+        if (newActions.Length == 0)
+            return;
+
+        var deduplicatedActions = newActions
             .Where(x => !string.IsNullOrWhiteSpace(x.DeduplicationKey))
             .ToArray();
 
@@ -79,14 +96,14 @@ internal class EntityFrameworkMuleStorage<TDbContext> : IMuleDurableStorage, IMu
                 await Actions.AddAsync(action, cancellationToken);
             }
 
-            var nonDeduplicatedActions = actions
+            var nonDeduplicatedActions = newActions
                 .Where(x => string.IsNullOrWhiteSpace(x.DeduplicationKey))
                 .ToArray();
             await Actions.AddRangeAsync(nonDeduplicatedActions, cancellationToken);
             return;
         }
 
-        await Actions.AddRangeAsync(actions, cancellationToken);
+        await Actions.AddRangeAsync(newActions, cancellationToken);
     }
 
     public async Task<Guid?> FindByDeduplicationKeyAsync(
