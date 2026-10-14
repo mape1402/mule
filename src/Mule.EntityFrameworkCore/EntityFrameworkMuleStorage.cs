@@ -127,17 +127,12 @@ internal class EntityFrameworkMuleStorage<TDbContext> : IMuleDurableStorage, IMu
     {
         var normalizedLane = NormalizeLane(lane);
         var lockExpiration = now.Subtract(lockTimeout);
-        var candidateIds = await Actions
-            .AsNoTracking()
-            .Where(x =>
-                x.Lane == normalizedLane &&
-                (x.Status == DurableActionStatus.Pending && (x.NextAttemptOnUtc == null || x.NextAttemptOnUtc <= now) ||
-                 x.Status == DurableActionStatus.Locked && x.LockedOnUtc != null && x.LockedOnUtc <= lockExpiration))
-            .OrderBy(x => x.NextAttemptOnUtc ?? x.CreatedOnUtc)
-            .ThenBy(x => x.CreatedOnUtc)
-            .Select(x => x.Id)
-            .Take(Math.Max(1, batchSize))
-            .ToArrayAsync(cancellationToken);
+        var candidateIds = await GetClaimCandidateIdsAsync(
+            normalizedLane,
+            Math.Max(1, batchSize),
+            lockExpiration,
+            now,
+            cancellationToken);
 
         if (candidateIds.Length == 0)
             return Array.Empty<DurableAction>();
@@ -269,14 +264,10 @@ internal class EntityFrameworkMuleStorage<TDbContext> : IMuleDurableStorage, IMu
 
     public async Task<int> CleanCompletedAsync(DateTimeOffset olderThanUtc, int batchSize, CancellationToken cancellationToken = default)
     {
-        var ids = await Actions
-            .AsNoTracking()
-            .Where(x => x.Status == DurableActionStatus.Completed && x.CompletedOnUtc != null && x.CompletedOnUtc <= olderThanUtc)
-            .OrderBy(x => x.CompletedOnUtc)
-            .ThenBy(x => x.CreatedOnUtc)
-            .Select(x => x.Id)
-            .Take(Math.Max(1, batchSize))
-            .ToArrayAsync(cancellationToken);
+        var ids = await GetCompletedCandidateIdsAsync(
+            olderThanUtc,
+            Math.Max(1, batchSize),
+            cancellationToken);
 
         if (ids.Length == 0)
             return 0;
@@ -289,12 +280,30 @@ internal class EntityFrameworkMuleStorage<TDbContext> : IMuleDurableStorage, IMu
     }
 
     public async Task<DateTimeOffset?> GetOldestCompletedOnUtcAsync(CancellationToken cancellationToken = default)
-        => await Actions
-            .AsNoTracking()
-            .Where(x => x.Status == DurableActionStatus.Completed && x.CompletedOnUtc != null)
-            .OrderBy(x => x.CompletedOnUtc)
-            .Select(x => x.CompletedOnUtc)
-            .FirstOrDefaultAsync(cancellationToken);
+    {
+        try
+        {
+            return await Actions
+                .AsNoTracking()
+                .Where(x => x.Status == DurableActionStatus.Completed && x.CompletedOnUtc != null)
+                .OrderBy(x => x.CompletedOnUtc)
+                .Select(x => x.CompletedOnUtc)
+                .FirstOrDefaultAsync(cancellationToken);
+        }
+        catch (InvalidOperationException)
+        {
+            var completed = await Actions
+                .AsNoTracking()
+                .Where(x => x.Status == DurableActionStatus.Completed && x.CompletedOnUtc != null)
+                .Select(x => new { x.CompletedOnUtc })
+                .ToListAsync(cancellationToken);
+
+            return completed
+                .OrderBy(x => x.CompletedOnUtc)
+                .Select(x => x.CompletedOnUtc)
+                .FirstOrDefault();
+        }
+    }
 
     public async Task SaveChangesAsync(CancellationToken cancellationToken = default)
     {
@@ -312,6 +321,95 @@ internal class EntityFrameworkMuleStorage<TDbContext> : IMuleDurableStorage, IMu
     }
 
     protected DbSet<DurableAction> Actions => _dbContext.Set<DurableAction>();
+
+    private async Task<Ulid[]> GetClaimCandidateIdsAsync(
+        string normalizedLane,
+        int batchSize,
+        DateTimeOffset lockExpiration,
+        DateTimeOffset now,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            return await Actions
+                .AsNoTracking()
+                .Where(x =>
+                    x.Lane == normalizedLane &&
+                    ((x.Status == DurableActionStatus.Pending && (x.NextAttemptOnUtc == null || x.NextAttemptOnUtc <= now)) ||
+                     (x.Status == DurableActionStatus.Locked && x.LockedOnUtc != null && x.LockedOnUtc <= lockExpiration)))
+                .OrderBy(x => x.NextAttemptOnUtc ?? x.CreatedOnUtc)
+                .ThenBy(x => x.CreatedOnUtc)
+                .Select(x => x.Id)
+                .Take(batchSize)
+                .ToArrayAsync(cancellationToken);
+        }
+        catch (InvalidOperationException)
+        {
+            var candidates = await Actions
+                .AsNoTracking()
+                .Where(x =>
+                    x.Lane == normalizedLane &&
+                    (x.Status == DurableActionStatus.Pending || x.Status == DurableActionStatus.Locked))
+                .Select(x => new
+                {
+                    x.Id,
+                    x.Status,
+                    x.CreatedOnUtc,
+                    x.LockedOnUtc,
+                    x.NextAttemptOnUtc
+                })
+                .ToListAsync(cancellationToken);
+
+            return candidates
+                .Where(x =>
+                    x.Status == DurableActionStatus.Pending && (x.NextAttemptOnUtc == null || x.NextAttemptOnUtc <= now) ||
+                    x.Status == DurableActionStatus.Locked && x.LockedOnUtc != null && x.LockedOnUtc <= lockExpiration)
+                .OrderBy(x => x.NextAttemptOnUtc ?? x.CreatedOnUtc)
+                .ThenBy(x => x.CreatedOnUtc)
+                .Select(x => x.Id)
+                .Take(batchSize)
+                .ToArray();
+        }
+    }
+
+    private async Task<Ulid[]> GetCompletedCandidateIdsAsync(
+        DateTimeOffset olderThanUtc,
+        int batchSize,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            return await Actions
+                .AsNoTracking()
+                .Where(x => x.Status == DurableActionStatus.Completed && x.CompletedOnUtc != null && x.CompletedOnUtc <= olderThanUtc)
+                .OrderBy(x => x.CompletedOnUtc)
+                .ThenBy(x => x.CreatedOnUtc)
+                .Select(x => x.Id)
+                .Take(batchSize)
+                .ToArrayAsync(cancellationToken);
+        }
+        catch (InvalidOperationException)
+        {
+            var candidates = await Actions
+                .AsNoTracking()
+                .Where(x => x.Status == DurableActionStatus.Completed && x.CompletedOnUtc != null)
+                .Select(x => new
+                {
+                    x.Id,
+                    x.CreatedOnUtc,
+                    x.CompletedOnUtc
+                })
+                .ToListAsync(cancellationToken);
+
+            return candidates
+                .Where(x => x.CompletedOnUtc <= olderThanUtc)
+                .OrderBy(x => x.CompletedOnUtc)
+                .ThenBy(x => x.CreatedOnUtc)
+                .Select(x => x.Id)
+                .Take(batchSize)
+                .ToArray();
+        }
+    }
 
     private async Task<DurableAction> FindAsync(Ulid id, CancellationToken cancellationToken)
         => await Actions.FindAsync(new object[] { id }, cancellationToken)
