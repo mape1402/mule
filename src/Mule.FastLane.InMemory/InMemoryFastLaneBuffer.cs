@@ -95,19 +95,7 @@ internal sealed class InMemoryFastLaneBuffer
         {
             var lockExpiration = now.Subtract(lockTimeout);
             return _actions.Values
-                .Select(x =>
-                {
-                    var action = x.Action;
-                    if (action.Status == DurableActionStatus.Pending)
-                        return action.NextAttemptOnUtc == null || action.NextAttemptOnUtc <= now
-                            ? now
-                            : action.NextAttemptOnUtc;
-
-                    if (action.Status == DurableActionStatus.Locked && action.LockedOnUtc <= lockExpiration)
-                        return now;
-
-                    return null;
-                })
+                .Select(x => GetNextPendingOnUtc(x.Action, lockExpiration, now))
                 .Where(x => x != null)
                 .OrderBy(x => x)
                 .FirstOrDefault();
@@ -257,9 +245,25 @@ internal sealed class InMemoryFastLaneBuffer
     private static bool CanLock(DurableAction action, TimeSpan lockTimeout, DateTimeOffset now)
     {
         var lockExpiration = now.Subtract(lockTimeout);
-        return action.Status == DurableActionStatus.Pending && (action.NextAttemptOnUtc == null || action.NextAttemptOnUtc <= now) ||
-               action.Status == DurableActionStatus.Locked && action.LockedOnUtc <= lockExpiration;
+        return action.Status switch
+        {
+            DurableActionStatus.Pending => action.NextAttemptOnUtc is not { } nextAttemptOnUtc || nextAttemptOnUtc <= now,
+            DurableActionStatus.Locked => action.LockedOnUtc is { } lockedOnUtc && lockedOnUtc <= lockExpiration,
+            _ => false
+        };
     }
+
+    private static DateTimeOffset? GetNextPendingOnUtc(
+        DurableAction action,
+        DateTimeOffset lockExpiration,
+        DateTimeOffset now)
+        => action.Status switch
+        {
+            DurableActionStatus.Pending when action.NextAttemptOnUtc is not { } nextAttemptOnUtc => now,
+            DurableActionStatus.Pending when action.NextAttemptOnUtc is { } nextAttemptOnUtc => nextAttemptOnUtc <= now ? now : nextAttemptOnUtc,
+            DurableActionStatus.Locked when action.LockedOnUtc is { } lockedOnUtc && lockedOnUtc <= lockExpiration => now,
+            _ => null
+        };
 
     private static DurableAction CloneForBuffer(DurableAction action)
         => Clone(action);

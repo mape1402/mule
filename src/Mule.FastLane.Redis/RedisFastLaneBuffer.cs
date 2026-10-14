@@ -565,36 +565,12 @@ return 1
         return await database.StringSetAsync(GetLeaseKey(id), token, GetLeaseDuration(), When.NotExists);
     }
 
-    private async Task ReleaseLeaseAsync(Ulid id, string token = null)
+    private async Task ReleaseLeaseAsync(Ulid id, string token)
     {
-        if (token == null)
-        {
-            var database = await _connection.GetDatabaseAsync();
-            await database.KeyDeleteAsync(GetLeaseKey(id));
-            return;
-        }
-
         var databaseWithLease = await _connection.GetDatabaseAsync();
         var value = await databaseWithLease.StringGetAsync(GetLeaseKey(id));
         if (value == token)
             await databaseWithLease.KeyDeleteAsync(GetLeaseKey(id));
-    }
-
-    private async Task ReleaseLeasesAsync(IReadOnlyCollection<Ulid> ids, string token)
-    {
-        foreach (var id in ids)
-            await ReleaseLeaseAsync(id, token);
-    }
-
-    private async Task TryRemoveAsync(RedisActionEnvelope envelope)
-    {
-        if (!envelope.IntentPersisted || envelope.IntentDirty || !envelope.TerminalFlushed || envelope.TerminalDirty)
-            return;
-
-        var database = await _connection.GetDatabaseAsync();
-        await database.KeyDeleteAsync(GetActionKey(envelope.Id));
-        if (!string.IsNullOrWhiteSpace(envelope.DeduplicationKey))
-            await database.KeyDeleteAsync(DeduplicationKey(ActionKey.From(envelope.Key), envelope.DeduplicationKey));
     }
 
     private void AddSaveEnvelope(IBatch batch, List<Task> tasks, RedisActionEnvelope envelope)
@@ -633,8 +609,12 @@ return 1
     private static bool CanLock(DurableAction action, TimeSpan lockTimeout, DateTimeOffset now)
     {
         var lockExpiration = now.Subtract(lockTimeout);
-        return action.Status == DurableActionStatus.Pending && (action.NextAttemptOnUtc == null || action.NextAttemptOnUtc <= now) ||
-               action.Status == DurableActionStatus.Locked && action.LockedOnUtc <= lockExpiration;
+        return action.Status switch
+        {
+            DurableActionStatus.Pending => action.NextAttemptOnUtc is not { } nextAttemptOnUtc || nextAttemptOnUtc <= now,
+            DurableActionStatus.Locked => action.LockedOnUtc is { } lockedOnUtc && lockedOnUtc <= lockExpiration,
+            _ => false
+        };
     }
 
     private string GetActionKey(Ulid id) => $"{_connection.Prefix}:fastlane:action:{id}";

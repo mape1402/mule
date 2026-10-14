@@ -406,9 +406,6 @@ internal sealed class MuleDispatcherHostedService : BackgroundService
             .SelectMany(lane => Enumerable.Repeat(lane, GetWeight(lane)))
             .ToArray();
 
-        if (schedule.Length == 0)
-            return lanes;
-
         var start = Math.Abs(Interlocked.Increment(ref _fairScheduleCursor) % schedule.Length);
         return schedule
             .Skip(start)

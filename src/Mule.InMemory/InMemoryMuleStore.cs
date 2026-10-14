@@ -52,10 +52,7 @@ internal sealed class InMemoryMuleStore
         {
             var lockExpiration = now.Subtract(lockTimeout);
             var actions = _actions
-                .Where(x =>
-                    IsLane(x, lane) &&
-                    (x.Status == DurableActionStatus.Pending && (x.NextAttemptOnUtc == null || x.NextAttemptOnUtc <= now) ||
-                    x.Status == DurableActionStatus.Locked && x.LockedOnUtc <= lockExpiration))
+                .Where(x => IsLane(x, lane) && CanLock(x, lockExpiration, now))
                 .OrderBy(x => x.CreatedOnUtc)
                 .Take(batchSize)
                 .ToArray();
@@ -84,11 +81,7 @@ internal sealed class InMemoryMuleStore
                 return null;
 
             var lockExpiration = now.Subtract(lockTimeout);
-            var canLock =
-                action.Status == DurableActionStatus.Pending && (action.NextAttemptOnUtc == null || action.NextAttemptOnUtc <= now) ||
-                action.Status == DurableActionStatus.Locked && action.LockedOnUtc <= lockExpiration;
-
-            if (!canLock)
+            if (!CanLock(action, lockExpiration, now))
                 return null;
 
             action.Status = DurableActionStatus.Locked;
@@ -106,19 +99,7 @@ internal sealed class InMemoryMuleStore
         {
             var lockExpiration = now.Subtract(lockTimeout);
             return _actions
-                .Where(x => x.Status is DurableActionStatus.Pending or DurableActionStatus.Locked)
-                .Select(x =>
-                {
-                    if (x.Status == DurableActionStatus.Pending)
-                        return x.NextAttemptOnUtc == null || x.NextAttemptOnUtc <= now
-                            ? now
-                            : x.NextAttemptOnUtc;
-
-                    if (x.LockedOnUtc <= lockExpiration)
-                        return now;
-
-                    return x.LockedOnUtc?.Add(lockTimeout);
-                })
+                .Select(x => GetNextPendingOnUtc(x, lockExpiration, lockTimeout, now))
                 .Where(x => x != null)
                 .OrderBy(x => x)
                 .FirstOrDefault();
@@ -284,6 +265,28 @@ internal sealed class InMemoryMuleStore
 
     private static bool IsLane(DurableAction action, string lane)
         => string.Equals(NormalizeLane(action.Lane), NormalizeLane(lane), StringComparison.OrdinalIgnoreCase);
+
+    private static bool CanLock(DurableAction action, DateTimeOffset lockExpiration, DateTimeOffset now)
+        => action.Status switch
+        {
+            DurableActionStatus.Pending => action.NextAttemptOnUtc is not { } nextAttemptOnUtc || nextAttemptOnUtc <= now,
+            DurableActionStatus.Locked => action.LockedOnUtc is { } lockedOnUtc && lockedOnUtc <= lockExpiration,
+            _ => false
+        };
+
+    private static DateTimeOffset? GetNextPendingOnUtc(
+        DurableAction action,
+        DateTimeOffset lockExpiration,
+        TimeSpan lockTimeout,
+        DateTimeOffset now)
+        => action.Status switch
+        {
+            DurableActionStatus.Pending when action.NextAttemptOnUtc is not { } nextAttemptOnUtc => now,
+            DurableActionStatus.Pending when action.NextAttemptOnUtc is { } nextAttemptOnUtc => nextAttemptOnUtc <= now ? now : nextAttemptOnUtc,
+            DurableActionStatus.Locked when action.LockedOnUtc is not { } lockedOnUtc => null,
+            DurableActionStatus.Locked when action.LockedOnUtc is { } lockedOnUtc => lockedOnUtc <= lockExpiration ? now : lockedOnUtc.Add(lockTimeout),
+            _ => null
+        };
 
     private static string NormalizeLane(string lane)
         => string.IsNullOrWhiteSpace(lane) ? MuleSettings.DefaultLane : lane;

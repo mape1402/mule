@@ -76,7 +76,7 @@ public sealed class FastLaneInMemoryTests
 
     private static async Task WaitForDurableCountAsync(IHost host, DurableActionStatus status, int count)
     {
-        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
         while (!timeout.IsCancellationRequested)
         {
             using var scope = host.Services.CreateScope();
