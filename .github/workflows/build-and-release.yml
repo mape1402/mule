@@ -36,6 +36,9 @@ on:
 env:
   CHANGELOG_PATH: CHANGELOG.md
   CONFIGURATION: Release
+  COVERAGE_MINIMUM: '99.0'
+  COVERAGE_OUTPUT: ./artifacts/coverage
+  COVERAGE_REPORT: ./artifacts/coverage-report
   DOTNET_TARGET: .
   NUGET_OUTPUT: ./nupkgs
   NUGET_SOURCE: https://api.nuget.org/v3/index.json
@@ -49,9 +52,21 @@ env:
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
     permissions:
       contents: write
       id-token: write
+    env:
+      MULE_REDIS_CONNECTION_STRING: localhost:6379
 
     steps:
       - name: Checkout
@@ -75,6 +90,49 @@ jobs:
 
       - name: Test
         run: dotnet test "$DOTNET_TARGET" --no-build --configuration "$CONFIGURATION" --verbosity normal
+
+      - name: Collect coverage
+        run: >
+          dotnet test "$DOTNET_TARGET"
+          --no-build
+          --configuration "$CONFIGURATION"
+          --framework net8.0
+          --collect:"XPlat Code Coverage"
+          --results-directory "$COVERAGE_OUTPUT"
+
+      - name: Enforce coverage
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          dotnet tool install --global dotnet-reportgenerator-globaltool --version 5.5.11
+          reportgenerator \
+            "-reports:$COVERAGE_OUTPUT/**/coverage.cobertura.xml" \
+            "-targetdir:$COVERAGE_REPORT" \
+            "-reporttypes:TextSummary;Cobertura" \
+            "-verbosity:Warning"
+
+          LINE_COVERAGE="$(awk -F': ' '/^  Line coverage:/ { gsub(/%/, "", $2); print $2 }' "$COVERAGE_REPORT/Summary.txt")"
+          BRANCH_COVERAGE="$(awk -F': ' '/^  Branch coverage:/ { split($2, value, "%"); print value[1] }' "$COVERAGE_REPORT/Summary.txt")"
+
+          echo "Line coverage: $LINE_COVERAGE%"
+          echo "Branch coverage: $BRANCH_COVERAGE%"
+
+          awk -v actual="$LINE_COVERAGE" -v minimum="$COVERAGE_MINIMUM" 'BEGIN { exit actual >= minimum ? 0 : 1 }' || {
+            echo "Line coverage must be at least $COVERAGE_MINIMUM%."
+            exit 1
+          }
+          awk -v actual="$BRANCH_COVERAGE" -v minimum="$COVERAGE_MINIMUM" 'BEGIN { exit actual >= minimum ? 0 : 1 }' || {
+            echo "Branch coverage must be at least $COVERAGE_MINIMUM%."
+            exit 1
+          }
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: ${{ env.COVERAGE_REPORT }}
+          if-no-files-found: error
 
       - name: Resolve release marker
         id: release
