@@ -4,6 +4,24 @@ All notable changes to Mule packages will be documented in this file.
 
 ## [Unreleased]
 
+## [v2.0.0] - 2026-10-14
+
+### Added
+
+- Added `Ulid` as the durable action id type returned by `IMuleClient`, exposed by `MuleActionContext<TPayload>`, and stored by all Mule providers.
+- Added `DurableAction.ConcurrencyToken` as a ULID-backed EF Core concurrency token for replica-safe action locking.
+- Added chainable EF Core model customization through `UseEntityFrameworkCore<TDbContext>(ef => ef.ConfigureActions(...))`.
+- Added provider-agnostic EF Core storage paths that avoid raw SQL, provider checks, and SQL Server-only model defaults.
+- Added portable EF query fallbacks for providers that cannot translate every `DateTimeOffset` comparison.
+- Added focused tests for ULID parsing, JSON roundtrips, EF model customization, concurrency token updates, and portable cleanup batching.
+- Added README badges and a generated README hero image.
+
+### Changed
+
+- Changed durable action ids from `Guid` to `Ulid`.
+- Changed EF Core defaults to avoid SQL Server-specific table, index filter, and direct SQL assumptions.
+- Changed EF Core deduplication strictness to be host-configurable for provider-specific unique constraints.
+
 ## [v1.5.0] - 2026-09-24
 
 ### Added
