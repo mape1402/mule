@@ -24,7 +24,7 @@ internal sealed class AmbientTransactionMuleCommitNotifier : IMuleCommitNotifier
         _logger = logger ?? NullLogger<AmbientTransactionMuleCommitNotifier>.Instance;
     }
 
-    public async ValueTask NotifySavedAsync(Guid actionId, string lane, CancellationToken cancellationToken = default)
+    public async ValueTask NotifySavedAsync(Ulid actionId, string lane, CancellationToken cancellationToken = default)
     {
         if (!_settings.ImmediateDispatch)
         {
@@ -51,7 +51,7 @@ internal sealed class AmbientTransactionMuleCommitNotifier : IMuleCommitNotifier
         };
     }
 
-    private async Task EnqueueCommittedActionAsync(Guid actionId, string lane)
+    private async Task EnqueueCommittedActionAsync(Ulid actionId, string lane)
     {
         try
         {

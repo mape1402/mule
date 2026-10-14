@@ -2,7 +2,9 @@ namespace Mule.FastLane.Redis;
 
 internal sealed class RedisActionEnvelope
 {
-    public Guid Id { get; set; }
+    public Ulid Id { get; set; }
+
+    public Ulid ConcurrencyToken { get; set; }
 
     public string Key { get; set; }
 
@@ -52,6 +54,7 @@ internal sealed class RedisActionEnvelope
         => new()
         {
             Id = Id,
+            ConcurrencyToken = ConcurrencyToken,
             Key = ActionKey.From(Key),
             Lane = string.IsNullOrWhiteSpace(Lane) ? MuleSettings.DefaultLane : Lane,
             Payload = Payload,
@@ -74,6 +77,7 @@ internal sealed class RedisActionEnvelope
         => new()
         {
             Id = action.Id,
+            ConcurrencyToken = action.ConcurrencyToken,
             Key = action.Key.Value,
             Lane = string.IsNullOrWhiteSpace(action.Lane) ? MuleSettings.DefaultLane : action.Lane,
             Payload = action.Payload,

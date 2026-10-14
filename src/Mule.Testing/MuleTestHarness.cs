@@ -28,7 +28,7 @@ internal sealed class MuleTestHarness : IMuleTestHarness
             cancellationToken);
 
     public Task<DurableAction> WaitForActionAsync(
-        Guid id,
+        Ulid id,
         DurableActionStatus? status = null,
         TimeSpan? timeout = null,
         CancellationToken cancellationToken = default)

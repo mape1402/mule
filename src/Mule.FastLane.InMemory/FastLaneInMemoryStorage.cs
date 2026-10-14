@@ -37,7 +37,7 @@ internal sealed class FastLaneInMemoryStorage : IMuleStorage
         return Task.CompletedTask;
     }
 
-    public async Task<Guid?> FindByDeduplicationKeyAsync(
+    public async Task<Ulid?> FindByDeduplicationKeyAsync(
         ActionKey key,
         string deduplicationKey,
         CancellationToken cancellationToken = default)
@@ -90,7 +90,7 @@ internal sealed class FastLaneInMemoryStorage : IMuleStorage
     }
 
     public async Task<DurableAction> LockAsync(
-        Guid id,
+        Ulid id,
         TimeSpan lockTimeout,
         DateTimeOffset now,
         CancellationToken cancellationToken = default)
@@ -102,7 +102,7 @@ internal sealed class FastLaneInMemoryStorage : IMuleStorage
         return await _durableStorage.LockAsync(id, lockTimeout, now, cancellationToken);
     }
 
-    public async Task MarkCompletedAsync(Guid id, DateTimeOffset completedOnUtc, CancellationToken cancellationToken = default)
+    public async Task MarkCompletedAsync(Ulid id, DateTimeOffset completedOnUtc, CancellationToken cancellationToken = default)
     {
         if (_buffer.MarkCompleted(id, completedOnUtc))
             return;
@@ -111,7 +111,7 @@ internal sealed class FastLaneInMemoryStorage : IMuleStorage
     }
 
     public async Task MarkFailedAsync(
-        Guid id,
+        Ulid id,
         string error,
         DateTimeOffset now,
         DateTimeOffset? nextAttemptOnUtc,

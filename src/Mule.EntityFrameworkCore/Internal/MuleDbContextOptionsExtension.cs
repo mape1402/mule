@@ -8,6 +8,13 @@ internal sealed class MuleDbContextOptionsExtension : IDbContextOptionsExtension
 {
     private DbContextOptionsExtensionInfo _info;
 
+    public MuleDbContextOptionsExtension(Action<MuleEntityFrameworkOptions> configureModel = null)
+    {
+        ConfigureModel = configureModel;
+    }
+
+    public Action<MuleEntityFrameworkOptions> ConfigureModel { get; }
+
     public DbContextOptionsExtensionInfo Info => _info ??= new ExtensionInfo(this);
 
     public void ApplyServices(IServiceCollection services)
@@ -21,9 +28,12 @@ internal sealed class MuleDbContextOptionsExtension : IDbContextOptionsExtension
 
     private sealed class ExtensionInfo : DbContextOptionsExtensionInfo
     {
-        public ExtensionInfo(IDbContextOptionsExtension extension)
+        private readonly MuleDbContextOptionsExtension _extension;
+
+        public ExtensionInfo(MuleDbContextOptionsExtension extension)
             : base(extension)
         {
+            _extension = extension;
         }
 
         public override bool IsDatabaseProvider => false;
@@ -31,7 +41,9 @@ internal sealed class MuleDbContextOptionsExtension : IDbContextOptionsExtension
         public override string LogFragment => "using Mule ";
 
         public override int GetServiceProviderHashCode()
-            => typeof(MuleDbContextOptionsExtension).GetHashCode();
+            => HashCode.Combine(
+                typeof(MuleDbContextOptionsExtension),
+                _extension.ConfigureModel?.GetHashCode() ?? 0);
 
         public override void PopulateDebugInfo(IDictionary<string, string> debugInfo)
             => debugInfo["Mule"] = "1";

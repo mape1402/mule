@@ -40,7 +40,7 @@ internal sealed class InMemoryMuleStorage : IMuleDurableStorage
         return Task.CompletedTask;
     }
 
-    public Task<Guid?> FindByDeduplicationKeyAsync(
+    public Task<Ulid?> FindByDeduplicationKeyAsync(
         ActionKey key,
         string deduplicationKey,
         CancellationToken cancellationToken = default)
@@ -60,17 +60,17 @@ internal sealed class InMemoryMuleStorage : IMuleDurableStorage
         CancellationToken cancellationToken = default)
         => Task.FromResult(_store.GetNextPendingOnUtc(lockTimeout, now));
 
-    public Task<DurableAction> LockAsync(Guid id, TimeSpan lockTimeout, DateTimeOffset now, CancellationToken cancellationToken = default)
+    public Task<DurableAction> LockAsync(Ulid id, TimeSpan lockTimeout, DateTimeOffset now, CancellationToken cancellationToken = default)
         => Task.FromResult(_store.Lock(id, lockTimeout, now));
 
-    public Task MarkCompletedAsync(Guid id, DateTimeOffset completedOnUtc, CancellationToken cancellationToken = default)
+    public Task MarkCompletedAsync(Ulid id, DateTimeOffset completedOnUtc, CancellationToken cancellationToken = default)
     {
         _store.MarkCompleted(id, completedOnUtc);
         return Task.CompletedTask;
     }
 
     public Task MarkFailedAsync(
-        Guid id,
+        Ulid id,
         string error,
         DateTimeOffset now,
         DateTimeOffset? nextAttemptOnUtc,

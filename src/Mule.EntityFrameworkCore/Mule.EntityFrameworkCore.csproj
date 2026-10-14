@@ -6,12 +6,11 @@
     <Title>Mule Durable Actions Entity Framework Core Provider</Title>
     <PackageType>Dependency</PackageType>
     <Description>Entity Framework Core storage provider for Mule durable actions, enabling persistent action queues, retry state, locking, and recovery across application restarts.</Description>
-    <PackageTags>$(PackageTags);entity-framework-core;ef-core;persistence;sqlite;sql-server</PackageTags>
+    <PackageTags>$(PackageTags);entity-framework-core;ef-core;persistence;provider-agnostic</PackageTags>
   </PropertyGroup>
 
   <ItemGroup>
     <PackageReference Include="Microsoft.EntityFrameworkCore" Version="8.0.18" />
-    <PackageReference Include="Microsoft.EntityFrameworkCore.Relational" Version="8.0.18" />
     <ProjectReference Include="..\Mule\Mule.csproj" />
   </ItemGroup>
 

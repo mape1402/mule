@@ -32,7 +32,7 @@ internal sealed class InMemoryMuleStore
         }
     }
 
-    public Guid? FindByDeduplicationKey(ActionKey key, string deduplicationKey)
+    public Ulid? FindByDeduplicationKey(ActionKey key, string deduplicationKey)
     {
         if (string.IsNullOrWhiteSpace(deduplicationKey))
             return null;
@@ -41,7 +41,7 @@ internal sealed class InMemoryMuleStore
         {
             return _actions
                 .Where(x => x.Key == key && x.DeduplicationKey == deduplicationKey)
-                .Select(x => (Guid?)x.Id)
+                .Select(x => (Ulid?)x.Id)
                 .FirstOrDefault();
         }
     }
@@ -65,6 +65,7 @@ internal sealed class InMemoryMuleStore
                 action.Status = DurableActionStatus.Locked;
                 action.LockedOnUtc = now;
                 action.StartedOnUtc ??= now;
+                action.ConcurrencyToken = Ulid.NewUlid();
             }
 
             return actions
@@ -73,7 +74,7 @@ internal sealed class InMemoryMuleStore
         }
     }
 
-    public DurableAction Lock(Guid id, TimeSpan lockTimeout, DateTimeOffset now)
+    public DurableAction Lock(Ulid id, TimeSpan lockTimeout, DateTimeOffset now)
     {
         lock (_gate)
         {
@@ -93,6 +94,7 @@ internal sealed class InMemoryMuleStore
             action.Status = DurableActionStatus.Locked;
             action.LockedOnUtc = now;
             action.StartedOnUtc ??= now;
+            action.ConcurrencyToken = Ulid.NewUlid();
 
             return Clone(action);
         }
@@ -123,7 +125,7 @@ internal sealed class InMemoryMuleStore
         }
     }
 
-    public void MarkCompleted(Guid id, DateTimeOffset completedOnUtc)
+    public void MarkCompleted(Ulid id, DateTimeOffset completedOnUtc)
     {
         lock (_gate)
         {
@@ -134,10 +136,11 @@ internal sealed class InMemoryMuleStore
             action.LockedOnUtc = null;
             action.NextAttemptOnUtc = null;
             action.LastError = null;
+            action.ConcurrencyToken = Ulid.NewUlid();
         }
     }
 
-    public void MarkFailed(Guid id, string error, DateTimeOffset? nextAttemptOnUtc)
+    public void MarkFailed(Ulid id, string error, DateTimeOffset? nextAttemptOnUtc)
     {
         lock (_gate)
         {
@@ -148,6 +151,7 @@ internal sealed class InMemoryMuleStore
             action.LockedOnUtc = null;
             action.NextAttemptOnUtc = nextAttemptOnUtc;
             action.TerminalOnUtc = nextAttemptOnUtc == null ? DateTimeOffset.UtcNow : null;
+            action.ConcurrencyToken = Ulid.NewUlid();
         }
     }
 
@@ -256,6 +260,7 @@ internal sealed class InMemoryMuleStore
         => new()
         {
             Id = action.Id,
+            ConcurrencyToken = action.ConcurrencyToken,
             Key = action.Key,
             Lane = NormalizeLane(action.Lane),
             Payload = action.Payload,
@@ -292,7 +297,7 @@ internal sealed class InMemoryMuleStore
         return TimeSpan.FromTicks((long)values.Average(x => x.Ticks));
     }
 
-    private DurableAction Find(Guid id)
+    private DurableAction Find(Ulid id)
         => _actions.SingleOrDefault(x => x.Id == id)
             ?? throw new InvalidOperationException($"Mule action '{id}' was not found.");
 }

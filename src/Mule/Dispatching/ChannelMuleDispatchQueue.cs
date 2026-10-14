@@ -6,7 +6,7 @@ using Microsoft.Extensions.Options;
 internal sealed class ChannelMuleDispatchQueue : IMuleDispatchQueue
 {
     private readonly object _gate = new();
-    private readonly Dictionary<string, Channel<Guid>> _channels = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, Channel<Ulid>> _channels = new(StringComparer.OrdinalIgnoreCase);
     private readonly Channel<bool> _signals = Channel.CreateUnbounded<bool>(new UnboundedChannelOptions
     {
         SingleReader = false,
@@ -20,7 +20,7 @@ internal sealed class ChannelMuleDispatchQueue : IMuleDispatchQueue
         _settings = settings?.Value ?? throw new ArgumentNullException(nameof(settings));
     }
 
-    public async ValueTask EnqueueAsync(Guid actionId, string lane, CancellationToken cancellationToken = default)
+    public async ValueTask EnqueueAsync(Ulid actionId, string lane, CancellationToken cancellationToken = default)
     {
         var channel = GetChannel(lane);
         await channel.Writer.WriteAsync(actionId, cancellationToken);
@@ -83,7 +83,7 @@ internal sealed class ChannelMuleDispatchQueue : IMuleDispatchQueue
         throw new OperationCanceledException(cancellationToken);
     }
 
-    private Channel<Guid> GetChannel(string lane)
+    private Channel<Ulid> GetChannel(string lane)
     {
         lane = NormalizeLane(lane);
         lock (_gate)
@@ -97,18 +97,18 @@ internal sealed class ChannelMuleDispatchQueue : IMuleDispatchQueue
         }
     }
 
-    private Channel<Guid> CreateChannel(string lane)
+    private Channel<Ulid> CreateChannel(string lane)
     {
         var capacity = GetQueueCapacity(lane);
         if (capacity > 0)
-            return Channel.CreateBounded<Guid>(new BoundedChannelOptions(capacity)
+            return Channel.CreateBounded<Ulid>(new BoundedChannelOptions(capacity)
             {
                 FullMode = BoundedChannelFullMode.Wait,
                 SingleReader = false,
                 SingleWriter = false
             });
 
-        return Channel.CreateUnbounded<Guid>(new UnboundedChannelOptions
+        return Channel.CreateUnbounded<Ulid>(new UnboundedChannelOptions
         {
             SingleReader = false,
             SingleWriter = false

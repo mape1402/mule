@@ -19,6 +19,7 @@ envelope.terminalOnUtc = ARGV[2]
 envelope.lockedOnUtc = cjson.null
 envelope.nextAttemptOnUtc = cjson.null
 envelope.lastError = cjson.null
+envelope.concurrencyToken = ARGV[5]
 envelope.terminalDirty = true
 redis.call('SET', KEYS[1], cjson.encode(envelope))
 redis.call('ZADD', KEYS[2], ARGV[3], ARGV[4])
@@ -102,6 +103,7 @@ for _, id in ipairs(ids) do
                 if envelope.startedOnUtc == nil or envelope.startedOnUtc == cjson.null then
                     envelope.startedOnUtc = ARGV[7]
                 end
+                envelope.concurrencyToken = ARGV[8]
                 envelope.intentDirty = true
                 local updated = cjson.encode(envelope)
                 redis.call('SET', KEYS[3] .. id, updated)
@@ -132,6 +134,7 @@ envelope.attempts = (envelope.attempts or 0) + 1
 envelope.status = tonumber(ARGV[1])
 envelope.lastError = ARGV[2]
 envelope.lockedOnUtc = cjson.null
+envelope.concurrencyToken = ARGV[8]
 if retry then
     envelope.nextAttemptOnUtc = ARGV[6]
     envelope.terminalOnUtc = cjson.null
@@ -168,13 +171,13 @@ return 1
         return (await TryAddRangeAsync([action])).Count == 1;
     }
 
-    public async Task<IReadOnlyCollection<Guid>> TryAddRangeAsync(IReadOnlyCollection<DurableAction> actions)
+    public async Task<IReadOnlyCollection<Ulid>> TryAddRangeAsync(IReadOnlyCollection<DurableAction> actions)
     {
         if (actions == null)
             throw new ArgumentNullException(nameof(actions));
 
         if (actions.Count == 0)
-            return Array.Empty<Guid>();
+            return Array.Empty<Ulid>();
 
         var database = await _connection.GetDatabaseAsync();
         var dedupeTasks = new List<(DurableAction Action, Task<bool> Task)>();
@@ -194,7 +197,7 @@ return 1
                 action,
                 batch.StringSetAsync(
                     dedupeKey,
-                    action.Id.ToString("D"),
+                    action.Id.ToString(),
                     deduplicationRetention,
                     When.NotExists)));
         }
@@ -209,7 +212,7 @@ return 1
             .ToArray();
 
         if (accepted.Length == 0)
-            return Array.Empty<Guid>();
+            return Array.Empty<Ulid>();
 
         batch = database.CreateBatch();
         var writeTasks = new List<Task>(accepted.Length * 4);
@@ -218,8 +221,8 @@ return 1
             var envelope = RedisActionEnvelope.FromAction(action);
             writeTasks.Add(batch.StringSetAsync(GetActionKey(envelope.Id), JsonSerializer.Serialize(envelope, JsonOptions)));
             writeTasks.Add(batch.SetAddAsync(LanesKey, NormalizeLane(envelope.Lane)));
-            writeTasks.Add(batch.SortedSetAddAsync(IntentFlushKey, action.Id.ToString("D"), Score(action.CreatedOnUtc)));
-            writeTasks.Add(batch.SortedSetAddAsync(PendingKey(NormalizeLane(action.Lane)), action.Id.ToString("D"), Score(action.NextAttemptOnUtc ?? DateTimeOffset.UtcNow)));
+            writeTasks.Add(batch.SortedSetAddAsync(IntentFlushKey, action.Id.ToString(), Score(action.CreatedOnUtc)));
+            writeTasks.Add(batch.SortedSetAddAsync(PendingKey(NormalizeLane(action.Lane)), action.Id.ToString(), Score(action.NextAttemptOnUtc ?? DateTimeOffset.UtcNow)));
         }
 
         batch.Execute();
@@ -227,17 +230,17 @@ return 1
         return accepted.Select(x => x.Id).ToArray();
     }
 
-    public async Task<Guid?> FindByDeduplicationKeyAsync(ActionKey key, string deduplicationKey)
+    public async Task<Ulid?> FindByDeduplicationKeyAsync(ActionKey key, string deduplicationKey)
     {
         if (string.IsNullOrWhiteSpace(deduplicationKey))
             return null;
 
         var database = await _connection.GetDatabaseAsync();
         var value = await database.StringGetAsync(DeduplicationKey(key, deduplicationKey));
-        return Guid.TryParse((string)value, out var id) ? id : null;
+        return Ulid.TryParse((string)value, out var id) ? id : null;
     }
 
-    public async Task<DurableAction> LockAsync(Guid id, TimeSpan lockTimeout, DateTimeOffset now)
+    public async Task<DurableAction> LockAsync(Ulid id, TimeSpan lockTimeout, DateTimeOffset now)
     {
         var token = Guid.NewGuid().ToString("N");
         if (!await TryAcquireLeaseAsync(id, token))
@@ -253,11 +256,12 @@ return 1
         envelope.Status = DurableActionStatus.Locked;
         envelope.LockedOnUtc = now;
         envelope.StartedOnUtc ??= now;
+        envelope.ConcurrencyToken = Ulid.NewUlid();
         envelope.IntentDirty = true;
         await SaveEnvelopeAsync(envelope);
         var database = await _connection.GetDatabaseAsync();
-        await database.SortedSetRemoveAsync(PendingKey(NormalizeLane(envelope.Lane)), id.ToString("D"));
-        await database.SortedSetAddAsync(IntentFlushKey, id.ToString("D"), Score(now));
+        await database.SortedSetRemoveAsync(PendingKey(NormalizeLane(envelope.Lane)), id.ToString());
+        await database.SortedSetAddAsync(IntentFlushKey, id.ToString(), Score(now));
         return envelope.ToAction();
     }
 
@@ -285,7 +289,8 @@ return 1
                 Math.Max(1, (long)GetLeaseDuration().TotalMilliseconds),
                 (int)DurableActionStatus.Pending,
                 (int)DurableActionStatus.Locked,
-                FormatDate(now)
+                FormatDate(now),
+                Ulid.NewUlid().ToString()
             ]);
         var values = (RedisResult[])result;
 
@@ -320,7 +325,7 @@ return 1
         return next;
     }
 
-    public async Task<bool> MarkCompletedAsync(Guid id, DateTimeOffset completedOnUtc)
+    public async Task<bool> MarkCompletedAsync(Ulid id, DateTimeOffset completedOnUtc)
     {
         var database = await _connection.GetDatabaseAsync();
         var result = await database.ScriptEvaluateAsync(
@@ -334,12 +339,13 @@ return 1
                 (int)DurableActionStatus.Completed,
                 FormatDate(completedOnUtc),
                 Score(completedOnUtc),
-                id.ToString("D")
+                id.ToString(),
+                Ulid.NewUlid().ToString()
             ]);
         return (int)result == 1;
     }
 
-    public async Task<bool> MarkFailedAsync(Guid id, string error, DateTimeOffset now, DateTimeOffset? nextAttemptOnUtc)
+    public async Task<bool> MarkFailedAsync(Ulid id, string error, DateTimeOffset now, DateTimeOffset? nextAttemptOnUtc)
     {
         var envelope = await GetEnvelopeAsync(id);
         if (envelope == null)
@@ -360,10 +366,11 @@ return 1
                 (int)status,
                 error ?? string.Empty,
                 Score(now),
-                id.ToString("D"),
+                id.ToString(),
                 nextAttemptOnUtc == null ? "0" : "1",
                 FormatDate(nextAttemptOnUtc ?? now),
-                nextAttemptOnUtc == null ? 0 : Score(nextAttemptOnUtc.Value)
+                nextAttemptOnUtc == null ? 0 : Score(nextAttemptOnUtc.Value),
+                Ulid.NewUlid().ToString()
             ]);
         return (int)result == 1;
     }
@@ -384,7 +391,7 @@ return 1
             .ToArray();
     }
 
-    public async Task CompleteIntentFlushAsync(IReadOnlyCollection<Guid> ids)
+    public async Task CompleteIntentFlushAsync(IReadOnlyCollection<Ulid> ids)
     {
         if (ids.Count == 0)
             return;
@@ -412,7 +419,7 @@ return 1
             envelope.IntentDirty = false;
             envelope.IntentFlushing = false;
             AddSaveEnvelope(writeBatch, writeTasks, envelope);
-            writeTasks.Add(writeBatch.SortedSetRemoveAsync(IntentFlushKey, item.Id.ToString("D")));
+            writeTasks.Add(writeBatch.SortedSetRemoveAsync(IntentFlushKey, item.Id.ToString()));
             AddTryRemove(writeBatch, writeTasks, envelope);
         }
 
@@ -420,7 +427,7 @@ return 1
         await Task.WhenAll(writeTasks);
     }
 
-    public async Task CancelIntentFlushAsync(IReadOnlyCollection<Guid> ids)
+    public async Task CancelIntentFlushAsync(IReadOnlyCollection<Ulid> ids)
     {
         if (ids.Count == 0)
             return;
@@ -468,7 +475,7 @@ return 1
             .ToArray();
     }
 
-    public async Task CompleteTerminalFlushAsync(IReadOnlyCollection<Guid> ids)
+    public async Task CompleteTerminalFlushAsync(IReadOnlyCollection<Ulid> ids)
     {
         if (ids.Count == 0)
             return;
@@ -496,7 +503,7 @@ return 1
             envelope.TerminalFlushed = true;
             envelope.TerminalFlushing = false;
             AddSaveEnvelope(writeBatch, writeTasks, envelope);
-            writeTasks.Add(writeBatch.SortedSetRemoveAsync(TerminalFlushKey, item.Id.ToString("D")));
+            writeTasks.Add(writeBatch.SortedSetRemoveAsync(TerminalFlushKey, item.Id.ToString()));
             AddTryRemove(writeBatch, writeTasks, envelope);
         }
 
@@ -504,7 +511,7 @@ return 1
         await Task.WhenAll(writeTasks);
     }
 
-    public async Task CancelTerminalFlushAsync(IReadOnlyCollection<Guid> ids)
+    public async Task CancelTerminalFlushAsync(IReadOnlyCollection<Ulid> ids)
     {
         if (ids.Count == 0)
             return;
@@ -543,7 +550,7 @@ return 1
         await database.SetAddAsync(LanesKey, NormalizeLane(envelope.Lane));
     }
 
-    private async Task<RedisActionEnvelope> GetEnvelopeAsync(Guid id)
+    private async Task<RedisActionEnvelope> GetEnvelopeAsync(Ulid id)
     {
         var database = await _connection.GetDatabaseAsync();
         var value = await database.StringGetAsync(GetActionKey(id));
@@ -552,13 +559,13 @@ return 1
             : null;
     }
 
-    private async Task<bool> TryAcquireLeaseAsync(Guid id, string token)
+    private async Task<bool> TryAcquireLeaseAsync(Ulid id, string token)
     {
         var database = await _connection.GetDatabaseAsync();
         return await database.StringSetAsync(GetLeaseKey(id), token, GetLeaseDuration(), When.NotExists);
     }
 
-    private async Task ReleaseLeaseAsync(Guid id, string token = null)
+    private async Task ReleaseLeaseAsync(Ulid id, string token = null)
     {
         if (token == null)
         {
@@ -573,7 +580,7 @@ return 1
             await databaseWithLease.KeyDeleteAsync(GetLeaseKey(id));
     }
 
-    private async Task ReleaseLeasesAsync(IReadOnlyCollection<Guid> ids, string token)
+    private async Task ReleaseLeasesAsync(IReadOnlyCollection<Ulid> ids, string token)
     {
         foreach (var id in ids)
             await ReleaseLeaseAsync(id, token);
@@ -630,9 +637,9 @@ return 1
                action.Status == DurableActionStatus.Locked && action.LockedOnUtc <= lockExpiration;
     }
 
-    private string GetActionKey(Guid id) => $"{_connection.Prefix}:fastlane:action:{id:D}";
+    private string GetActionKey(Ulid id) => $"{_connection.Prefix}:fastlane:action:{id}";
 
-    private string GetLeaseKey(Guid id) => $"{_connection.Prefix}:fastlane:lease:{id:D}";
+    private string GetLeaseKey(Ulid id) => $"{_connection.Prefix}:fastlane:lease:{id}";
 
     private string DeduplicationKey(ActionKey key, string deduplicationKey)
         => $"{_connection.Prefix}:fastlane:dedupe:{key.Value}:{deduplicationKey}";

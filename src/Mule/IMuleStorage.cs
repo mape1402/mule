@@ -6,7 +6,7 @@ public interface IMuleStorage
 
     Task AddRangeAsync(IReadOnlyCollection<DurableAction> actions, CancellationToken cancellationToken = default);
 
-    Task<Guid?> FindByDeduplicationKeyAsync(
+    Task<Ulid?> FindByDeduplicationKeyAsync(
         ActionKey key,
         string deduplicationKey,
         CancellationToken cancellationToken = default);
@@ -24,15 +24,15 @@ public interface IMuleStorage
         CancellationToken cancellationToken = default);
 
     Task<DurableAction> LockAsync(
-        Guid id,
+        Ulid id,
         TimeSpan lockTimeout,
         DateTimeOffset now,
         CancellationToken cancellationToken = default);
 
-    Task MarkCompletedAsync(Guid id, DateTimeOffset completedOnUtc, CancellationToken cancellationToken = default);
+    Task MarkCompletedAsync(Ulid id, DateTimeOffset completedOnUtc, CancellationToken cancellationToken = default);
 
     Task MarkFailedAsync(
-        Guid id,
+        Ulid id,
         string error,
         DateTimeOffset now,
         DateTimeOffset? nextAttemptOnUtc,

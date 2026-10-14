@@ -56,7 +56,7 @@ public sealed class EntityFrameworkMuleTests
     public async Task LockAsync_Should_Allow_Only_One_Replica_To_Claim_Action()
     {
         using var host = CreateAppDbContextHost(out var databasePath);
-        var actionId = Guid.NewGuid();
+        var actionId = Ulid.NewUlid();
 
         using (var scope = host.Services.CreateScope())
         {

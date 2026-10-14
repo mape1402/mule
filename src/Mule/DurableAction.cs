@@ -2,7 +2,9 @@ namespace Mule;
 
 public sealed class DurableAction
 {
-    public Guid Id { get; set; } = Guid.NewGuid();
+    public Ulid Id { get; set; } = Ulid.NewUlid();
+
+    public Ulid ConcurrencyToken { get; set; } = Ulid.NewUlid();
 
     public ActionKey Key { get; set; }
 

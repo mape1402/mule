@@ -13,6 +13,9 @@ internal sealed class MuleModelCustomizer : ModelCustomizer
     public override void Customize(ModelBuilder modelBuilder, DbContext context)
     {
         base.Customize(modelBuilder, context);
-        modelBuilder.UseMuleModel();
+        var extension = context.GetService<IDbContextOptions>()
+            .FindExtension<MuleDbContextOptionsExtension>();
+
+        modelBuilder.UseMuleModel(extension?.ConfigureModel);
     }
 }

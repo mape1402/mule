@@ -58,7 +58,7 @@ public sealed class SqlServerMuleTests
             await db.SaveChangesAsync();
         }
 
-        var ids = new List<Guid>();
+        var ids = new List<Ulid>();
         for (var wave = 0; wave < 10 && ids.Count < 100; wave++)
         {
             var claims = await Task.WhenAll(Enumerable.Range(0, 10).Select(async _ =>
@@ -103,7 +103,7 @@ public sealed class SqlServerMuleTests
     }
 
     [SqlServerFact]
-    public async Task MarkCompletedAsync_Should_Update_Action_With_Direct_Sql()
+    public async Task MarkCompletedAsync_Should_Update_Action_With_Ef()
     {
         using var database = SqlServerTestDatabase.Create();
         using var host = CreateHost(database.ConnectionString);
@@ -128,7 +128,7 @@ public sealed class SqlServerMuleTests
     }
 
     [SqlServerFact]
-    public async Task MarkFailedAsync_Should_Update_Action_With_Direct_Sql()
+    public async Task MarkFailedAsync_Should_Update_Action_With_Ef()
     {
         using var database = SqlServerTestDatabase.Create();
         using var host = CreateHost(database.ConnectionString);
@@ -179,6 +179,7 @@ public sealed class SqlServerMuleTests
         {
             var storage = scope.ServiceProvider.GetRequiredService<IMuleStorage>();
             var deleted = await storage.CleanCompletedAsync(DateTimeOffset.UtcNow, 2);
+            await storage.SaveChangesAsync();
 
             Assert.Equal(2, deleted);
         }
@@ -194,7 +195,15 @@ public sealed class SqlServerMuleTests
             .ConfigureServices(services =>
             {
                 services.AddMule();
-                services.UseEntityFrameworkMule(options => options.UseSqlServer(connectionString));
+                services.UseEntityFrameworkMule(
+                    options => options.UseSqlServer(connectionString),
+                    ef => ef.ConfigureActions(entity =>
+                    {
+                        entity.ToTable("MuleActions");
+                        entity.HasIndex(x => new { x.Key, x.DeduplicationKey })
+                            .IsUnique()
+                            .HasFilter("[DeduplicationKey] IS NOT NULL");
+                    }));
             })
             .Build();
 
@@ -205,7 +214,7 @@ public sealed class SqlServerMuleTests
         await db.Database.EnsureCreatedAsync();
     }
 
-    private static async Task<Guid> InsertActionAsync(IHost host, DurableActionStatus status)
+    private static async Task<Ulid> InsertActionAsync(IHost host, DurableActionStatus status)
     {
         using var scope = host.Services.CreateScope();
         var db = scope.ServiceProvider.GetRequiredService<MuleDbContext>();
