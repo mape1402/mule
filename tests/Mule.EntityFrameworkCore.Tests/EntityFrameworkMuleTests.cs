@@ -24,6 +24,28 @@ public sealed class EntityFrameworkMuleTests
     }
 
     [Fact]
+    public async Task UseEntityFrameworkCore_Should_Apply_Mule_Model_Configuration()
+    {
+        using var host = CreateAppDbContextHost(
+            out var databasePath,
+            ef => ef.ConfigureActions(entity =>
+            {
+                entity.Property(x => x.PayloadType).HasMaxLength(128);
+                entity.Property(x => x.CorrelationId).HasMaxLength(64);
+            }));
+
+        using var scope = host.Services.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<TestDbContext>();
+        var entity = db.Model.FindEntityType(typeof(DurableAction));
+
+        Assert.Equal(128, entity.FindProperty(nameof(DurableAction.PayloadType)).GetMaxLength());
+        Assert.Equal(64, entity.FindProperty(nameof(DurableAction.CorrelationId)).GetMaxLength());
+        Assert.True(entity.FindProperty(nameof(DurableAction.ConcurrencyToken)).IsConcurrencyToken);
+
+        TryDelete(databasePath);
+    }
+
+    [Fact]
     public async Task UseEntityFrameworkCore_Should_Persist_Action_In_App_DbContext_Model()
     {
         using var host = CreateAppDbContextHost(out var databasePath);
@@ -89,6 +111,51 @@ public sealed class EntityFrameworkMuleTests
     }
 
     [Fact]
+    public async Task LockAsync_Should_Update_Concurrency_Token()
+    {
+        using var host = CreateAppDbContextHost(out var databasePath);
+        var actionId = Ulid.NewUlid();
+        var originalToken = Ulid.NewUlid();
+
+        using (var scope = host.Services.CreateScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<TestDbContext>();
+            await db.Database.EnsureCreatedAsync();
+            db.Set<DurableAction>().Add(new DurableAction
+            {
+                Id = actionId,
+                ConcurrencyToken = originalToken,
+                Key = Key,
+                Payload = "{}",
+                PayloadType = typeof(TestPayload).AssemblyQualifiedName,
+                Status = DurableActionStatus.Pending,
+                CreatedOnUtc = DateTimeOffset.UtcNow
+            });
+            await db.SaveChangesAsync();
+        }
+
+        using (var scope = host.Services.CreateScope())
+        {
+            var storage = scope.ServiceProvider.GetRequiredService<IMuleStorage>();
+            var action = await storage.LockAsync(actionId, TimeSpan.FromMinutes(5), DateTimeOffset.UtcNow);
+
+            Assert.NotNull(action);
+            Assert.NotEqual(originalToken, action.ConcurrencyToken);
+        }
+
+        using (var scope = host.Services.CreateScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<TestDbContext>();
+            var action = await db.Set<DurableAction>().AsNoTracking().SingleAsync();
+
+            Assert.Equal(DurableActionStatus.Locked, action.Status);
+            Assert.NotEqual(originalToken, action.ConcurrencyToken);
+        }
+
+        TryDelete(databasePath);
+    }
+
+    [Fact]
     public async Task EnqueueAsync_Should_Persist_Action()
     {
         using var host = CreateHost(out var databasePath);
@@ -132,6 +199,46 @@ public sealed class EntityFrameworkMuleTests
         Assert.Equal(10, ids.Distinct().Count());
         Assert.Equal(10, actions.Length);
         Assert.Equal("batch-0", actions[0].CorrelationId);
+
+        TryDelete(databasePath);
+    }
+
+    [Fact]
+    public async Task CleanCompletedAsync_Should_Delete_Completed_Actions_In_Configured_Batch()
+    {
+        using var host = CreateHost(out var databasePath);
+        await EnsureDatabaseAsync(host);
+
+        using (var scope = host.Services.CreateScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<MuleDbContext>();
+            db.Actions.AddRange(Enumerable.Range(0, 3).Select(index => new DurableAction
+            {
+                Key = Key,
+                Payload = "{}",
+                PayloadType = typeof(TestPayload).AssemblyQualifiedName,
+                Status = DurableActionStatus.Completed,
+                CompletedOnUtc = DateTimeOffset.UtcNow.AddMinutes(-10),
+                CreatedOnUtc = DateTimeOffset.UtcNow.AddTicks(index)
+            }));
+            await db.SaveChangesAsync();
+        }
+
+        using (var scope = host.Services.CreateScope())
+        {
+            var storage = scope.ServiceProvider.GetRequiredService<IMuleStorage>();
+            var deleted = await storage.CleanCompletedAsync(DateTimeOffset.UtcNow, 2);
+            await storage.SaveChangesAsync();
+
+            Assert.Equal(2, deleted);
+        }
+
+        using (var scope = host.Services.CreateScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<MuleDbContext>();
+
+            Assert.Equal(1, await db.Actions.CountAsync());
+        }
 
         TryDelete(databasePath);
     }
@@ -214,7 +321,9 @@ public sealed class EntityFrameworkMuleTests
             .Build();
     }
 
-    private static IHost CreateAppDbContextHost(out string databasePath)
+    private static IHost CreateAppDbContextHost(
+        out string databasePath,
+        Action<MuleEntityFrameworkOptions> configureMule = null)
     {
         databasePath = Path.Combine(Path.GetTempPath(), $"mule-app-{Guid.NewGuid():N}.db");
         var capturedPath = databasePath;
@@ -224,7 +333,7 @@ public sealed class EntityFrameworkMuleTests
             {
                 services.AddDbContext<TestDbContext>(options => options.UseSqlite($"Data Source={capturedPath}"));
                 services.AddMule(mule => mule
-                    .UseEntityFrameworkCore<TestDbContext>()
+                    .UseEntityFrameworkCore<TestDbContext>(configureMule)
                     .AddActionsFromAssemblyContaining<CaptureTestPayloadAction>());
             })
             .Build();
