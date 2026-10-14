@@ -17,7 +17,7 @@ var host = Host.CreateDefaultBuilder(args)
 
 await host.StartAsync();
 
-Guid actionId;
+Ulid actionId;
 
 using (var scope = host.Services.CreateScope())
 {

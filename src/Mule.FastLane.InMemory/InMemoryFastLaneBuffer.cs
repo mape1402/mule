@@ -4,7 +4,7 @@ using System.Collections.Concurrent;
 
 internal sealed class InMemoryFastLaneBuffer
 {
-    private readonly ConcurrentDictionary<Guid, BufferedAction> _actions = new();
+    private readonly ConcurrentDictionary<Ulid, BufferedAction> _actions = new();
     private readonly object _gate = new();
 
     public bool TryAdd(DurableAction action)
@@ -25,7 +25,7 @@ internal sealed class InMemoryFastLaneBuffer
         }
     }
 
-    public bool TryFindByDeduplicationKey(ActionKey key, string deduplicationKey, out Guid id)
+    public bool TryFindByDeduplicationKey(ActionKey key, string deduplicationKey, out Ulid id)
     {
         lock (_gate)
         {
@@ -34,12 +34,12 @@ internal sealed class InMemoryFastLaneBuffer
                 x.Action.DeduplicationKey == deduplicationKey &&
                 !x.TerminalFlushed);
 
-            id = match?.Action.Id ?? Guid.Empty;
+            id = match?.Action.Id ?? Ulid.Empty;
             return match != null;
         }
     }
 
-    public DurableAction Lock(Guid id, TimeSpan lockTimeout, DateTimeOffset now)
+    public DurableAction Lock(Ulid id, TimeSpan lockTimeout, DateTimeOffset now)
     {
         lock (_gate)
         {
@@ -52,6 +52,7 @@ internal sealed class InMemoryFastLaneBuffer
             buffered.Action.Status = DurableActionStatus.Locked;
             buffered.Action.LockedOnUtc = now;
             buffered.Action.StartedOnUtc ??= now;
+            buffered.Action.ConcurrencyToken = Ulid.NewUlid();
             buffered.IntentDirty = true;
             return CloneForExecution(buffered.Action);
         }
@@ -78,6 +79,7 @@ internal sealed class InMemoryFastLaneBuffer
                 buffered.Action.Status = DurableActionStatus.Locked;
                 buffered.Action.LockedOnUtc = now;
                 buffered.Action.StartedOnUtc ??= now;
+                buffered.Action.ConcurrencyToken = Ulid.NewUlid();
                 buffered.IntentDirty = true;
             }
 
@@ -112,7 +114,7 @@ internal sealed class InMemoryFastLaneBuffer
         }
     }
 
-    public bool MarkCompleted(Guid id, DateTimeOffset completedOnUtc)
+    public bool MarkCompleted(Ulid id, DateTimeOffset completedOnUtc)
     {
         lock (_gate)
         {
@@ -125,12 +127,13 @@ internal sealed class InMemoryFastLaneBuffer
             buffered.Action.LockedOnUtc = null;
             buffered.Action.NextAttemptOnUtc = null;
             buffered.Action.LastError = null;
+            buffered.Action.ConcurrencyToken = Ulid.NewUlid();
             buffered.TerminalDirty = true;
             return true;
         }
     }
 
-    public bool MarkFailed(Guid id, string error, DateTimeOffset now, DateTimeOffset? nextAttemptOnUtc)
+    public bool MarkFailed(Ulid id, string error, DateTimeOffset now, DateTimeOffset? nextAttemptOnUtc)
     {
         lock (_gate)
         {
@@ -143,6 +146,7 @@ internal sealed class InMemoryFastLaneBuffer
             buffered.Action.LockedOnUtc = null;
             buffered.Action.NextAttemptOnUtc = nextAttemptOnUtc;
             buffered.Action.TerminalOnUtc = nextAttemptOnUtc == null ? now : null;
+            buffered.Action.ConcurrencyToken = Ulid.NewUlid();
             buffered.IntentDirty = nextAttemptOnUtc != null;
             buffered.TerminalDirty = nextAttemptOnUtc == null;
             return true;
@@ -166,7 +170,7 @@ internal sealed class InMemoryFastLaneBuffer
         }
     }
 
-    public void CompleteIntentFlush(IReadOnlyCollection<Guid> ids)
+    public void CompleteIntentFlush(IReadOnlyCollection<Ulid> ids)
     {
         lock (_gate)
         {
@@ -183,7 +187,7 @@ internal sealed class InMemoryFastLaneBuffer
         }
     }
 
-    public void CancelIntentFlush(IReadOnlyCollection<Guid> ids)
+    public void CancelIntentFlush(IReadOnlyCollection<Ulid> ids)
     {
         lock (_gate)
         {
@@ -212,7 +216,7 @@ internal sealed class InMemoryFastLaneBuffer
         }
     }
 
-    public void CompleteTerminalFlush(IReadOnlyCollection<Guid> ids)
+    public void CompleteTerminalFlush(IReadOnlyCollection<Ulid> ids)
     {
         lock (_gate)
         {
@@ -229,7 +233,7 @@ internal sealed class InMemoryFastLaneBuffer
         }
     }
 
-    public void CancelTerminalFlush(IReadOnlyCollection<Guid> ids)
+    public void CancelTerminalFlush(IReadOnlyCollection<Ulid> ids)
     {
         lock (_gate)
         {
@@ -241,7 +245,7 @@ internal sealed class InMemoryFastLaneBuffer
         }
     }
 
-    public bool Contains(Guid id)
+    public bool Contains(Ulid id)
         => _actions.ContainsKey(id);
 
     private void TryRemove(BufferedAction buffered)
@@ -283,6 +287,7 @@ internal sealed class InMemoryFastLaneBuffer
         => new()
         {
             Id = action.Id,
+            ConcurrencyToken = action.ConcurrencyToken,
             Key = action.Key,
             Lane = NormalizeLane(action.Lane),
             Payload = action.Payload,

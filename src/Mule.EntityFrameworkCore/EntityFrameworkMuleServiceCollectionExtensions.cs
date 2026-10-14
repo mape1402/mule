@@ -11,13 +11,19 @@ public static class EntityFrameworkMuleServiceCollectionExtensions
 {
     public static IMuleRegistrationBuilder UseEntityFrameworkCore<TDbContext>(this IMuleRegistrationBuilder builder)
         where TDbContext : DbContext
+        => UseEntityFrameworkCore<TDbContext>(builder, null);
+
+    public static IMuleRegistrationBuilder UseEntityFrameworkCore<TDbContext>(
+        this IMuleRegistrationBuilder builder,
+        Action<MuleEntityFrameworkOptions> configure)
+        where TDbContext : DbContext
     {
         if (builder == null)
             throw new ArgumentNullException(nameof(builder));
 
         return builder.AddServices(services =>
         {
-            services.AddMuleDbContextOptions<TDbContext>();
+            services.AddMuleDbContextOptions<TDbContext>(configure);
             services.TryAddScoped<IMuleDbContextFactory<TDbContext>, MuleDbContextFactory<TDbContext>>();
             services.TryAddScoped<EntityFrameworkMuleStorage<TDbContext>>();
             services.TryAddScoped<IMuleDurableStorage>(provider => provider.GetRequiredService<EntityFrameworkMuleStorage<TDbContext>>());
@@ -29,6 +35,12 @@ public static class EntityFrameworkMuleServiceCollectionExtensions
     public static IServiceCollection UseEntityFrameworkMule(
         this IServiceCollection services,
         Action<DbContextOptionsBuilder> configure)
+        => UseEntityFrameworkMule(services, configure, null);
+
+    public static IServiceCollection UseEntityFrameworkMule(
+        this IServiceCollection services,
+        Action<DbContextOptionsBuilder> configure,
+        Action<MuleEntityFrameworkOptions> configureMule)
     {
         if (services == null)
             throw new ArgumentNullException(nameof(services));
@@ -37,7 +49,7 @@ public static class EntityFrameworkMuleServiceCollectionExtensions
             throw new ArgumentNullException(nameof(configure));
 
         services.AddDbContext<MuleDbContext>(configure);
-        services.AddMuleDbContextOptions<MuleDbContext>();
+        services.AddMuleDbContextOptions<MuleDbContext>(configureMule);
         services.TryAddScoped<IMuleDbContextFactory<MuleDbContext>, MuleDbContextFactory<MuleDbContext>>();
         services.TryAddScoped<EntityFrameworkMuleStorage>();
         services.TryAddScoped<IMuleDurableStorage>(provider => provider.GetRequiredService<EntityFrameworkMuleStorage>());
@@ -47,7 +59,9 @@ public static class EntityFrameworkMuleServiceCollectionExtensions
         return services;
     }
 
-    private static IServiceCollection AddMuleDbContextOptions<TDbContext>(this IServiceCollection services)
+    private static IServiceCollection AddMuleDbContextOptions<TDbContext>(
+        this IServiceCollection services,
+        Action<MuleEntityFrameworkOptions> configure)
         where TDbContext : DbContext
     {
         var serviceType = typeof(DbContextOptions<TDbContext>);
@@ -61,7 +75,7 @@ public static class EntityFrameworkMuleServiceCollectionExtensions
         {
             var options = ResolveOptions<TDbContext>(descriptor, provider);
             return new DbContextOptionsBuilder<TDbContext>(options)
-                .UseMuleModel()
+                .UseMuleModel(configure)
                 .Options;
         }, descriptor.Lifetime));
 

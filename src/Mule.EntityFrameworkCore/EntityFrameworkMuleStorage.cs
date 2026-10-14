@@ -1,9 +1,6 @@
 namespace Mule.EntityFrameworkCore;
 
 using Microsoft.EntityFrameworkCore;
-using Microsoft.EntityFrameworkCore.Infrastructure;
-using Microsoft.EntityFrameworkCore.Metadata;
-using Microsoft.EntityFrameworkCore.Storage;
 using Mule.Diagnostics;
 
 internal class EntityFrameworkMuleStorage<TDbContext> : IMuleDurableStorage, IMuleBatchTerminalStorage, IDisposable, IAsyncDisposable
@@ -52,7 +49,7 @@ internal class EntityFrameworkMuleStorage<TDbContext> : IMuleDurableStorage, IMu
             .Where(x => ids.Contains(x.Id))
             .Select(x => x.Id)
             .ToListAsync(cancellationToken);
-        var newActionIds = new HashSet<Guid>();
+        var newActionIds = new HashSet<Ulid>();
         var newActions = actions
             .Where(x => !existingIds.Contains(x.Id) && newActionIds.Add(x.Id))
             .ToArray();
@@ -106,7 +103,7 @@ internal class EntityFrameworkMuleStorage<TDbContext> : IMuleDurableStorage, IMu
         await Actions.AddRangeAsync(newActions, cancellationToken);
     }
 
-    public async Task<Guid?> FindByDeduplicationKeyAsync(
+    public async Task<Ulid?> FindByDeduplicationKeyAsync(
         ActionKey key,
         string deduplicationKey,
         CancellationToken cancellationToken = default)
@@ -117,7 +114,7 @@ internal class EntityFrameworkMuleStorage<TDbContext> : IMuleDurableStorage, IMu
         return await Actions
             .AsNoTracking()
             .Where(x => x.Key == key && x.DeduplicationKey == deduplicationKey)
-            .Select(x => (Guid?)x.Id)
+            .Select(x => (Ulid?)x.Id)
             .FirstOrDefaultAsync(cancellationToken);
     }
 
@@ -128,15 +125,32 @@ internal class EntityFrameworkMuleStorage<TDbContext> : IMuleDurableStorage, IMu
         DateTimeOffset now,
         CancellationToken cancellationToken = default)
     {
+        var normalizedLane = NormalizeLane(lane);
         var lockExpiration = now.Subtract(lockTimeout);
+        var candidateIds = await Actions
+            .AsNoTracking()
+            .Where(x =>
+                x.Lane == normalizedLane &&
+                (x.Status == DurableActionStatus.Pending && (x.NextAttemptOnUtc == null || x.NextAttemptOnUtc <= now) ||
+                 x.Status == DurableActionStatus.Locked && x.LockedOnUtc != null && x.LockedOnUtc <= lockExpiration))
+            .OrderBy(x => x.NextAttemptOnUtc ?? x.CreatedOnUtc)
+            .ThenBy(x => x.CreatedOnUtc)
+            .Select(x => x.Id)
+            .Take(Math.Max(1, batchSize))
+            .ToArrayAsync(cancellationToken);
 
-        if (IsSqlServer())
-            return await ClaimSqlServerAsync(lane, batchSize, lockExpiration, now, cancellationToken);
+        if (candidateIds.Length == 0)
+            return Array.Empty<DurableAction>();
 
-        if (_dbContext.Database.IsRelational())
-            return await ClaimRelationalAsync(lane, batchSize, lockExpiration, now, cancellationToken);
+        var claimed = new List<DurableAction>(candidateIds.Length);
+        foreach (var id in candidateIds)
+        {
+            var action = await LockAsync(id, lockTimeout, now, cancellationToken);
+            if (action != null)
+                claimed.Add(action);
+        }
 
-        return await ClaimTrackedAsync(lane, batchSize, lockExpiration, now, cancellationToken);
+        return claimed;
     }
 
     public async Task<DateTimeOffset?> GetNextPendingOnUtcAsync(
@@ -174,100 +188,44 @@ internal class EntityFrameworkMuleStorage<TDbContext> : IMuleDurableStorage, IMu
             .FirstOrDefault();
     }
 
-    private async Task<IReadOnlyCollection<DurableAction>> ClaimTrackedAsync(
-        string lane,
-        int batchSize,
-        DateTimeOffset lockExpiration,
+    public async Task<DurableAction> LockAsync(
+        Ulid id,
+        TimeSpan lockTimeout,
         DateTimeOffset now,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken = default)
     {
-        var normalizedLane = NormalizeLane(lane);
-        var candidates = await Actions
-            .Where(x =>
-                x.Lane == normalizedLane &&
-                (x.Status == DurableActionStatus.Pending || x.Status == DurableActionStatus.Locked))
-            .ToListAsync(cancellationToken);
+        var lockExpiration = now.Subtract(lockTimeout);
+        var action = await Actions.FindAsync(new object[] { id }, cancellationToken);
 
-        candidates = candidates
-            .Where(x =>
-                x.Status == DurableActionStatus.Pending && (x.NextAttemptOnUtc == null || x.NextAttemptOnUtc <= now) ||
-                x.Status == DurableActionStatus.Locked && x.LockedOnUtc <= lockExpiration)
-            .OrderBy(x => x.NextAttemptOnUtc ?? x.CreatedOnUtc)
-            .ThenBy(x => x.CreatedOnUtc)
-            .Take(batchSize)
-            .ToList();
+        if (action == null)
+            return null;
 
-        foreach (var action in candidates)
+        var canLock =
+            action.Status == DurableActionStatus.Pending && (action.NextAttemptOnUtc == null || action.NextAttemptOnUtc <= now) ||
+            action.Status == DurableActionStatus.Locked && action.LockedOnUtc <= lockExpiration;
+
+        if (!canLock)
+            return null;
+
+        action.Status = DurableActionStatus.Locked;
+        action.LockedOnUtc = now;
+        action.StartedOnUtc ??= now;
+        action.ConcurrencyToken = Ulid.NewUlid();
+
+        try
         {
-            action.Status = DurableActionStatus.Locked;
-            action.LockedOnUtc = now;
-            action.StartedOnUtc ??= now;
+            await _dbContext.SaveChangesAsync(cancellationToken);
+            return action;
         }
-
-        await _dbContext.SaveChangesAsync(cancellationToken);
-        return candidates.ToArray();
+        catch (DbUpdateConcurrencyException)
+        {
+            DetachChangedEntries();
+            return null;
+        }
     }
 
-    private async Task<IReadOnlyCollection<DurableAction>> ClaimRelationalAsync(
-        string lane,
-        int batchSize,
-        DateTimeOffset lockExpiration,
-        DateTimeOffset now,
-        CancellationToken cancellationToken)
+    public async Task MarkCompletedAsync(Ulid id, DateTimeOffset completedOnUtc, CancellationToken cancellationToken = default)
     {
-        var normalizedLane = NormalizeLane(lane);
-        var candidates = await Actions
-            .AsNoTracking()
-            .Where(x =>
-                x.Lane == normalizedLane &&
-                (x.Status == DurableActionStatus.Pending || x.Status == DurableActionStatus.Locked))
-            .Select(x => new
-            {
-                x.Id,
-                x.Status,
-                x.CreatedOnUtc,
-                x.LockedOnUtc,
-                x.NextAttemptOnUtc
-            })
-            .ToListAsync(cancellationToken);
-
-        var candidateIds = candidates
-            .Where(x =>
-                x.Status == DurableActionStatus.Pending && (x.NextAttemptOnUtc == null || x.NextAttemptOnUtc <= now) ||
-                x.Status == DurableActionStatus.Locked && x.LockedOnUtc <= lockExpiration)
-            .OrderBy(x => x.NextAttemptOnUtc ?? x.CreatedOnUtc)
-            .ThenBy(x => x.CreatedOnUtc)
-            .Select(x => x.Id)
-            .Take(batchSize)
-            .ToArray();
-
-        if (candidateIds.Length == 0)
-            return Array.Empty<DurableAction>();
-
-        var claimed = new List<DurableAction>(candidateIds.Length);
-        foreach (var id in candidateIds)
-        {
-            var locked = await LockRelationalAsync(id, lockExpiration, now, cancellationToken);
-            if (locked == 0)
-                continue;
-
-            var action = await Actions
-                .AsNoTracking()
-                .SingleAsync(x => x.Id == id, cancellationToken);
-            claimed.Add(action);
-        }
-
-        return claimed;
-    }
-
-    public async Task MarkCompletedAsync(Guid id, DateTimeOffset completedOnUtc, CancellationToken cancellationToken = default)
-    {
-        if (IsSqlServer())
-        {
-            await MarkCompletedSqlServerAsync(id, completedOnUtc, cancellationToken);
-            return;
-        }
-
         var action = await FindAsync(id, cancellationToken);
         action.Status = DurableActionStatus.Completed;
         action.CompletedOnUtc = completedOnUtc;
@@ -275,6 +233,7 @@ internal class EntityFrameworkMuleStorage<TDbContext> : IMuleDurableStorage, IMu
         action.LockedOnUtc = null;
         action.NextAttemptOnUtc = null;
         action.LastError = null;
+        action.ConcurrencyToken = Ulid.NewUlid();
     }
 
     public async Task MarkCompletedRangeAsync(
@@ -287,29 +246,17 @@ internal class EntityFrameworkMuleStorage<TDbContext> : IMuleDurableStorage, IMu
         if (actions.Count == 0)
             return;
 
-        if (IsSqlServer())
-        {
-            await MarkCompletedRangeSqlServerAsync(actions, cancellationToken);
-            return;
-        }
-
         foreach (var completed in actions)
             await MarkCompletedAsync(completed.Id, completed.CompletedOnUtc, cancellationToken);
     }
 
     public async Task MarkFailedAsync(
-        Guid id,
+        Ulid id,
         string error,
         DateTimeOffset now,
         DateTimeOffset? nextAttemptOnUtc,
         CancellationToken cancellationToken = default)
     {
-        if (IsSqlServer())
-        {
-            await MarkFailedSqlServerAsync(id, error, now, nextAttemptOnUtc, cancellationToken);
-            return;
-        }
-
         var action = await FindAsync(id, cancellationToken);
         action.Attempts++;
         action.Status = nextAttemptOnUtc == null ? DurableActionStatus.Failed : DurableActionStatus.Pending;
@@ -317,23 +264,26 @@ internal class EntityFrameworkMuleStorage<TDbContext> : IMuleDurableStorage, IMu
         action.LockedOnUtc = null;
         action.NextAttemptOnUtc = nextAttemptOnUtc;
         action.TerminalOnUtc = nextAttemptOnUtc == null ? now : null;
+        action.ConcurrencyToken = Ulid.NewUlid();
     }
 
     public async Task<int> CleanCompletedAsync(DateTimeOffset olderThanUtc, int batchSize, CancellationToken cancellationToken = default)
     {
-        if (IsSqlServer())
-            return await CleanCompletedSqlServerAsync(olderThanUtc, batchSize, cancellationToken);
-
-        var candidates = await Actions
-            .Where(x => x.Status == DurableActionStatus.Completed && x.CompletedOnUtc != null)
-            .ToListAsync(cancellationToken);
-
-        var actions = candidates
-            .Where(x => x.CompletedOnUtc <= olderThanUtc)
+        var ids = await Actions
+            .AsNoTracking()
+            .Where(x => x.Status == DurableActionStatus.Completed && x.CompletedOnUtc != null && x.CompletedOnUtc <= olderThanUtc)
             .OrderBy(x => x.CompletedOnUtc)
-            .Take(batchSize)
-            .ToArray();
+            .ThenBy(x => x.CreatedOnUtc)
+            .Select(x => x.Id)
+            .Take(Math.Max(1, batchSize))
+            .ToArrayAsync(cancellationToken);
 
+        if (ids.Length == 0)
+            return 0;
+
+        var actions = await Actions
+            .Where(x => ids.Contains(x.Id))
+            .ToArrayAsync(cancellationToken);
         Actions.RemoveRange(actions);
         return actions.Length;
     }
@@ -363,273 +313,7 @@ internal class EntityFrameworkMuleStorage<TDbContext> : IMuleDurableStorage, IMu
 
     protected DbSet<DurableAction> Actions => _dbContext.Set<DurableAction>();
 
-    private async Task<IReadOnlyCollection<DurableAction>> ClaimSqlServerAsync(
-        string lane,
-        int batchSize,
-        DateTimeOffset lockExpiration,
-        DateTimeOffset now,
-        CancellationToken cancellationToken)
-    {
-        var names = GetActionStoreNames();
-        var sql = $$"""
-WITH MuleClaim AS (
-    SELECT TOP ({0}) *
-    FROM {{names.Table}} WITH (UPDLOCK, READPAST, ROWLOCK)
-    WHERE {{names.Lane}} = {3}
-      AND (
-          ({{names.Status}} = {4} AND ({{names.NextAttemptOnUtc}} IS NULL OR {{names.NextAttemptOnUtc}} <= {5}))
-          OR ({{names.Status}} = {6} AND {{names.LockedOnUtc}} <= {7})
-      )
-    ORDER BY COALESCE({{names.NextAttemptOnUtc}}, {{names.CreatedOnUtc}}), {{names.CreatedOnUtc}}
-)
-UPDATE MuleClaim
-SET {{names.Status}} = {1},
-    {{names.LockedOnUtc}} = {2},
-    {{names.StartedOnUtc}} = COALESCE({{names.StartedOnUtc}}, {2})
-OUTPUT INSERTED.*
-""";
-
-        return await Actions
-            .FromSqlRaw(
-                sql,
-                batchSize,
-                (int)DurableActionStatus.Locked,
-                now,
-                NormalizeLane(lane),
-                (int)DurableActionStatus.Pending,
-                now,
-                (int)DurableActionStatus.Locked,
-                lockExpiration)
-            .AsNoTracking()
-            .ToListAsync(cancellationToken);
-    }
-
-    public async Task<DurableAction> LockAsync(
-        Guid id,
-        TimeSpan lockTimeout,
-        DateTimeOffset now,
-        CancellationToken cancellationToken = default)
-    {
-        var lockExpiration = now.Subtract(lockTimeout);
-        var locked = _dbContext.Database.IsRelational()
-            ? await LockRelationalAsync(id, lockExpiration, now, cancellationToken)
-            : await LockTrackedAsync(id, lockExpiration, now, cancellationToken);
-
-        if (locked == 0)
-            return null;
-
-        return await Actions.FindAsync(new object[] { id }, cancellationToken);
-    }
-
-    private async Task<int> LockRelationalAsync(
-        Guid id,
-        DateTimeOffset lockExpiration,
-        DateTimeOffset now,
-        CancellationToken cancellationToken)
-    {
-        var names = GetActionStoreNames();
-        var sql = $$"""
-UPDATE {{names.Table}}
-SET {{names.Status}} = {0},
-    {{names.LockedOnUtc}} = {1},
-    {{names.StartedOnUtc}} = COALESCE({{names.StartedOnUtc}}, {1})
-WHERE {{names.Id}} = {2}
-  AND (
-      ({{names.Status}} = {3} AND ({{names.NextAttemptOnUtc}} IS NULL OR {{names.NextAttemptOnUtc}} <= {4}))
-      OR ({{names.Status}} = {5} AND {{names.LockedOnUtc}} <= {6})
-  )
-""";
-
-        return await _dbContext.Database.ExecuteSqlRawAsync(
-            sql,
-            [
-                (int)DurableActionStatus.Locked,
-                now,
-                id,
-                (int)DurableActionStatus.Pending,
-                now,
-                (int)DurableActionStatus.Locked,
-                lockExpiration
-            ],
-            cancellationToken);
-    }
-
-    private async Task<int> LockTrackedAsync(
-        Guid id,
-        DateTimeOffset lockExpiration,
-        DateTimeOffset now,
-        CancellationToken cancellationToken)
-    {
-        var action = await Actions.FindAsync(new object[] { id }, cancellationToken);
-
-        if (action == null)
-            return 0;
-
-        var canLock =
-            action.Status == DurableActionStatus.Pending && (action.NextAttemptOnUtc == null || action.NextAttemptOnUtc <= now) ||
-            action.Status == DurableActionStatus.Locked && action.LockedOnUtc <= lockExpiration;
-
-        if (!canLock)
-            return 0;
-
-        action.Status = DurableActionStatus.Locked;
-        action.LockedOnUtc = now;
-        action.StartedOnUtc ??= now;
-        await _dbContext.SaveChangesAsync(cancellationToken);
-        return 1;
-    }
-
-    private async Task MarkCompletedSqlServerAsync(
-        Guid id,
-        DateTimeOffset completedOnUtc,
-        CancellationToken cancellationToken)
-    {
-        var names = GetActionStoreNames();
-        var sql = $$"""
-UPDATE {{names.Table}}
-SET {{names.Status}} = {0},
-    {{names.CompletedOnUtc}} = {1},
-    {{names.TerminalOnUtc}} = {1},
-    {{names.LockedOnUtc}} = NULL,
-    {{names.NextAttemptOnUtc}} = NULL,
-    {{names.LastError}} = NULL
-WHERE {{names.Id}} = {2}
-""";
-
-        await _dbContext.Database.ExecuteSqlRawAsync(
-            sql,
-            [
-                (int)DurableActionStatus.Completed,
-                completedOnUtc,
-                id
-            ],
-            cancellationToken);
-    }
-
-    private async Task MarkCompletedRangeSqlServerAsync(
-        IReadOnlyCollection<MuleCompletedAction> actions,
-        CancellationToken cancellationToken)
-    {
-        var names = GetActionStoreNames();
-        var values = new List<string>(actions.Count);
-        var parameters = new object[actions.Count * 2 + 1];
-        var index = 0;
-        parameters[index++] = (int)DurableActionStatus.Completed;
-
-        foreach (var action in actions)
-        {
-            values.Add($"({{{index}}}, {{{index + 1}}})");
-            parameters[index++] = action.Id;
-            parameters[index++] = action.CompletedOnUtc;
-        }
-
-        var sql = $$"""
-UPDATE target
-SET target.{{names.Status}} = {0},
-    target.{{names.CompletedOnUtc}} = source.CompletedOnUtc,
-    target.{{names.TerminalOnUtc}} = source.CompletedOnUtc,
-    target.{{names.LockedOnUtc}} = NULL,
-    target.{{names.NextAttemptOnUtc}} = NULL,
-    target.{{names.LastError}} = NULL
-FROM {{names.Table}} AS target
-INNER JOIN (VALUES {{string.Join(", ", values)}}) AS source(Id, CompletedOnUtc)
-    ON target.{{names.Id}} = source.Id
-""";
-
-        await _dbContext.Database.ExecuteSqlRawAsync(sql, parameters, cancellationToken);
-    }
-
-    private async Task MarkFailedSqlServerAsync(
-        Guid id,
-        string error,
-        DateTimeOffset now,
-        DateTimeOffset? nextAttemptOnUtc,
-        CancellationToken cancellationToken)
-    {
-        var names = GetActionStoreNames();
-        var sql = $$"""
-UPDATE {{names.Table}}
-SET {{names.Attempts}} = {{names.Attempts}} + 1,
-    {{names.Status}} = {0},
-    {{names.LastError}} = {1},
-    {{names.LockedOnUtc}} = NULL,
-    {{names.NextAttemptOnUtc}} = {2},
-    {{names.TerminalOnUtc}} = {3}
-WHERE {{names.Id}} = {4}
-""";
-
-        await _dbContext.Database.ExecuteSqlRawAsync(
-            sql,
-            [
-                (int)(nextAttemptOnUtc == null ? DurableActionStatus.Failed : DurableActionStatus.Pending),
-                error,
-                nextAttemptOnUtc,
-                nextAttemptOnUtc == null ? now : null,
-                id
-            ],
-            cancellationToken);
-    }
-
-    private async Task<int> CleanCompletedSqlServerAsync(
-        DateTimeOffset olderThanUtc,
-        int batchSize,
-        CancellationToken cancellationToken)
-    {
-        var names = GetActionStoreNames();
-        var sql = $$"""
-WITH MuleCleanup AS (
-    SELECT TOP ({0}) *
-    FROM {{names.Table}} WITH (READPAST, ROWLOCK)
-    WHERE {{names.Status}} = {1}
-      AND {{names.CompletedOnUtc}} <= {2}
-    ORDER BY {{names.CompletedOnUtc}}, {{names.CreatedOnUtc}}
-)
-DELETE FROM MuleCleanup
-""";
-
-        return await _dbContext.Database.ExecuteSqlRawAsync(
-            sql,
-            [
-                Math.Max(1, batchSize),
-                (int)DurableActionStatus.Completed,
-                olderThanUtc
-            ],
-            cancellationToken);
-    }
-
-    private ActionStoreNames GetActionStoreNames()
-    {
-        var entity = _dbContext.Model.FindEntityType(typeof(DurableAction))
-            ?? throw new InvalidOperationException("Mule action entity is not part of the DbContext model.");
-        var tableName = entity.GetTableName()
-            ?? throw new InvalidOperationException("Mule action entity is not mapped to a table.");
-        var schema = entity.GetSchema();
-        var table = StoreObjectIdentifier.Table(tableName, schema);
-        var helper = _dbContext.GetService<ISqlGenerationHelper>();
-
-        string Column(string propertyName)
-        {
-            var property = entity.FindProperty(propertyName)
-                ?? throw new InvalidOperationException($"Mule action property '{propertyName}' is not part of the DbContext model.");
-            return helper.DelimitIdentifier(property.GetColumnName(table), schema: null);
-        }
-
-        return new ActionStoreNames(
-            helper.DelimitIdentifier(tableName, schema),
-            Column(nameof(DurableAction.Id)),
-            Column(nameof(DurableAction.Lane)),
-            Column(nameof(DurableAction.Status)),
-            Column(nameof(DurableAction.LockedOnUtc)),
-            Column(nameof(DurableAction.StartedOnUtc)),
-            Column(nameof(DurableAction.CreatedOnUtc)),
-            Column(nameof(DurableAction.NextAttemptOnUtc)),
-            Column(nameof(DurableAction.CompletedOnUtc)),
-            Column(nameof(DurableAction.TerminalOnUtc)),
-            Column(nameof(DurableAction.LastError)),
-            Column(nameof(DurableAction.Attempts)));
-    }
-
-    private async Task<DurableAction> FindAsync(Guid id, CancellationToken cancellationToken)
+    private async Task<DurableAction> FindAsync(Ulid id, CancellationToken cancellationToken)
         => await Actions.FindAsync(new object[] { id }, cancellationToken)
             ?? throw new InvalidOperationException($"Mule action '{id}' was not found.");
 
@@ -639,29 +323,18 @@ DELETE FROM MuleCleanup
     public ValueTask DisposeAsync()
         => _dbContext.DisposeAsync();
 
+    private void DetachChangedEntries()
+    {
+        foreach (var entry in _dbContext.ChangeTracker.Entries<DurableAction>().Where(x => x.State != EntityState.Unchanged))
+            entry.State = EntityState.Detached;
+    }
+
     private static string NormalizeLane(string lane)
         => string.IsNullOrWhiteSpace(lane) ? MuleSettings.DefaultLane : lane;
 
     private static bool IsUniqueConstraintViolation(DbUpdateException exception)
         => exception.InnerException?.Message.Contains("unique", StringComparison.OrdinalIgnoreCase) == true ||
            exception.InnerException?.Message.Contains("duplicate", StringComparison.OrdinalIgnoreCase) == true;
-
-    private bool IsSqlServer()
-        => _dbContext.Database.ProviderName?.Contains("SqlServer", StringComparison.OrdinalIgnoreCase) == true;
-
-    private sealed record ActionStoreNames(
-        string Table,
-        string Id,
-        string Lane,
-        string Status,
-        string LockedOnUtc,
-        string StartedOnUtc,
-        string CreatedOnUtc,
-        string NextAttemptOnUtc,
-        string CompletedOnUtc,
-        string TerminalOnUtc,
-        string LastError,
-        string Attempts);
 }
 
 internal sealed class EntityFrameworkMuleStorage : EntityFrameworkMuleStorage<MuleDbContext>

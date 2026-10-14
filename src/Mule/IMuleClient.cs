@@ -2,18 +2,18 @@ namespace Mule;
 
 public interface IMuleClient
 {
-    ValueTask<Guid> EnqueueAsync<TPayload>(
+    ValueTask<Ulid> EnqueueAsync<TPayload>(
         ActionKey key,
         TPayload payload,
         CancellationToken cancellationToken = default);
 
-    ValueTask<Guid> EnqueueAsync<TPayload>(
+    ValueTask<Ulid> EnqueueAsync<TPayload>(
         ActionKey key,
         TPayload payload,
         Action<EnqueueOptions> configure,
         CancellationToken cancellationToken = default);
 
-    ValueTask<IReadOnlyCollection<Guid>> EnqueueManyAsync(
+    ValueTask<IReadOnlyCollection<Ulid>> EnqueueManyAsync(
         IEnumerable<MuleIntent> intents,
         CancellationToken cancellationToken = default);
 }

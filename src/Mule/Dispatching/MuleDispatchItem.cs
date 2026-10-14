@@ -1,3 +1,3 @@
 namespace Mule.Dispatching;
 
-public sealed record MuleDispatchItem(Guid ActionId, string Lane);
+public sealed record MuleDispatchItem(Ulid ActionId, string Lane);

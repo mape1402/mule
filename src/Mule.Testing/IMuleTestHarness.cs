@@ -11,7 +11,7 @@ public interface IMuleTestHarness
         CancellationToken cancellationToken = default);
 
     Task<DurableAction> WaitForActionAsync(
-        Guid id,
+        Ulid id,
         DurableActionStatus? status = null,
         TimeSpan? timeout = null,
         CancellationToken cancellationToken = default);

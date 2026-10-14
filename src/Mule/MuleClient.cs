@@ -16,13 +16,13 @@ internal sealed class MuleClient : IMuleClient
         _commitNotifier = commitNotifier ?? throw new ArgumentNullException(nameof(commitNotifier));
     }
 
-    public ValueTask<Guid> EnqueueAsync<TPayload>(
+    public ValueTask<Ulid> EnqueueAsync<TPayload>(
         ActionKey key,
         TPayload payload,
         CancellationToken cancellationToken = default)
         => EnqueueAsync(key, payload, null, cancellationToken);
 
-    public async ValueTask<Guid> EnqueueAsync<TPayload>(
+    public async ValueTask<Ulid> EnqueueAsync<TPayload>(
         ActionKey key,
         TPayload payload,
         Action<EnqueueOptions> configure,
@@ -35,7 +35,7 @@ internal sealed class MuleClient : IMuleClient
         return ids.Single();
     }
 
-    public async ValueTask<IReadOnlyCollection<Guid>> EnqueueManyAsync(
+    public async ValueTask<IReadOnlyCollection<Ulid>> EnqueueManyAsync(
         IEnumerable<MuleIntent> intents,
         CancellationToken cancellationToken = default)
     {
@@ -47,12 +47,12 @@ internal sealed class MuleClient : IMuleClient
             .ToArray();
 
         if (actions.Length == 0)
-            return Array.Empty<Guid>();
+            return Array.Empty<Ulid>();
 
         await _storage.AddRangeAsync(actions, cancellationToken);
         await _storage.SaveChangesAsync(cancellationToken);
 
-        var actionIds = new List<Guid>(actions.Length);
+        var actionIds = new List<Ulid>(actions.Length);
         foreach (var action in actions)
         {
             var actionId = action.Id;
@@ -83,7 +83,6 @@ internal sealed class MuleClient : IMuleClient
 
         return new DurableAction
         {
-            Id = Guid.NewGuid(),
             Key = intent.Key,
             Lane = string.IsNullOrWhiteSpace(options.Lane) ? MuleSettings.DefaultLane : options.Lane,
             Payload = _serializer.Serialize(intent.Payload),
