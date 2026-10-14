@@ -10,6 +10,9 @@ internal static class MuleDbContextOptionsBuilderExtensions
         this DbContextOptionsBuilder optionsBuilder,
         Action<MuleEntityFrameworkOptions> configureModel = null)
     {
+        if (optionsBuilder == null)
+            throw new ArgumentNullException(nameof(optionsBuilder));
+
         var extension = new MuleDbContextOptionsExtension(configureModel);
 
         ((IDbContextOptionsBuilderInfrastructure)optionsBuilder).AddOrUpdateExtension(extension);

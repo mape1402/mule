@@ -166,18 +166,7 @@ internal class EntityFrameworkMuleStorage<TDbContext> : IMuleDurableStorage, IMu
             .ToListAsync(cancellationToken);
 
         return actions
-            .Select(x =>
-            {
-                if (x.Status == DurableActionStatus.Pending)
-                    return x.NextAttemptOnUtc == null || x.NextAttemptOnUtc <= now
-                        ? now
-                        : x.NextAttemptOnUtc;
-
-                if (x.LockedOnUtc <= lockExpiration)
-                    return now;
-
-                return x.LockedOnUtc?.Add(lockTimeout);
-            })
+            .Select(x => GetNextPendingOnUtc(x.Status, x.LockedOnUtc, x.NextAttemptOnUtc, lockExpiration, lockTimeout, now))
             .Where(x => x != null)
             .OrderBy(x => x)
             .FirstOrDefault();
@@ -195,11 +184,7 @@ internal class EntityFrameworkMuleStorage<TDbContext> : IMuleDurableStorage, IMu
         if (action == null)
             return null;
 
-        var canLock =
-            action.Status == DurableActionStatus.Pending && (action.NextAttemptOnUtc == null || action.NextAttemptOnUtc <= now) ||
-            action.Status == DurableActionStatus.Locked && action.LockedOnUtc <= lockExpiration;
-
-        if (!canLock)
+        if (!CanLock(action.Status, action.LockedOnUtc, action.NextAttemptOnUtc, lockExpiration, now))
             return null;
 
         action.Status = DurableActionStatus.Locked;
@@ -290,7 +275,7 @@ internal class EntityFrameworkMuleStorage<TDbContext> : IMuleDurableStorage, IMu
                 .Select(x => x.CompletedOnUtc)
                 .FirstOrDefaultAsync(cancellationToken);
         }
-        catch (InvalidOperationException)
+        catch (Exception ex) when (ShouldFallbackToClientFiltering(ex))
         {
             var completed = await Actions
                 .AsNoTracking()
@@ -343,7 +328,7 @@ internal class EntityFrameworkMuleStorage<TDbContext> : IMuleDurableStorage, IMu
                 .Take(batchSize)
                 .ToArrayAsync(cancellationToken);
         }
-        catch (InvalidOperationException)
+        catch (Exception ex) when (ShouldFallbackToClientFiltering(ex))
         {
             var candidates = await Actions
                 .AsNoTracking()
@@ -361,9 +346,7 @@ internal class EntityFrameworkMuleStorage<TDbContext> : IMuleDurableStorage, IMu
                 .ToListAsync(cancellationToken);
 
             return candidates
-                .Where(x =>
-                    x.Status == DurableActionStatus.Pending && (x.NextAttemptOnUtc == null || x.NextAttemptOnUtc <= now) ||
-                    x.Status == DurableActionStatus.Locked && x.LockedOnUtc != null && x.LockedOnUtc <= lockExpiration)
+                .Where(x => CanLock(x.Status, x.LockedOnUtc, x.NextAttemptOnUtc, lockExpiration, now))
                 .OrderBy(x => x.NextAttemptOnUtc ?? x.CreatedOnUtc)
                 .ThenBy(x => x.CreatedOnUtc)
                 .Select(x => x.Id)
@@ -388,7 +371,7 @@ internal class EntityFrameworkMuleStorage<TDbContext> : IMuleDurableStorage, IMu
                 .Take(batchSize)
                 .ToArrayAsync(cancellationToken);
         }
-        catch (InvalidOperationException)
+        catch (Exception ex) when (ShouldFallbackToClientFiltering(ex))
         {
             var candidates = await Actions
                 .AsNoTracking()
@@ -433,6 +416,38 @@ internal class EntityFrameworkMuleStorage<TDbContext> : IMuleDurableStorage, IMu
     private static bool IsUniqueConstraintViolation(DbUpdateException exception)
         => exception.InnerException?.Message.Contains("unique", StringComparison.OrdinalIgnoreCase) == true ||
            exception.InnerException?.Message.Contains("duplicate", StringComparison.OrdinalIgnoreCase) == true;
+
+    private static bool ShouldFallbackToClientFiltering(Exception exception)
+        => exception is InvalidOperationException or NotSupportedException;
+
+    private static bool CanLock(
+        DurableActionStatus status,
+        DateTimeOffset? lockedOnUtc,
+        DateTimeOffset? nextAttemptOnUtc,
+        DateTimeOffset lockExpiration,
+        DateTimeOffset now)
+        => status switch
+        {
+            DurableActionStatus.Pending => nextAttemptOnUtc is not { } nextAttempt || nextAttempt <= now,
+            DurableActionStatus.Locked => lockedOnUtc is { } lockedOn && lockedOn <= lockExpiration,
+            _ => false
+        };
+
+    private static DateTimeOffset? GetNextPendingOnUtc(
+        DurableActionStatus status,
+        DateTimeOffset? lockedOnUtc,
+        DateTimeOffset? nextAttemptOnUtc,
+        DateTimeOffset lockExpiration,
+        TimeSpan lockTimeout,
+        DateTimeOffset now)
+        => status switch
+        {
+            DurableActionStatus.Pending when nextAttemptOnUtc is not { } nextAttempt => now,
+            DurableActionStatus.Pending when nextAttemptOnUtc is { } nextAttempt => nextAttempt <= now ? now : nextAttempt,
+            DurableActionStatus.Locked when lockedOnUtc is not { } lockedOn => null,
+            DurableActionStatus.Locked when lockedOnUtc is { } lockedOn => lockedOn <= lockExpiration ? now : lockedOn.Add(lockTimeout),
+            _ => null
+        };
 }
 
 internal sealed class EntityFrameworkMuleStorage : EntityFrameworkMuleStorage<MuleDbContext>

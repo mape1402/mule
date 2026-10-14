@@ -2,6 +2,7 @@ namespace Mule.Testing.Tests;
 
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
+using Mule.InMemory;
 
 public sealed class MuleTestingTests
 {
@@ -41,6 +42,32 @@ public sealed class MuleTestingTests
                 TimeSpan.FromMilliseconds(50)));
     }
 
+    [Fact]
+    public async Task Harness_Should_Wait_By_Key_And_Respect_Cancellation()
+    {
+        var action = new DurableAction
+        {
+            Key = Key,
+            Status = DurableActionStatus.Pending,
+            CreatedOnUtc = DateTimeOffset.UtcNow
+        };
+        var harness = new MuleTestHarness(new FixedInMemoryMule([action]));
+
+        Assert.Throws<ArgumentNullException>(() => MuleTestingRegistrationBuilderExtensions.UseTesting(null));
+        Assert.Throws<ArgumentNullException>(() => new MuleTestHarness(null));
+        Assert.Same(action, await harness.WaitForActionAsync(Key));
+
+        using var cancellation = new CancellationTokenSource();
+        await cancellation.CancelAsync();
+
+        await Assert.ThrowsAsync<TimeoutException>(() =>
+            harness.WaitForActionAsync(
+                Ulid.NewUlid(),
+                null,
+                TimeSpan.FromSeconds(1),
+                cancellation.Token));
+    }
+
     private static IHost CreateHost()
         => Host.CreateDefaultBuilder()
             .ConfigureServices(services =>
@@ -74,5 +101,15 @@ public sealed class MuleTestingTests
     private sealed class TestProbe
     {
         public List<string> Values { get; } = new();
+    }
+
+    private sealed class FixedInMemoryMule : IInMemoryMule
+    {
+        public FixedInMemoryMule(IReadOnlyCollection<DurableAction> actions)
+        {
+            Actions = actions;
+        }
+
+        public IReadOnlyCollection<DurableAction> Actions { get; }
     }
 }

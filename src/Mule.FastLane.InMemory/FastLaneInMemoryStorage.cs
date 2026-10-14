@@ -86,7 +86,7 @@ internal sealed class FastLaneInMemoryStorage : IMuleStorage
         if (durable == null)
             return buffered;
 
-        return buffered <= durable ? buffered : durable;
+        return buffered.Value <= durable.Value ? buffered.Value : durable.Value;
     }
 
     public async Task<DurableAction> LockAsync(
