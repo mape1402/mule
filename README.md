@@ -3,7 +3,7 @@
 [![Build](https://github.com/mape1402/mule/actions/workflows/build-and-release.yml/badge.svg)](https://github.com/mape1402/mule/actions/workflows/build-and-release.yml)
 [![NuGet](https://img.shields.io/nuget/v/Mule.DurableActions.svg)](https://www.nuget.org/packages/Mule.DurableActions)
 [![Downloads](https://img.shields.io/nuget/dt/Mule.DurableActions.svg)](https://www.nuget.org/packages/Mule.DurableActions)
-![Coverage](https://img.shields.io/badge/coverage-48.66%25-orange)
+![Coverage](https://img.shields.io/badge/coverage-99.1%25-brightgreen)
 ![License](https://img.shields.io/github/license/mape1402/mule.svg)
 
 ![Mule durable action workflow](assets/readme-hero.png)
