@@ -1,5 +1,13 @@
 # Mule
 
+[![Build](https://github.com/mape1402/mule/actions/workflows/build-and-release.yml/badge.svg)](https://github.com/mape1402/mule/actions/workflows/build-and-release.yml)
+[![NuGet](https://img.shields.io/nuget/v/Mule.DurableActions.svg)](https://www.nuget.org/packages/Mule.DurableActions)
+[![Downloads](https://img.shields.io/nuget/dt/Mule.DurableActions.svg)](https://www.nuget.org/packages/Mule.DurableActions)
+![Coverage](https://img.shields.io/badge/coverage-48.66%25-orange)
+![License](https://img.shields.io/github/license/mape1402/mule.svg)
+
+![Mule durable action workflow](assets/readme-hero.png)
+
 Mule is a .NET library for durable, resilient action execution.
 
 Your application records an intent in the foreground. Mule stores that intent, then a background dispatcher executes the matching action with locking, retries, recovery, cleanup, and diagnostics.
@@ -45,6 +53,7 @@ using StackExchange.Redis;
 - **Client**: `IMuleClient`, used by foreground code to enqueue work.
 - **Storage provider**: InMemory or EF Core.
 - **Dispatcher**: a hosted background service that locks and executes pending actions.
+- **Durable id**: every action id is a `Ulid`, so ids are typed, compact, sortable, and storage-friendly.
 
 Mule stores the action key as a string, but public APIs use `ActionKey` to avoid loose string usage.
 
@@ -100,6 +109,8 @@ await mule.EnqueueAsync(
 ```
 
 Mule persists the intent, queues it for background execution, and retries it if the action fails.
+
+`EnqueueAsync` returns the durable `Ulid` assigned to the action. The same id is exposed in `MuleActionContext<TPayload>.Id`, diagnostics, storage rows, and test harness helpers.
 
 ### Batch Enqueue
 
@@ -255,7 +266,9 @@ Common examples:
 
 The deduplication key should be stable and domain-owned. Avoid timestamps, random values, or generated ids when the goal is to prevent duplicate work.
 
-Storage providers enforce deduplication at write time. When a duplicate is detected, Mule treats the enqueue as an idempotent success and keeps the existing durable action.
+Storage providers check deduplication at write time. When a duplicate is detected, Mule treats the enqueue as an idempotent success and keeps the existing durable action.
+
+For EF Core under multiple replicas, add a provider-specific unique constraint or index for the pair `ActionKey + DeduplicationKey` when strict duplicate prevention is required. Mule keeps the default model provider-agnostic, so it does not add SQL Server-only filtered indexes by default.
 
 When the duplicate already exists, `EnqueueAsync` returns the existing action id instead of the transient id from the ignored enqueue attempt. This lets callers safely correlate follow-up work with the durable row that Mule will execute.
 
@@ -305,7 +318,7 @@ var action = Assert.Single(store.Actions);
 
 ### Entity Framework Core
 
-Use EF Core for durable storage:
+Use EF Core for durable storage. Mule is provider-agnostic: it uses EF APIs, optimistic concurrency, and model conventions instead of SQL Server-specific commands.
 
 ```csharp
 services.AddDbContext<AppDbContext>(options =>
@@ -333,7 +346,48 @@ await db.Database.EnsureCreatedAsync();
 
 `UseEntityFrameworkMule(...)` and `MuleDbContext` remain available for standalone storage, but `UseEntityFrameworkCore<TDbContext>()` is the recommended integration for applications that already have a DbContext.
 
-For existing SQL Server installations upgrading to the lane and latency model, use [docs/sql-server-upgrade-1.2.0.sql](/C:/elysium/mule/docs/sql-server-upgrade-1.2.0.sql) as the reference migration. It adds lane and runtime timestamp columns, creates the filtered deduplication constraint, and adds the lane/status/due-date index used by the dispatcher.
+Mule's default EF model is intentionally portable. It configures `DurableAction.Id` and `DurableAction.ConcurrencyToken` as `Ulid` values stored as 26-character strings, marks the concurrency token for optimistic concurrency, and applies conservative lengths to common string fields.
+
+Customize the Mule entity from the Mule registration chain when your provider or host needs different storage details:
+
+```csharp
+services.AddMule(mule => mule
+    .UseEntityFrameworkCore<AppDbContext>(ef => ef
+        .ConfigureActions(entity =>
+        {
+            entity.Property(x => x.PayloadType).HasMaxLength(256);
+            entity.Property(x => x.Payload).HasColumnType("jsonb");
+            entity.Property(x => x.CorrelationId).HasMaxLength(64);
+        }))
+    .AddActionsFromAssemblyContaining<SendReceiptAction>());
+```
+
+For standalone storage:
+
+```csharp
+services.UseEntityFrameworkMule(
+    options => options.UseSqlite("Data Source=mule.db"),
+    ef => ef.ConfigureActions(entity =>
+    {
+        entity.Property(x => x.DeduplicationKey).HasMaxLength(128);
+    }));
+```
+
+Provider-specific constraints belong in the host configuration. For example, SQL Server apps that need strict multi-replica deduplication can add a filtered unique index:
+
+```csharp
+services.AddMule(mule => mule
+    .UseEntityFrameworkCore<AppDbContext>(ef => ef
+        .ConfigureActions(entity =>
+        {
+            entity.ToTable("MuleActions");
+            entity.HasIndex(x => new { x.Key, x.DeduplicationKey })
+                .IsUnique()
+                .HasFilter("[DeduplicationKey] IS NOT NULL");
+        })));
+```
+
+The EF provider does not require you to add `DbSet<DurableAction>` or edit `OnModelCreating` manually. Mule attaches its model through the DbContext options pipeline.
 
 ### FastLane InMemory
 
@@ -425,16 +479,16 @@ For high-throughput workloads, tune `IntentFlushSize` and `CompletionFlushSize` 
 
 ### Local Stress Results
 
-The following local stress run compares direct SQL Server persistence with FastLane Redis in front of SQL Server. These numbers are environment-specific and should be treated as a relative signal, not a benchmark guarantee.
+The following local stress run compares EF Core SQL Server durable storage with FastLane Redis in front of SQL Server. These numbers are environment-specific and should be treated as a relative signal, not a benchmark guarantee.
 
 Test shape: .NET 10, local SQL Server test database, local Redis container, `WorkerCount = 4`, `MaxDegreeOfParallelism = 128`, enqueue batch size `500`, cleanup disabled.
 
 | Scenario | Actions | Total Time | Throughput | Enqueue Time | Duplicates |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| SQL Server direct | 1,000 | 3.72s | 268/s | 1.39s | 0 |
+| EF Core SQL Server | 1,000 | 3.72s | 268/s | 1.39s | 0 |
 | FastLane Redis + SQL | 1,000 | 1.75s | 569/s | 0.35s | 0 |
 | FastLane Redis + SQL | 10,000 | 5.25s | 1,903/s | 1.92s | 0 |
-| SQL Server direct | 10,000 | 16.90s | 591/s | 10.63s | 0 |
+| EF Core SQL Server | 10,000 | 16.90s | 591/s | 10.63s | 0 |
 | FastLane Redis + SQL | 20,000 | 10.22s | 1,956/s | 5.63s | 0 |
 | FastLane Redis + SQL | 50,000 | 22.14s | 2,257/s | 14.22s | 0 |
 | FastLane Redis + SQL, handler 1ms | 50,000 | 23.46s | 2,130/s | 13.77s | 0 |
@@ -588,13 +642,13 @@ Use `Polling` when another process may insert work without notifying the current
 - `Polling`: cleanup runs every `CleanupInterval`.
 - `Scheduled`: cleanup wakes when completed actions reach `CompletedRetention`.
 
-Cleanup is batch-oriented. `CleanupBatchSize` controls how many completed actions can be removed per storage operation. SQL Server uses direct ordered batch delete statements for completed actions instead of loading entities one by one.
+Cleanup is batch-oriented. `CleanupBatchSize` controls how many completed actions can be removed per storage operation.
 
 Mule uses atomic storage claims and locks so multiple service replicas can run workers at the same time without intentionally executing the same locked action concurrently. Actions should still be idempotent because Mule provides at-least-once execution.
 
 For large workloads, tune `WorkerCount` and `MaxDegreeOfParallelism` independently. Increase `WorkerCount` when storage admission is slow. Increase `MaxDegreeOfParallelism` when handlers are the bottleneck. Use `ExecutionQueueCapacity` to bound claimed work waiting behind slow handlers.
 
-SQL Server claims use update locks with `READPAST`, so a replica may skip rows that another replica is locking at that exact moment. That is expected: later waves or later polling cycles can claim the remaining rows without duplicating work.
+EF Core storage uses optimistic concurrency through `DurableAction.ConcurrencyToken`. When multiple replicas try to lock the same action, one update wins and the others back off without executing that action.
 
 ## Diagnostics
 
