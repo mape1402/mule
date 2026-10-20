@@ -3,7 +3,7 @@ namespace Mule.InMemory;
 using System.Transactions;
 using Mule.Diagnostics;
 
-internal sealed class InMemoryMuleStorage : IMuleDurableStorage
+internal sealed class InMemoryMuleStorage : IMuleDurableStorage, IMuleReplayStorage
 {
     private readonly InMemoryMuleStore _store;
     private readonly MuleRuntimeMetrics _metrics;
@@ -85,6 +85,46 @@ internal sealed class InMemoryMuleStorage : IMuleDurableStorage
 
     public Task<DateTimeOffset?> GetOldestCompletedOnUtcAsync(CancellationToken cancellationToken = default)
         => Task.FromResult(_store.GetOldestCompletedOnUtc());
+
+    public Task<MuleReplayResult> ScheduleAsync(
+        Ulid sourceActionId,
+        MuleReplayRequest request,
+        DateTimeOffset now,
+        CancellationToken cancellationToken = default)
+        => Task.FromResult(_store.ScheduleReplay(sourceActionId, request, now));
+
+    public Task<MuleReplayInfo> FindAsync(Ulid requestId, CancellationToken cancellationToken = default)
+        => Task.FromResult(_store.FindReplay(requestId));
+
+    public Task<IReadOnlyCollection<MuleReplayClaim>> ClaimScheduledAsync(
+        int batchSize,
+        TimeSpan lockTimeout,
+        DateTimeOffset now,
+        CancellationToken cancellationToken = default)
+        => Task.FromResult(_store.ClaimScheduledReplays(batchSize, lockTimeout, now));
+
+    public Task<DateTimeOffset?> GetNextScheduledOnUtcAsync(
+        TimeSpan lockTimeout,
+        DateTimeOffset now,
+        CancellationToken cancellationToken = default)
+        => Task.FromResult(_store.GetNextScheduledReplayOnUtc(lockTimeout, now));
+
+    public Task<MuleReplayMaterializationOutcome> MaterializeAsync(
+        MuleReplayClaim claim,
+        DurableAction action,
+        DateTimeOffset now,
+        CancellationToken cancellationToken = default)
+        => Task.FromResult(_store.MaterializeReplay(claim, action, now));
+
+    public Task ReleaseAsync(
+        MuleReplayClaim claim,
+        string error,
+        DateTimeOffset nextAttemptOnUtc,
+        CancellationToken cancellationToken = default)
+    {
+        _store.ReleaseReplay(claim, error, nextAttemptOnUtc);
+        return Task.CompletedTask;
+    }
 
     public Task SaveChangesAsync(CancellationToken cancellationToken = default)
     {

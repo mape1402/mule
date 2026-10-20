@@ -79,10 +79,14 @@ internal sealed class MuleReplayService : IMuleReplayService
         {
             case MuleReplayOutcome.Scheduled:
                 _logger.LogInformation(
-                    "Mule replay {MuleReplayRequestId} scheduled action {MuleReplayActionId} from {MuleActionId}.",
+                    "Mule replay {MuleReplayRequestId} scheduled action {MuleReplayActionId} from {MuleActionId} with key {MuleActionKey}, lane {MuleLane}, correlation {MuleCorrelationId}, requested by {MuleReplayRequestedBy}.",
                     request.RequestId,
                     replayActionId,
-                    actionId);
+                    actionId,
+                    result.Replay.ActionKey,
+                    result.Replay.Lane,
+                    result.Replay.CorrelationId,
+                    result.Replay.RequestedBy);
                 break;
             case MuleReplayOutcome.AlreadyScheduled:
                 _logger.LogInformation(

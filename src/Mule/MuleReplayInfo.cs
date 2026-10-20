@@ -14,6 +14,14 @@ public sealed class MuleReplayInfo
 
     public required MuleReplayStatus Status { get; init; }
 
+    public required ActionKey ActionKey { get; init; }
+
+    public string Lane { get; init; }
+
+    public string CorrelationId { get; init; }
+
+    public string OriginalDeduplicationKey { get; init; }
+
     public required DateTimeOffset RequestedOnUtc { get; init; }
 
     public required DateTimeOffset ScheduleOnUtc { get; init; }

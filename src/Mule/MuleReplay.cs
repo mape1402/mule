@@ -16,6 +16,14 @@ public sealed class MuleReplay
 
     public Ulid BranchId { get; set; }
 
+    public ActionKey ActionKey { get; set; }
+
+    public string Lane { get; set; }
+
+    public string CorrelationId { get; set; }
+
+    public string OriginalDeduplicationKey { get; set; }
+
     public MuleReplayStatus Status { get; set; } = MuleReplayStatus.Scheduled;
 
     public string RequestedBy { get; set; }
