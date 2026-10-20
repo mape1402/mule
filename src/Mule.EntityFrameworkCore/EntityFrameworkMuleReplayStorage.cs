@@ -97,17 +97,11 @@ internal partial class EntityFrameworkMuleStorage<TDbContext>
         CancellationToken cancellationToken = default)
     {
         var lockExpiration = now.Subtract(lockTimeout);
-        var candidateIds = await Replays
-            .AsNoTracking()
-            .Where(x => x.Status == MuleReplayStatus.Scheduled
-                && x.ScheduleOnUtc <= now
-                && (x.NextAttemptOnUtc == null || x.NextAttemptOnUtc <= now)
-                && (x.LockedOnUtc == null || x.LockedOnUtc <= lockExpiration))
-            .OrderBy(x => x.ScheduleOnUtc)
-            .ThenBy(x => x.RequestedOnUtc)
-            .Select(x => x.RequestId)
-            .Take(Math.Max(1, batchSize))
-            .ToArrayAsync(cancellationToken);
+        var candidateIds = await GetReplayClaimCandidateIdsAsync(
+            Math.Max(1, batchSize),
+            lockExpiration,
+            now,
+            cancellationToken);
         var claims = new List<MuleReplayClaim>(candidateIds.Length);
 
         foreach (var requestId in candidateIds)
@@ -208,7 +202,7 @@ internal partial class EntityFrameworkMuleStorage<TDbContext>
             var persisted = await Replays
                 .AsNoTracking()
                 .SingleOrDefaultAsync(x => x.RequestId == claim.Replay.RequestId, cancellationToken);
-            if (persisted?.Status == MuleReplayStatus.Materialized)
+            if (persisted != null && persisted.Status == MuleReplayStatus.Materialized)
                 return MuleReplayMaterializationOutcome.Reconciled;
 
             throw;
@@ -248,6 +242,53 @@ internal partial class EntityFrameworkMuleStorage<TDbContext>
     }
 
     private DbSet<MuleReplay> Replays => _dbContext.Set<MuleReplay>();
+
+    private async Task<Ulid[]> GetReplayClaimCandidateIdsAsync(
+        int batchSize,
+        DateTimeOffset lockExpiration,
+        DateTimeOffset now,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            return await Replays
+                .AsNoTracking()
+                .Where(x => x.Status == MuleReplayStatus.Scheduled
+                    && x.ScheduleOnUtc <= now
+                    && (!x.NextAttemptOnUtc.HasValue || x.NextAttemptOnUtc.Value <= now)
+                    && (!x.LockedOnUtc.HasValue || x.LockedOnUtc.Value <= lockExpiration))
+                .OrderBy(x => x.ScheduleOnUtc)
+                .ThenBy(x => x.RequestedOnUtc)
+                .Select(x => x.RequestId)
+                .Take(batchSize)
+                .ToArrayAsync(cancellationToken);
+        }
+        catch (Exception ex) when (ShouldFallbackToClientFiltering(ex))
+        {
+            var candidates = await Replays
+                .AsNoTracking()
+                .Where(x => x.Status == MuleReplayStatus.Scheduled)
+                .Select(x => new
+                {
+                    x.RequestId,
+                    x.ScheduleOnUtc,
+                    x.NextAttemptOnUtc,
+                    x.LockedOnUtc,
+                    x.RequestedOnUtc
+                })
+                .ToListAsync(cancellationToken);
+
+            return candidates
+                .Where(x => x.ScheduleOnUtc <= now
+                    && (!x.NextAttemptOnUtc.HasValue || x.NextAttemptOnUtc.Value <= now)
+                    && (!x.LockedOnUtc.HasValue || x.LockedOnUtc.Value <= lockExpiration))
+                .OrderBy(x => x.ScheduleOnUtc)
+                .ThenBy(x => x.RequestedOnUtc)
+                .Select(x => x.RequestId)
+                .Take(batchSize)
+                .ToArray();
+        }
+    }
 
     private async Task<MuleReplayClaim> TryClaimAsync(
         Ulid requestId,
@@ -291,8 +332,8 @@ internal partial class EntityFrameworkMuleStorage<TDbContext>
     private static bool CanClaimReplay(MuleReplay replay, DateTimeOffset lockExpiration, DateTimeOffset now)
         => replay.Status == MuleReplayStatus.Scheduled
             && replay.ScheduleOnUtc <= now
-            && (replay.NextAttemptOnUtc == null || replay.NextAttemptOnUtc <= now)
-            && (replay.LockedOnUtc == null || replay.LockedOnUtc <= lockExpiration);
+            && (!replay.NextAttemptOnUtc.HasValue || replay.NextAttemptOnUtc.Value <= now)
+            && (!replay.LockedOnUtc.HasValue || replay.LockedOnUtc.Value <= lockExpiration);
 
     private static DateTimeOffset GetNextReplayOnUtc(
         DateTimeOffset scheduleOnUtc,

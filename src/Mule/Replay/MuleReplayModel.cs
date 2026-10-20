@@ -8,8 +8,8 @@ internal static class MuleReplayModel
 
     public static MuleReplayRequest NormalizeRequest(MuleReplayRequest request, DateTimeOffset now)
     {
-        var scheduleOnUtc = request.ScheduleOnUtc?.ToUniversalTime() ?? now;
-        if (scheduleOnUtc < now)
+        var scheduleOnUtc = request.ScheduleOnUtc?.ToUniversalTime();
+        if (scheduleOnUtc is { } scheduled && scheduled < now)
             scheduleOnUtc = now;
 
         return new MuleReplayRequest
@@ -75,7 +75,7 @@ internal static class MuleReplayModel
         => replay.SourceActionId == sourceActionId
             && string.Equals(replay.RequestedBy, request.RequestedBy, StringComparison.Ordinal)
             && string.Equals(replay.Reason, request.Reason, StringComparison.Ordinal)
-            && replay.ScheduleOnUtc == request.ScheduleOnUtc
+            && (!request.ScheduleOnUtc.HasValue || replay.ScheduleOnUtc == request.ScheduleOnUtc.Value)
             && string.Equals(replay.Metadata, SerializeMetadata(request.Metadata), StringComparison.Ordinal)
             && replay.BranchId == GetBranchId(request);
 

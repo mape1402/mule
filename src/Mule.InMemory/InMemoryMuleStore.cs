@@ -469,8 +469,8 @@ internal sealed class InMemoryMuleStore
     private static bool CanClaimReplay(MuleReplay replay, DateTimeOffset lockExpiration, DateTimeOffset now)
         => replay.Status == MuleReplayStatus.Scheduled
             && replay.ScheduleOnUtc <= now
-            && (replay.NextAttemptOnUtc == null || replay.NextAttemptOnUtc <= now)
-            && (replay.LockedOnUtc == null || replay.LockedOnUtc <= lockExpiration);
+            && (!replay.NextAttemptOnUtc.HasValue || replay.NextAttemptOnUtc.Value <= now)
+            && (!replay.LockedOnUtc.HasValue || replay.LockedOnUtc.Value <= lockExpiration);
 
     private static DateTimeOffset GetNextReplayOnUtc(
         MuleReplay replay,

@@ -190,6 +190,53 @@ public sealed class SqlServerMuleTests
         Assert.Equal(3, await verificationDb.Actions.CountAsync());
     }
 
+    [SqlServerFact]
+    public async Task Replay_Should_Remain_Idempotent_Across_Replicas()
+    {
+        using var database = SqlServerTestDatabase.Create();
+        using var host = CreateHost(database.ConnectionString);
+        await EnsureDatabaseAsync(host);
+        var sourceId = await InsertActionAsync(host, DurableActionStatus.Failed);
+        var requestId = Ulid.NewUlid();
+        var now = DateTimeOffset.UtcNow;
+
+        var results = await Task.WhenAll(Enumerable.Range(0, 20).Select(async _ =>
+        {
+            using var scope = host.Services.CreateScope();
+            var storage = scope.ServiceProvider.GetRequiredService<IMuleReplayStorage>();
+            return await storage.ScheduleAsync(sourceId, new MuleReplayRequest
+            {
+                RequestId = requestId,
+                RequestedBy = "sql-test",
+                Reason = "concurrent",
+                ScheduleOnUtc = now
+            }, now);
+        }));
+
+        Assert.Single(results.Where(x => x.Outcome == MuleReplayOutcome.Scheduled));
+        Assert.Equal(19, results.Count(x => x.Outcome == MuleReplayOutcome.AlreadyScheduled));
+        Assert.Single(results.Select(x => x.ReplayActionId).Distinct());
+
+        var claims = await Task.WhenAll(Enumerable.Range(0, 10).Select(async _ =>
+        {
+            using var scope = host.Services.CreateScope();
+            var storage = scope.ServiceProvider.GetRequiredService<IMuleReplayStorage>();
+            return await storage.ClaimScheduledAsync(1, TimeSpan.FromMinutes(1), now);
+        }));
+        var claim = Assert.Single(claims.SelectMany(x => x));
+        using (var scope = host.Services.CreateScope())
+        {
+            var storage = scope.ServiceProvider.GetRequiredService<IMuleReplayStorage>();
+            var action = Mule.Replay.MuleReplayModel.CreateAction(claim, now);
+            Assert.Equal(MuleReplayMaterializationOutcome.Created, await storage.MaterializeAsync(claim, action, now));
+        }
+
+        using var verificationScope = host.Services.CreateScope();
+        var db = verificationScope.ServiceProvider.GetRequiredService<MuleDbContext>();
+        Assert.Equal(2, await db.Actions.CountAsync());
+        Assert.Equal(MuleReplayStatus.Materialized, await db.Replays.Select(x => x.Status).SingleAsync());
+    }
+
     private static IHost CreateHost(string connectionString)
         => Host.CreateDefaultBuilder()
             .ConfigureServices(services =>
