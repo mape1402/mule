@@ -1,23 +1,27 @@
 namespace Mule.Replay;
 
 using Microsoft.Extensions.Logging;
+using Mule.Diagnostics;
 
 internal sealed class MuleReplayService : IMuleReplayService
 {
     private readonly IMuleReplayStorage _storage;
     private readonly IMuleReplayCommitNotifier _commitNotifier;
     private readonly TimeProvider _timeProvider;
+    private readonly MuleRuntimeMetrics _metrics;
     private readonly ILogger<MuleReplayService> _logger;
 
     public MuleReplayService(
         IMuleReplayStorage storage,
         IMuleReplayCommitNotifier commitNotifier,
         TimeProvider timeProvider,
+        MuleRuntimeMetrics metrics,
         ILogger<MuleReplayService> logger)
     {
         _storage = storage ?? throw new ArgumentNullException(nameof(storage));
         _commitNotifier = commitNotifier ?? throw new ArgumentNullException(nameof(commitNotifier));
         _timeProvider = timeProvider ?? throw new ArgumentNullException(nameof(timeProvider));
+        _metrics = metrics ?? throw new ArgumentNullException(nameof(metrics));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
     }
 
@@ -47,7 +51,18 @@ internal sealed class MuleReplayService : IMuleReplayService
             LogResult(result, actionId, request);
 
             if (result.Outcome == MuleReplayOutcome.Scheduled)
+            {
+                _metrics.RecordReplayScheduled();
                 await _commitNotifier.NotifyScheduledAsync(result.Replay.ScheduleOnUtc);
+            }
+            else if (result.Outcome == MuleReplayOutcome.AlreadyScheduled)
+            {
+                _metrics.RecordReplayAlreadyScheduled();
+            }
+            else
+            {
+                _metrics.RecordReplayRejected();
+            }
 
             return result;
         }

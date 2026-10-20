@@ -14,6 +14,12 @@ public sealed class MuleRuntimeMetrics
     private int _completed;
     private int _failed;
     private int _duplicatesIgnored;
+    private int _replayScheduled;
+    private int _replayMaterialized;
+    private int _replayAlreadyScheduled;
+    private int _replayRejected;
+    private int _replayRetried;
+    private int _replayMaterializationFailures;
 
     public void RecordCompleted(string lane, ActionKey key, DateTimeOffset completedOnUtc)
     {
@@ -39,6 +45,42 @@ public sealed class MuleRuntimeMetrics
     {
         lock (_gate)
             _duplicatesIgnored++;
+    }
+
+    public void RecordReplayScheduled()
+    {
+        lock (_gate)
+            _replayScheduled++;
+    }
+
+    public void RecordReplayMaterialized()
+    {
+        lock (_gate)
+            _replayMaterialized++;
+    }
+
+    public void RecordReplayAlreadyScheduled()
+    {
+        lock (_gate)
+            _replayAlreadyScheduled++;
+    }
+
+    public void RecordReplayRejected()
+    {
+        lock (_gate)
+            _replayRejected++;
+    }
+
+    public void RecordReplayRetried()
+    {
+        lock (_gate)
+            _replayRetried++;
+    }
+
+    public void RecordReplayMaterializationFailure()
+    {
+        lock (_gate)
+            _replayMaterializationFailures++;
     }
 
     public void RecordClaimed(string lane, int count)
@@ -122,7 +164,15 @@ public sealed class MuleRuntimeMetrics
                 _waitingExecutionOnUtcByLane.ToDictionary(
                     x => x.Key,
                     x => x.Value.Count == 0 ? null : (TimeSpan?)(now - x.Value.Peek()),
-                    StringComparer.OrdinalIgnoreCase));
+                    StringComparer.OrdinalIgnoreCase))
+            {
+                ReplayScheduled = _replayScheduled,
+                ReplayMaterialized = _replayMaterialized,
+                ReplayAlreadyScheduled = _replayAlreadyScheduled,
+                ReplayRejected = _replayRejected,
+                ReplayRetried = _replayRetried,
+                ReplayMaterializationFailures = _replayMaterializationFailures
+            };
         }
     }
 

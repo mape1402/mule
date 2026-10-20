@@ -5,6 +5,7 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Mule.Dispatching;
+using Mule.Diagnostics;
 
 internal sealed class MuleReplayHostedService : BackgroundService
 {
@@ -13,6 +14,7 @@ internal sealed class MuleReplayHostedService : BackgroundService
     private readonly MuleSchedulerSignal _schedulerSignal;
     private readonly MuleReplaySettings _settings;
     private readonly TimeProvider _timeProvider;
+    private readonly MuleRuntimeMetrics _metrics;
     private readonly ILogger<MuleReplayHostedService> _logger;
 
     public MuleReplayHostedService(
@@ -21,6 +23,7 @@ internal sealed class MuleReplayHostedService : BackgroundService
         MuleSchedulerSignal schedulerSignal,
         IOptions<MuleSettings> settings,
         TimeProvider timeProvider,
+        MuleRuntimeMetrics metrics,
         ILogger<MuleReplayHostedService> logger)
     {
         _scopeFactory = scopeFactory ?? throw new ArgumentNullException(nameof(scopeFactory));
@@ -28,6 +31,7 @@ internal sealed class MuleReplayHostedService : BackgroundService
         _schedulerSignal = schedulerSignal ?? throw new ArgumentNullException(nameof(schedulerSignal));
         _settings = settings?.Value?.Replay ?? throw new ArgumentNullException(nameof(settings));
         _timeProvider = timeProvider ?? throw new ArgumentNullException(nameof(timeProvider));
+        _metrics = metrics ?? throw new ArgumentNullException(nameof(metrics));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
     }
 
@@ -111,6 +115,7 @@ internal sealed class MuleReplayHostedService : BackgroundService
                 return;
 
             await _commitNotifier.NotifySavedAsync(action.Id, action.Lane, cancellationToken);
+            _metrics.RecordReplayMaterialized();
             _logger.LogInformation(
                 "Mule replay {MuleReplayRequestId} materialized action {MuleReplayActionId} from {MuleActionId} with {MuleReplayMaterializationOutcome}.",
                 claim.Replay.RequestId,
@@ -124,12 +129,14 @@ internal sealed class MuleReplayHostedService : BackgroundService
         }
         catch (Exception ex)
         {
+            _metrics.RecordReplayMaterializationFailure();
             var nextAttemptOnUtc = now.Add(GetRetryDelay());
             try
             {
                 using var scope = _scopeFactory.CreateScope();
                 var storage = scope.ServiceProvider.GetRequiredService<IMuleReplayStorage>();
                 await storage.ReleaseAsync(claim, ex.ToString(), nextAttemptOnUtc, cancellationToken);
+                _metrics.RecordReplayRetried();
                 _schedulerSignal.SignalReplayAt(nextAttemptOnUtc);
             }
             catch (Exception releaseException)
