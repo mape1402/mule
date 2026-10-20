@@ -15,4 +15,15 @@ public interface IMuleTestHarness
         DurableActionStatus? status = null,
         TimeSpan? timeout = null,
         CancellationToken cancellationToken = default);
+
+    ValueTask<MuleReplayResult> ReplayAsync(
+        Ulid actionId,
+        MuleReplayRequest request,
+        CancellationToken cancellationToken = default);
+
+    Task<MuleReplayInfo> WaitForReplayAsync(
+        Ulid requestId,
+        MuleReplayStatus? status = null,
+        TimeSpan? timeout = null,
+        CancellationToken cancellationToken = default);
 }
