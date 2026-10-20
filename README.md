@@ -3,7 +3,7 @@
 [![Build](https://github.com/mape1402/mule/actions/workflows/build-and-release.yml/badge.svg)](https://github.com/mape1402/mule/actions/workflows/build-and-release.yml)
 [![NuGet](https://img.shields.io/nuget/v/Mule.DurableActions.svg)](https://www.nuget.org/packages/Mule.DurableActions)
 [![Downloads](https://img.shields.io/nuget/dt/Mule.DurableActions.svg)](https://www.nuget.org/packages/Mule.DurableActions)
-![Coverage](https://img.shields.io/badge/coverage-99.1%25-brightgreen)
+![Coverage](https://img.shields.io/badge/coverage-99.0%25-brightgreen)
 ![License](https://img.shields.io/github/license/mape1402/mule.svg)
 
 ![Mule durable action workflow](assets/readme-hero.png)
@@ -358,6 +358,12 @@ services.AddMule(mule => mule
             entity.Property(x => x.PayloadType).HasMaxLength(256);
             entity.Property(x => x.Payload).HasColumnType("jsonb");
             entity.Property(x => x.CorrelationId).HasMaxLength(64);
+        })
+        .ConfigureReplays(entity =>
+        {
+            entity.ToTable("MuleReplays");
+            entity.Property(x => x.RequestedBy).HasMaxLength(128);
+            entity.Property(x => x.Reason).HasMaxLength(512);
         }))
     .AddActionsFromAssemblyContaining<SendReceiptAction>());
 ```
@@ -492,6 +498,117 @@ Test shape: .NET 10, local SQL Server test database, local Redis container, `Wor
 | FastLane Redis + SQL | 20,000 | 10.22s | 1,956/s | 5.63s | 0 |
 | FastLane Redis + SQL | 50,000 | 22.14s | 2,257/s | 14.22s | 0 |
 | FastLane Redis + SQL, handler 1ms | 50,000 | 23.46s | 2,130/s | 13.77s | 0 |
+
+## Manual Replay
+
+Manual replay schedules a new durable action from a failed action without mutating the original record. This is useful for support tools, administrative APIs, and operational recovery after the dependency or data that caused a terminal failure has been corrected.
+
+Resolve `IMuleReplayService` and supply a caller-owned `RequestId`:
+
+```csharp
+var replays = scope.ServiceProvider.GetRequiredService<IMuleReplayService>();
+var requestId = Ulid.NewUlid();
+
+var result = await replays.ReplayAsync(failedActionId, new MuleReplayRequest
+{
+    RequestId = requestId,
+    RequestedBy = "support@example.test",
+    Reason = "Payment provider incident resolved",
+    ScheduleOnUtc = DateTimeOffset.UtcNow.AddMinutes(5),
+    Metadata = new Dictionary<string, string>
+    {
+        ["ticket"] = "INC-1042"
+    }
+}, cancellationToken);
+```
+
+`ReplayAsync` records a durable replay schedule. It does not execute the handler inline. A replay worker later claims the schedule and materializes a new `DurableAction` using an action id reserved when the request is accepted.
+
+The replayed action preserves the original action key, payload, payload type, lane, and correlation id. Request metadata is merged over the original metadata. Mule assigns a replay-specific deduplication key so the new action does not collide with the original intent.
+
+Only actions in `Failed` status are eligible. The original failed action remains unchanged for audit and diagnostics.
+
+### Idempotency And Outcomes
+
+`RequestId` is the idempotency key for the administrative replay request. Store it with the command, ticket, or API request that initiated the replay and reuse it when retrying the same call.
+
+| Outcome | Meaning |
+| --- | --- |
+| `Scheduled` | A new durable replay schedule was created. |
+| `AlreadyScheduled` | The same `RequestId` and request values were already accepted. The existing replay is returned. |
+| `NotFound` | The source action does not exist. |
+| `NotEligible` | The source action is not in `Failed` status. |
+| `RequestConflict` | The `RequestId` already exists with different source or request values. |
+| `ReplayAlreadyExists` | The source already has a replay in the same logical branch. |
+
+`MuleReplayResult.ReplayActionId` is stable across idempotent calls. Use `GetReplayAsync(requestId)` to inspect the schedule:
+
+```csharp
+var replay = await replays.GetReplayAsync(requestId, cancellationToken);
+
+if (replay?.Status == MuleReplayStatus.Materialized)
+{
+    logger.LogInformation(
+        "Replay {ReplayActionId} was materialized after {Attempts} attempt(s).",
+        replay.ReplayActionId,
+        replay.MaterializationAttempts);
+}
+```
+
+`MuleReplayStatus.Scheduled` means the administrative request is durable and waiting to be materialized. `MuleReplayStatus.Materialized` means the new durable action exists and can be dispatched normally.
+
+### Replay Chains And Parallel Branches
+
+By default, Mule allows one replay child per failed action. If that replay later fails, replay the failed child to build a linear history:
+
+```text
+original action -> replay 1 -> replay 2
+```
+
+`ReplayRootActionId`, `ReplayOfActionId`, and `ReplaySequence` expose that lineage.
+
+Set `AllowParallelReplay = true` only when separate replay attempts for the same failed source are intentional. Each request id then identifies an independent branch. The request id remains idempotent inside that branch.
+
+### Durability And Replicas
+
+Replay uses two durable stages to avoid a race between scheduling and action creation:
+
+1. Mule persists one replay schedule and reserves the future action `Ulid`.
+2. A background worker claims schedules in batches and creates the action with that reserved id.
+
+If the process stops between the two writes, startup recovery claims the schedule again. If the action write succeeded but the schedule status update did not, Mule detects the reserved action id and reconciles the schedule instead of creating a duplicate.
+
+EF Core uses unique indexes plus optimistic concurrency for request idempotency, branch idempotency, action reservation, and leases. Multiple replicas can run replay workers concurrently; only the replica that owns the current lease can materialize a schedule. Mule still provides at-least-once action execution, so handlers must remain idempotent.
+
+FastLane does not buffer replay schedules. With FastLane InMemory or Redis enabled, replay scheduling and materialization use the configured durable provider directly so process-local or Redis buffer loss cannot erase an accepted administrative replay.
+
+### Replay Worker Settings
+
+Replay settings are part of the normal chainable Mule configuration:
+
+```csharp
+services.AddMule(mule => mule
+    .UseEntityFrameworkCore<AppDbContext>()
+    .Configure(settings =>
+    {
+        settings.Replay.RecoveryMode = MuleRecoveryMode.Scheduled;
+        settings.Replay.PollingInterval = TimeSpan.FromSeconds(30);
+        settings.Replay.BatchSize = 100;
+        settings.Replay.WorkerCount = 8;
+        settings.Replay.LockTimeout = TimeSpan.FromMinutes(2);
+        settings.Replay.RetryDelay = TimeSpan.FromSeconds(10);
+    })
+    .AddActionsFromAssemblyContaining<SendReceiptAction>());
+```
+
+- `RecoveryMode = Scheduled` scans on startup, then sleeps until a replay is signaled or becomes due.
+- `RecoveryMode = Polling` scans every `PollingInterval`, including work inserted by another process that cannot signal this instance.
+- `BatchSize` limits schedules claimed per storage read.
+- `WorkerCount` controls concurrent materialization inside one process.
+- `LockTimeout` makes abandoned claims eligible after a replica stops.
+- `RetryDelay` controls recovery after a materialization failure.
+
+The worker claims and materializes batches; it does not process pending schedules one at a time.
 
 ## Dispatcher Settings
 
@@ -672,6 +789,12 @@ The snapshot includes:
 - completed per minute by action key
 - runtime completed count
 - runtime failed count
+- replay schedules accepted
+- replay actions materialized
+- idempotent replay requests observed
+- replay requests rejected
+- replay materialization retries
+- replay materialization failures
 - runtime failed count by lane
 - runtime failed count by action key
 - claimed count by lane
@@ -713,6 +836,21 @@ var actionId = await mule.EnqueueAsync(
 var harness = provider.GetRequiredService<IMuleTestHarness>();
 var action = await harness.WaitForActionAsync(
     actionId,
+    DurableActionStatus.Completed);
+```
+
+The harness also exposes replay helpers:
+
+```csharp
+var request = new MuleReplayRequest { RequestId = Ulid.NewUlid() };
+var scheduled = await harness.ReplayAsync(failedActionId, request);
+
+await harness.WaitForReplayAsync(
+    request.RequestId,
+    MuleReplayStatus.Materialized);
+
+var completedReplay = await harness.WaitForActionAsync(
+    scheduled.ReplayActionId,
     DurableActionStatus.Completed);
 ```
 
@@ -765,3 +903,11 @@ Expected output:
 Observed action samples.testing.send-receipt.v1 with status Completed.
 Captured receipt for order-1001 to mario@example.com.
 ```
+
+Run the manual replay sample:
+
+```bash
+dotnet run --project samples/Mule.Samples.Replay/Mule.Samples.Replay.csproj --framework net8.0
+```
+
+The sample intentionally fails an action, schedules a replay after the dependency recovers, and waits for the new action to complete while the original remains failed.

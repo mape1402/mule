@@ -4,6 +4,20 @@ All notable changes to Mule packages will be documented in this file.
 
 ## [Unreleased]
 
+## [v2.1.0] - 2026-10-20
+
+### Added
+
+- Added `IMuleReplayService` for idempotently scheduling manual replays of failed durable actions.
+- Added durable two-stage replay scheduling with a reserved action ULID, recoverable materialization, and reconciliation after partial writes.
+- Added linear replay lineage through root, parent, and sequence metadata, with opt-in parallel replay branches.
+- Added batch replay workers with scheduled or polling recovery, configurable concurrency, leases, retry delay, and startup recovery.
+- Added replica-safe in-memory and provider-agnostic EF Core replay storage implementations.
+- Added chainable EF replay model customization through `ConfigureReplays(...)`.
+- Added replay counters to `IMuleDiagnostics` for accepted, materialized, idempotent, rejected, retried, and failed replay operations.
+- Added `IMuleTestHarness` replay helpers and an executable manual replay sample.
+- Added focused unit and integration coverage for idempotency, crash recovery, optimistic concurrency, replica coordination, FastLane compatibility, SQLite, and SQL Server.
+
 ## [v2.0.0] - 2026-10-14
 
 ### Added
