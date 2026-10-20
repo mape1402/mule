@@ -44,5 +44,7 @@ public sealed class MuleSettings
 
     public TimeSpan LockTimeout { get; set; } = TimeSpan.FromMinutes(5);
 
+    public MuleReplaySettings Replay { get; } = new();
+
     public IDictionary<string, MuleLaneSettings> Lanes { get; } = new Dictionary<string, MuleLaneSettings>(StringComparer.OrdinalIgnoreCase);
 }
