@@ -11,6 +11,8 @@ public sealed class MuleDbContext : DbContext
 
     public DbSet<DurableAction> Actions => Set<DurableAction>();
 
+    public DbSet<MuleReplay> Replays => Set<MuleReplay>();
+
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
         modelBuilder.UseMuleModel();
