@@ -1,11 +1,13 @@
 namespace Mule.InMemory;
 
 using Mule.Diagnostics;
+using Mule.Replay;
 
 internal sealed class InMemoryMuleStore
 {
     private readonly object _gate = new();
     private readonly List<DurableAction> _actions = new();
+    private readonly List<MuleReplay> _replays = new();
 
     public IReadOnlyCollection<DurableAction> Actions
     {
@@ -29,6 +31,168 @@ internal sealed class InMemoryMuleStore
 
             _actions.Add(Clone(action));
             return true;
+        }
+    }
+
+    public MuleReplayResult ScheduleReplay(Ulid sourceActionId, MuleReplayRequest request, DateTimeOffset now)
+    {
+        lock (_gate)
+        {
+            var existingRequest = _replays.SingleOrDefault(x => x.RequestId == request.RequestId);
+            if (existingRequest != null)
+            {
+                return Result(
+                    MuleReplayModel.Matches(existingRequest, sourceActionId, request)
+                        ? MuleReplayOutcome.AlreadyScheduled
+                        : MuleReplayOutcome.RequestConflict,
+                    existingRequest);
+            }
+
+            var source = _actions.SingleOrDefault(x => x.Id == sourceActionId);
+            if (source == null)
+                return Result(MuleReplayOutcome.NotFound, null);
+            if (source.Status != DurableActionStatus.Failed)
+                return Result(MuleReplayOutcome.NotEligible, null);
+
+            var branchId = MuleReplayModel.GetBranchId(request);
+            var existingBranch = _replays.SingleOrDefault(x =>
+                x.SourceActionId == sourceActionId && x.BranchId == branchId);
+            if (existingBranch != null)
+                return Result(MuleReplayOutcome.ReplayAlreadyExists, existingBranch);
+
+            var parent = _replays.SingleOrDefault(x => x.ReplayActionId == sourceActionId);
+            var replay = new MuleReplay
+            {
+                RequestId = request.RequestId,
+                ConcurrencyToken = Ulid.NewUlid(),
+                SourceActionId = sourceActionId,
+                ReplayRootActionId = parent?.ReplayRootActionId ?? sourceActionId,
+                ReplayActionId = Ulid.NewUlid(),
+                ReplaySequence = (parent?.ReplaySequence ?? 0) + 1,
+                BranchId = branchId,
+                ActionKey = source.Key,
+                Lane = source.Lane,
+                CorrelationId = source.CorrelationId,
+                OriginalDeduplicationKey = source.DeduplicationKey,
+                Status = MuleReplayStatus.Scheduled,
+                RequestedBy = request.RequestedBy,
+                Reason = request.Reason,
+                Metadata = MuleReplayModel.SerializeMetadata(request.Metadata),
+                RequestedOnUtc = now,
+                ScheduleOnUtc = request.ScheduleOnUtc ?? now
+            };
+            _replays.Add(replay);
+            return Result(MuleReplayOutcome.Scheduled, replay);
+        }
+    }
+
+    public MuleReplayInfo FindReplay(Ulid requestId)
+    {
+        lock (_gate)
+            return MuleReplayModel.ToInfo(_replays.SingleOrDefault(x => x.RequestId == requestId));
+    }
+
+    public IReadOnlyCollection<MuleReplayClaim> ClaimScheduledReplays(
+        int batchSize,
+        TimeSpan lockTimeout,
+        DateTimeOffset now)
+    {
+        lock (_gate)
+        {
+            var lockExpiration = now.Subtract(lockTimeout);
+            var replays = _replays
+                .Where(x => CanClaimReplay(x, lockExpiration, now))
+                .OrderBy(x => x.ScheduleOnUtc)
+                .ThenBy(x => x.RequestedOnUtc)
+                .Take(Math.Max(1, batchSize))
+                .ToArray();
+            var claims = new List<MuleReplayClaim>(replays.Length);
+
+            foreach (var replay in replays)
+            {
+                var source = _actions.SingleOrDefault(x => x.Id == replay.SourceActionId);
+                if (source == null)
+                    continue;
+
+                replay.LockedOnUtc = now;
+                replay.LockToken = Ulid.NewUlid();
+                replay.ConcurrencyToken = Ulid.NewUlid();
+                replay.Attempts++;
+                claims.Add(new MuleReplayClaim
+                {
+                    Replay = Clone(replay),
+                    SourceAction = Clone(source),
+                    LockToken = replay.LockToken
+                });
+            }
+
+            return claims;
+        }
+    }
+
+    public DateTimeOffset? GetNextScheduledReplayOnUtc(TimeSpan lockTimeout, DateTimeOffset now)
+    {
+        lock (_gate)
+        {
+            var lockExpiration = now.Subtract(lockTimeout);
+            return _replays
+                .Where(x => x.Status == MuleReplayStatus.Scheduled)
+                .Select(x => (DateTimeOffset?)GetNextReplayOnUtc(x, lockExpiration, lockTimeout, now))
+                .OrderBy(x => x)
+                .FirstOrDefault();
+        }
+    }
+
+    public MuleReplayMaterializationOutcome MaterializeReplay(
+        MuleReplayClaim claim,
+        DurableAction action,
+        DateTimeOffset now)
+    {
+        lock (_gate)
+        {
+            var replay = _replays.SingleOrDefault(x => x.RequestId == claim.Replay.RequestId);
+            if (replay == null)
+                return MuleReplayMaterializationOutcome.LeaseLost;
+
+            var existingAction = _actions.SingleOrDefault(x => x.Id == replay.ReplayActionId);
+            if (replay.Status == MuleReplayStatus.Materialized && existingAction != null)
+                return MuleReplayMaterializationOutcome.Reconciled;
+            if (replay.LockToken != claim.LockToken || replay.Status != MuleReplayStatus.Scheduled)
+                return MuleReplayMaterializationOutcome.LeaseLost;
+
+            var outcome = MuleReplayMaterializationOutcome.Reconciled;
+            if (existingAction == null)
+            {
+                if (!AddWithoutLock(action))
+                    throw new InvalidOperationException($"Mule replay action '{action.Id}' could not be persisted.");
+
+                outcome = MuleReplayMaterializationOutcome.Created;
+            }
+
+            replay.Status = MuleReplayStatus.Materialized;
+            replay.MaterializedOnUtc = now;
+            replay.LockedOnUtc = null;
+            replay.LockToken = Ulid.Empty;
+            replay.NextAttemptOnUtc = null;
+            replay.LastError = null;
+            replay.ConcurrencyToken = Ulid.NewUlid();
+            return outcome;
+        }
+    }
+
+    public void ReleaseReplay(MuleReplayClaim claim, string error, DateTimeOffset nextAttemptOnUtc)
+    {
+        lock (_gate)
+        {
+            var replay = _replays.SingleOrDefault(x => x.RequestId == claim.Replay.RequestId);
+            if (replay == null || replay.Status != MuleReplayStatus.Scheduled || replay.LockToken != claim.LockToken)
+                return;
+
+            replay.LockedOnUtc = null;
+            replay.LockToken = Ulid.Empty;
+            replay.LastError = error;
+            replay.NextAttemptOnUtc = nextAttemptOnUtc;
+            replay.ConcurrencyToken = Ulid.NewUlid();
         }
     }
 
@@ -260,6 +424,34 @@ internal sealed class InMemoryMuleStore
             TerminalOnUtc = action.TerminalOnUtc
         };
 
+    internal static MuleReplay Clone(MuleReplay replay)
+        => new()
+        {
+            RequestId = replay.RequestId,
+            ConcurrencyToken = replay.ConcurrencyToken,
+            SourceActionId = replay.SourceActionId,
+            ReplayRootActionId = replay.ReplayRootActionId,
+            ReplayActionId = replay.ReplayActionId,
+            ReplaySequence = replay.ReplaySequence,
+            BranchId = replay.BranchId,
+            ActionKey = replay.ActionKey,
+            Lane = replay.Lane,
+            CorrelationId = replay.CorrelationId,
+            OriginalDeduplicationKey = replay.OriginalDeduplicationKey,
+            Status = replay.Status,
+            RequestedBy = replay.RequestedBy,
+            Reason = replay.Reason,
+            Metadata = replay.Metadata,
+            RequestedOnUtc = replay.RequestedOnUtc,
+            ScheduleOnUtc = replay.ScheduleOnUtc,
+            Attempts = replay.Attempts,
+            NextAttemptOnUtc = replay.NextAttemptOnUtc,
+            LastError = replay.LastError,
+            LockedOnUtc = replay.LockedOnUtc,
+            LockToken = replay.LockToken,
+            MaterializedOnUtc = replay.MaterializedOnUtc
+        };
+
     private static bool IsBacklog(DurableAction action)
         => action.Status is DurableActionStatus.Pending or DurableActionStatus.Locked;
 
@@ -273,6 +465,50 @@ internal sealed class InMemoryMuleStore
             DurableActionStatus.Locked => action.LockedOnUtc is { } lockedOnUtc && lockedOnUtc <= lockExpiration,
             _ => false
         };
+
+    private static bool CanClaimReplay(MuleReplay replay, DateTimeOffset lockExpiration, DateTimeOffset now)
+        => replay.Status == MuleReplayStatus.Scheduled
+            && replay.ScheduleOnUtc <= now
+            && (replay.NextAttemptOnUtc == null || replay.NextAttemptOnUtc <= now)
+            && (replay.LockedOnUtc == null || replay.LockedOnUtc <= lockExpiration);
+
+    private static DateTimeOffset GetNextReplayOnUtc(
+        MuleReplay replay,
+        DateTimeOffset lockExpiration,
+        TimeSpan lockTimeout,
+        DateTimeOffset now)
+    {
+        var dueOnUtc = replay.ScheduleOnUtc;
+        if (replay.NextAttemptOnUtc is { } nextAttemptOnUtc && nextAttemptOnUtc > dueOnUtc)
+            dueOnUtc = nextAttemptOnUtc;
+        if (replay.LockedOnUtc is { } lockedOnUtc && lockedOnUtc > lockExpiration)
+        {
+            var lockDueOnUtc = lockedOnUtc.Add(lockTimeout);
+            if (lockDueOnUtc > dueOnUtc)
+                dueOnUtc = lockDueOnUtc;
+        }
+
+        return dueOnUtc <= now ? now : dueOnUtc;
+    }
+
+    private static MuleReplayResult Result(MuleReplayOutcome outcome, MuleReplay replay)
+        => new()
+        {
+            Outcome = outcome,
+            Replay = MuleReplayModel.ToInfo(replay)
+        };
+
+    private bool AddWithoutLock(DurableAction action)
+    {
+        if (_actions.Any(x => x.Id == action.Id))
+            return false;
+        if (!string.IsNullOrWhiteSpace(action.DeduplicationKey)
+            && _actions.Any(x => x.Key == action.Key && x.DeduplicationKey == action.DeduplicationKey))
+            return false;
+
+        _actions.Add(Clone(action));
+        return true;
+    }
 
     private static DateTimeOffset? GetNextPendingOnUtc(
         DurableAction action,
