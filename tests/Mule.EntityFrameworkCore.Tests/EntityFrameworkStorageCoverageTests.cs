@@ -202,10 +202,17 @@ public sealed class EntityFrameworkStorageCoverageTests
         optionsBuilder.UseMuleModel();
         var options = optionsBuilder.Options;
         var factory = new InlineFactory(options);
+        var metrics = new MuleRuntimeMetrics();
+        metrics.RecordReplayScheduled();
+        metrics.RecordReplayMaterialized();
+        metrics.RecordReplayAlreadyScheduled();
+        metrics.RecordReplayRejected();
+        metrics.RecordReplayRetried();
+        metrics.RecordReplayMaterializationFailure();
         await using var diagnostics = new EntityFrameworkMuleDiagnostics<TestDbContext>(
             factory,
             Options.Create(new MuleSettings { LockTimeout = TimeSpan.FromSeconds(1) }),
-            new MuleRuntimeMetrics());
+            metrics);
         await using (var db = factory.CreateDbContext())
             await db.Database.EnsureCreatedAsync();
 
@@ -217,6 +224,12 @@ public sealed class EntityFrameworkStorageCoverageTests
         Assert.Null(snapshot.AverageEnqueueToExecutionLatency);
         Assert.Null(snapshot.AverageExecutionLatency);
         Assert.Null(snapshot.AverageEnqueueToTerminalLatency);
+        Assert.Equal(1, snapshot.ReplayScheduled);
+        Assert.Equal(1, snapshot.ReplayMaterialized);
+        Assert.Equal(1, snapshot.ReplayAlreadyScheduled);
+        Assert.Equal(1, snapshot.ReplayRejected);
+        Assert.Equal(1, snapshot.ReplayRetried);
+        Assert.Equal(1, snapshot.ReplayMaterializationFailures);
 
         await using var defaultDiagnostics = new EntityFrameworkMuleDiagnostics<TestDbContext>(
             factory,

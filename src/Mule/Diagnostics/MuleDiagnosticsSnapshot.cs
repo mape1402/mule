@@ -20,6 +20,18 @@ public sealed class MuleDiagnosticsSnapshot
 
     public int RuntimeFailed { get; init; }
 
+    public int ReplayScheduled { get; init; }
+
+    public int ReplayMaterialized { get; init; }
+
+    public int ReplayAlreadyScheduled { get; init; }
+
+    public int ReplayRejected { get; init; }
+
+    public int ReplayRetried { get; init; }
+
+    public int ReplayMaterializationFailures { get; init; }
+
     public DateTimeOffset? OldestPendingOnUtc { get; init; }
 
     public DateTimeOffset? OldestLockedOnUtc { get; init; }

@@ -61,6 +61,12 @@ public sealed class InMemoryStorageCoverageTests
         runtime.RecordFailed("Lane-A", Key);
         runtime.RecordClaimed("Lane-A", 2);
         runtime.RecordWaitingExecution("Lane-A", now.AddSeconds(-1));
+        runtime.RecordReplayScheduled();
+        runtime.RecordReplayMaterialized();
+        runtime.RecordReplayAlreadyScheduled();
+        runtime.RecordReplayRejected();
+        runtime.RecordReplayRetried();
+        runtime.RecordReplayMaterializationFailure();
         var snapshot = store.GetSnapshot(TimeSpan.FromMinutes(1), runtime.GetSnapshot(now));
 
         Assert.Equal(1, snapshot.Pending);
@@ -70,6 +76,12 @@ public sealed class InMemoryStorageCoverageTests
         Assert.True(snapshot.LockExpired >= 0);
         Assert.Equal(1, snapshot.RuntimeCompleted);
         Assert.Equal(1, snapshot.RuntimeFailed);
+        Assert.Equal(1, snapshot.ReplayScheduled);
+        Assert.Equal(1, snapshot.ReplayMaterialized);
+        Assert.Equal(1, snapshot.ReplayAlreadyScheduled);
+        Assert.Equal(1, snapshot.ReplayRejected);
+        Assert.Equal(1, snapshot.ReplayRetried);
+        Assert.Equal(1, snapshot.ReplayMaterializationFailures);
         Assert.True(snapshot.BacklogByLane.ContainsKey("Lane-A"));
         Assert.True(snapshot.FailuresByActionKey.ContainsKey(Key));
         Assert.True(snapshot.RetriesByActionKey.ContainsKey(Key));

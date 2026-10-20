@@ -360,6 +360,12 @@ internal sealed class InMemoryMuleStore
                     _actions.Count(x => x.Status == DurableActionStatus.Completed && x.CompletedOnUtc >= throughputSinceUtc)),
                 RuntimeCompleted = runtime.Completed,
                 RuntimeFailed = runtime.Failed,
+                ReplayScheduled = runtime.ReplayScheduled,
+                ReplayMaterialized = runtime.ReplayMaterialized,
+                ReplayAlreadyScheduled = runtime.ReplayAlreadyScheduled,
+                ReplayRejected = runtime.ReplayRejected,
+                ReplayRetried = runtime.ReplayRetried,
+                ReplayMaterializationFailures = runtime.ReplayMaterializationFailures,
                 OldestPendingOnUtc = oldestPendingOnUtc,
                 OldestLockedOnUtc = oldestLockedOnUtc,
                 OldestFailedOnUtc = _actions
