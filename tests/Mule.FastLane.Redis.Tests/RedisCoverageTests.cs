@@ -169,6 +169,13 @@ public sealed class RedisCoverageTests
             Assert.NotNull(await storage.GetNextPendingOnUtcAsync(TimeSpan.FromMinutes(1), now));
             Assert.Equal(durableOnly.Id, (await storage.LockAsync(durableOnly.Id, TimeSpan.FromMinutes(1), now)).Id);
 
+            var bufferedLock = CreateAction("buffered-lock", now);
+            await storage.AddAsync(bufferedLock);
+            await storage.SaveChangesAsync();
+            Assert.Equal(
+                bufferedLock.Id,
+                (await storage.LockAsync(bufferedLock.Id, TimeSpan.FromMinutes(1), claimNow)).Id);
+
             var shortCircuit = CreateAction("short-circuit", now.AddSeconds(-4));
             await storage.AddAsync(shortCircuit);
             await storage.SaveChangesAsync();
