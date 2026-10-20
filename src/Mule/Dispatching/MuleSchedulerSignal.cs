@@ -6,6 +6,7 @@ internal sealed class MuleSchedulerSignal
 {
     private readonly Channel<bool> _recoverySignals = Channel.CreateUnbounded<bool>();
     private readonly Channel<bool> _cleanupSignals = Channel.CreateUnbounded<bool>();
+    private readonly Channel<bool> _replaySignals = Channel.CreateUnbounded<bool>();
 
     public void SignalRecovery()
         => _recoverySignals.Writer.TryWrite(true);
@@ -19,11 +20,17 @@ internal sealed class MuleSchedulerSignal
     public void SignalCleanupAt(DateTimeOffset dueOnUtc)
         => SignalAt(_cleanupSignals, dueOnUtc);
 
+    public void SignalReplayAt(DateTimeOffset dueOnUtc)
+        => SignalAt(_replaySignals, dueOnUtc);
+
     public async ValueTask WaitForRecoveryAsync(CancellationToken cancellationToken)
         => await _recoverySignals.Reader.ReadAsync(cancellationToken);
 
     public async ValueTask WaitForCleanupAsync(CancellationToken cancellationToken)
         => await _cleanupSignals.Reader.ReadAsync(cancellationToken);
+
+    public async ValueTask WaitForReplayAsync(CancellationToken cancellationToken)
+        => await _replaySignals.Reader.ReadAsync(cancellationToken);
 
     private static void SignalAt(Channel<bool> channel, DateTimeOffset dueOnUtc)
     {

@@ -6,6 +6,7 @@ using Mule;
 using Mule.Configuration;
 using Mule.Diagnostics;
 using Mule.Dispatching;
+using Mule.Replay;
 
 public static class MuleServiceCollectionExtensions
 {
@@ -26,8 +27,12 @@ public static class MuleServiceCollectionExtensions
         services.TryAddSingleton<IMuleActionExecutor>(provider => provider.GetRequiredService<MuleActionExecutor>());
         services.TryAddSingleton<MuleSchedulerSignal>();
         services.TryAddSingleton<IMuleCommitNotifier, AmbientTransactionMuleCommitNotifier>();
+        services.TryAddSingleton<IMuleReplayCommitNotifier, AmbientTransactionMuleReplayCommitNotifier>();
+        services.TryAddSingleton(TimeProvider.System);
         services.TryAddScoped<IMuleClient, MuleClient>();
+        services.TryAddScoped<IMuleReplayService, MuleReplayService>();
         services.AddSingleton<IHostedService, MuleDispatcherHostedService>();
+        services.AddSingleton<IHostedService, MuleReplayHostedService>();
 
         var registry = new MuleActionRegistry();
 
