@@ -3,7 +3,7 @@ namespace Mule.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore;
 using Mule.Diagnostics;
 
-internal class EntityFrameworkMuleStorage<TDbContext> : IMuleDurableStorage, IMuleBatchTerminalStorage, IDisposable, IAsyncDisposable
+internal partial class EntityFrameworkMuleStorage<TDbContext> : IMuleDurableStorage, IMuleBatchTerminalStorage, IMuleReplayStorage, IDisposable, IAsyncDisposable
     where TDbContext : DbContext
 {
     private readonly TDbContext _dbContext;
