@@ -3,6 +3,7 @@ namespace Mule.Testing.Tests;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Mule.InMemory;
+using NSubstitute;
 
 public sealed class MuleTestingTests
 {
@@ -51,10 +52,12 @@ public sealed class MuleTestingTests
             Status = DurableActionStatus.Pending,
             CreatedOnUtc = DateTimeOffset.UtcNow
         };
-        var harness = new MuleTestHarness(new FixedInMemoryMule([action]));
+        var replayService = Substitute.For<IMuleReplayService>();
+        var harness = new MuleTestHarness(new FixedInMemoryMule([action]), replayService);
 
         Assert.Throws<ArgumentNullException>(() => MuleTestingRegistrationBuilderExtensions.UseTesting(null));
-        Assert.Throws<ArgumentNullException>(() => new MuleTestHarness(null));
+        Assert.Throws<ArgumentNullException>(() => new MuleTestHarness(null, replayService));
+        Assert.Throws<ArgumentNullException>(() => new MuleTestHarness(new FixedInMemoryMule([]), null));
         Assert.Same(action, await harness.WaitForActionAsync(Key));
 
         using var cancellation = new CancellationTokenSource();
@@ -66,6 +69,67 @@ public sealed class MuleTestingTests
                 null,
                 TimeSpan.FromSeconds(1),
                 cancellation.Token));
+    }
+
+    [Fact]
+    public async Task Harness_Should_Schedule_And_Wait_For_Replay()
+    {
+        var sourceId = Ulid.NewUlid();
+        var requestId = Ulid.NewUlid();
+        var actionId = Ulid.NewUlid();
+        var info = new MuleReplayInfo
+        {
+            RequestId = requestId,
+            ReplayOfActionId = sourceId,
+            ReplayRootActionId = sourceId,
+            ReplayActionId = actionId,
+            ReplaySequence = 1,
+            Status = MuleReplayStatus.Materialized,
+            ActionKey = Key,
+            RequestedOnUtc = DateTimeOffset.UtcNow,
+            ScheduleOnUtc = DateTimeOffset.UtcNow
+        };
+        var replayService = Substitute.For<IMuleReplayService>();
+        replayService.ReplayAsync(sourceId, Arg.Any<MuleReplayRequest>(), Arg.Any<CancellationToken>())
+            .Returns(new MuleReplayResult { Outcome = MuleReplayOutcome.Scheduled, Replay = info });
+        replayService.GetReplayAsync(requestId, Arg.Any<CancellationToken>()).Returns(info);
+        var harness = new MuleTestHarness(new FixedInMemoryMule([]), replayService);
+        var request = new MuleReplayRequest { RequestId = requestId };
+
+        var result = await harness.ReplayAsync(sourceId, request);
+        var observed = await harness.WaitForReplayAsync(requestId, MuleReplayStatus.Materialized);
+
+        Assert.Equal(actionId, result.ReplayActionId);
+        Assert.Same(info, observed);
+    }
+
+    [Fact]
+    public async Task WaitForReplayAsync_Should_Timeout_When_Replay_Is_Not_Observed()
+    {
+        var replayService = Substitute.For<IMuleReplayService>();
+        replayService.GetReplayAsync(Arg.Any<Ulid>(), Arg.Any<CancellationToken>())
+            .Returns((MuleReplayInfo)null);
+        var harness = new MuleTestHarness(new FixedInMemoryMule([]), replayService);
+
+        await Assert.ThrowsAsync<TimeoutException>(() => harness.WaitForReplayAsync(
+            Ulid.NewUlid(),
+            MuleReplayStatus.Materialized,
+            TimeSpan.FromMilliseconds(50)));
+    }
+
+    [Fact]
+    public async Task WaitForReplayAsync_Should_Describe_Timeout_Without_Required_Status()
+    {
+        var replayService = Substitute.For<IMuleReplayService>();
+        replayService.GetReplayAsync(Arg.Any<Ulid>(), Arg.Any<CancellationToken>())
+            .Returns((MuleReplayInfo)null);
+        var harness = new MuleTestHarness(new FixedInMemoryMule([]), replayService);
+
+        var error = await Assert.ThrowsAsync<TimeoutException>(() => harness.WaitForReplayAsync(
+            Ulid.NewUlid(),
+            timeout: TimeSpan.FromMilliseconds(50)));
+
+        Assert.DoesNotContain("with status", error.Message);
     }
 
     private static IHost CreateHost()

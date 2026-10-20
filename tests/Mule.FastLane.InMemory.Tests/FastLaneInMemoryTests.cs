@@ -12,6 +12,21 @@ public sealed class FastLaneInMemoryTests
     private static readonly ActionKey Key = ActionKey.From("tests.fastlane.capture.v1");
 
     [Fact]
+    public void Replay_Storage_Should_Remain_On_The_Durable_Provider()
+    {
+        using var host = CreateHost(out var databasePath);
+        using var scope = host.Services.CreateScope();
+
+        var replayStorage = scope.ServiceProvider.GetRequiredService<IMuleReplayStorage>();
+        var durableStorage = scope.ServiceProvider.GetRequiredService<IMuleDurableStorage>();
+        var hotStorage = scope.ServiceProvider.GetRequiredService<IMuleStorage>();
+
+        Assert.Same(durableStorage, replayStorage);
+        Assert.NotSame(hotStorage, replayStorage);
+        TryDelete(databasePath);
+    }
+
+    [Fact]
     public async Task EnqueueManyAsync_Should_Buffer_Batch_And_Flush_Completions_After_Intents()
     {
         using var host = CreateHost(out var databasePath);

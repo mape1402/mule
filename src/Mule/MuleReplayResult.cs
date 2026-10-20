@@ -6,7 +6,25 @@ public sealed class MuleReplayResult
 
     public MuleReplayInfo Replay { get; init; }
 
-    public Ulid OriginalActionId => Replay?.ReplayOfActionId ?? Ulid.Empty;
+    public Ulid OriginalActionId
+    {
+        get
+        {
+            if (Replay == null)
+                return Ulid.Empty;
 
-    public Ulid ReplayActionId => Replay?.ReplayActionId ?? Ulid.Empty;
+            return Replay.ReplayOfActionId;
+        }
+    }
+
+    public Ulid ReplayActionId
+    {
+        get
+        {
+            if (Replay == null)
+                return Ulid.Empty;
+
+            return Replay.ReplayActionId;
+        }
+    }
 }
