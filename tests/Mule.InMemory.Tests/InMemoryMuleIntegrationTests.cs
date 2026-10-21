@@ -54,6 +54,7 @@ public sealed class InMemoryMuleIntegrationTests
 
         var probe = host.Services.GetRequiredService<TestProbe>();
         await probe.WaitAsync();
+        await WaitForActionStatusAsync(host, DurableActionStatus.Completed);
         await host.StopAsync();
 
         Assert.Equal("hello", Assert.Single(probe.Values));
@@ -105,6 +106,7 @@ public sealed class InMemoryMuleIntegrationTests
 
         var probe = host.Services.GetRequiredService<TestProbe>();
         await probe.WaitAsync();
+        await WaitForActionStatusAsync(host, DurableActionStatus.Completed);
         await host.StopAsync();
 
         Assert.Equal("retry", Assert.Single(probe.Values));
@@ -513,6 +515,21 @@ public sealed class InMemoryMuleIntegrationTests
                 return;
 
             await Task.Delay(25, timeout.Token);
+        }
+    }
+
+    private static async Task WaitForActionStatusAsync(IHost host, DurableActionStatus expected)
+    {
+        var mule = host.Services.GetRequiredService<IInMemoryMule>();
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+
+        while (!timeout.IsCancellationRequested)
+        {
+            var actions = mule.Actions;
+            if (actions.Count == 1 && actions.Single().Status == expected)
+                return;
+
+            await Task.Delay(10, timeout.Token);
         }
     }
 
