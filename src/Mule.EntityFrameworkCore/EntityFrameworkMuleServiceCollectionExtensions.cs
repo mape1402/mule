@@ -29,6 +29,8 @@ public static class EntityFrameworkMuleServiceCollectionExtensions
             services.TryAddScoped<IMuleDurableStorage>(provider => provider.GetRequiredService<EntityFrameworkMuleStorage<TDbContext>>());
             services.TryAddScoped<IMuleStorage>(provider => provider.GetRequiredService<EntityFrameworkMuleStorage<TDbContext>>());
             services.TryAddScoped<IMuleReplayStorage>(provider => provider.GetRequiredService<EntityFrameworkMuleStorage<TDbContext>>());
+            services.TryAddScoped<IMuleCancellationStorage>(provider => provider.GetRequiredService<EntityFrameworkMuleStorage<TDbContext>>());
+            services.TryAddScoped<IMuleTerminalCancellationStorage>(provider => provider.GetRequiredService<EntityFrameworkMuleStorage<TDbContext>>());
             services.TryAddScoped<IMuleDiagnostics, EntityFrameworkMuleDiagnostics<TDbContext>>();
         });
     }
@@ -56,6 +58,8 @@ public static class EntityFrameworkMuleServiceCollectionExtensions
         services.TryAddScoped<IMuleDurableStorage>(provider => provider.GetRequiredService<EntityFrameworkMuleStorage>());
         services.TryAddScoped<IMuleStorage>(provider => provider.GetRequiredService<EntityFrameworkMuleStorage>());
         services.TryAddScoped<IMuleReplayStorage>(provider => provider.GetRequiredService<EntityFrameworkMuleStorage>());
+        services.TryAddScoped<IMuleCancellationStorage>(provider => provider.GetRequiredService<EntityFrameworkMuleStorage>());
+        services.TryAddScoped<IMuleTerminalCancellationStorage>(provider => provider.GetRequiredService<EntityFrameworkMuleStorage>());
         services.TryAddScoped<IMuleDiagnostics, EntityFrameworkMuleDiagnostics>();
 
         return services;

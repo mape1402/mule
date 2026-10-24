@@ -10,6 +10,8 @@ public sealed class MuleDiagnosticsSnapshot
 
     public int Failed { get; init; }
 
+    public int Cancelled { get; init; }
+
     public int LockExpired { get; init; }
 
     public int DuplicatesIgnored { get; init; }

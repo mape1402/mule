@@ -1,6 +1,6 @@
 namespace Mule.FastLane.InMemory;
 
-internal sealed class FastLaneInMemoryStorage : IMuleStorage
+internal sealed class FastLaneInMemoryStorage : IMuleStorage, IMuleCancellationStorage
 {
     private readonly IMuleDurableStorage _durableStorage;
     private readonly InMemoryFastLaneBuffer _buffer;
@@ -121,6 +121,20 @@ internal sealed class FastLaneInMemoryStorage : IMuleStorage
             return;
 
         await _durableStorage.MarkFailedAsync(id, error, now, nextAttemptOnUtc, cancellationToken);
+    }
+
+    public async Task<MuleCancellationResult> CancelAsync(
+        Ulid actionId,
+        DateTimeOffset cancelledOnUtc,
+        CancellationToken cancellationToken = default)
+    {
+        if (_buffer.TryCancel(actionId, cancelledOnUtc, out var result))
+            return result;
+
+        if (_durableStorage is not IMuleCancellationStorage cancellationStorage)
+            return new MuleCancellationResult(actionId, MuleCancellationOutcome.NotSupported);
+
+        return await cancellationStorage.CancelAsync(actionId, cancelledOnUtc, cancellationToken);
     }
 
     public Task<int> CleanCompletedAsync(DateTimeOffset olderThanUtc, int batchSize, CancellationToken cancellationToken = default)

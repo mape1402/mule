@@ -36,5 +36,7 @@ public sealed class DurableAction
 
     public DateTimeOffset? CompletedOnUtc { get; set; }
 
+    public DateTimeOffset? CancelledOnUtc { get; set; }
+
     public DateTimeOffset? TerminalOnUtc { get; set; }
 }

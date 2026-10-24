@@ -37,4 +37,6 @@ public sealed class MuleReplayInfo
     public string LastError { get; init; }
 
     public DateTimeOffset? MaterializedOnUtc { get; init; }
+
+    public DateTimeOffset? CancelledOnUtc { get; init; }
 }

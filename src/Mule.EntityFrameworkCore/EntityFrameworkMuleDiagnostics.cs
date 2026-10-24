@@ -93,6 +93,7 @@ internal class EntityFrameworkMuleDiagnostics<TDbContext> : IMuleDiagnostics, ID
             Locked = await actions.CountAsync(x => x.Status == DurableActionStatus.Locked, cancellationToken),
             Completed = await actions.CountAsync(x => x.Status == DurableActionStatus.Completed, cancellationToken),
             Failed = await actions.CountAsync(x => x.Status == DurableActionStatus.Failed, cancellationToken),
+            Cancelled = await actions.CountAsync(x => x.Status == DurableActionStatus.Cancelled, cancellationToken),
             LockExpired = lockedDates.Count(x => x <= lockExpiration),
             DuplicatesIgnored = runtime.DuplicatesIgnored,
             ThroughputPerMinute = Math.Max(runtime.ThroughputPerMinute, completedDates.Count(x => x >= throughputSinceUtc)),

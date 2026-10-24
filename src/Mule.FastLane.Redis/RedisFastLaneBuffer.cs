@@ -154,6 +154,32 @@ redis.call('DEL', KEYS[5])
 return 1
 """;
 
+    private const string CancelScript = """
+local payload = redis.call('GET', KEYS[1])
+if not payload then
+    return { 0, '' }
+end
+local envelope = cjson.decode(payload)
+if envelope.status == tonumber(ARGV[2]) then
+    return { 2, envelope.cancelledOnUtc or '' }
+end
+if envelope.status ~= tonumber(ARGV[1]) or redis.call('EXISTS', KEYS[3]) == 1 then
+    return { 3, '' }
+end
+envelope.status = tonumber(ARGV[2])
+envelope.cancelledOnUtc = ARGV[3]
+envelope.terminalOnUtc = ARGV[3]
+envelope.lockedOnUtc = cjson.null
+envelope.nextAttemptOnUtc = cjson.null
+envelope.concurrencyToken = ARGV[6]
+envelope.terminalDirty = true
+envelope.terminalFlushed = false
+redis.call('SET', KEYS[1], cjson.encode(envelope))
+redis.call('ZREM', KEYS[4] .. envelope.lane, ARGV[5])
+redis.call('ZADD', KEYS[2], ARGV[4], ARGV[5])
+return { 1, ARGV[3] }
+""";
+
     private readonly RedisFastLaneConnection _connection;
     private readonly FastLaneRedisOptions _options;
 
@@ -373,6 +399,41 @@ return 1
                 Ulid.NewUlid().ToString()
             ]);
         return (int)result == 1;
+    }
+
+    public async Task<MuleCancellationResult> CancelAsync(Ulid id, DateTimeOffset cancelledOnUtc)
+    {
+        var database = await _connection.GetDatabaseAsync();
+        var result = await database.ScriptEvaluateAsync(
+            CancelScript,
+            [
+                GetActionKey(id),
+                TerminalFlushKey,
+                GetLeaseKey(id),
+                $"{_connection.Prefix}:fastlane:pending:"
+            ],
+            [
+                (int)DurableActionStatus.Pending,
+                (int)DurableActionStatus.Cancelled,
+                FormatDate(cancelledOnUtc),
+                Score(cancelledOnUtc),
+                id.ToString(),
+                Ulid.NewUlid().ToString()
+            ]);
+        var values = (RedisResult[])result;
+        var outcome = (int)values[0] switch
+        {
+            1 => MuleCancellationOutcome.Cancelled,
+            2 => MuleCancellationOutcome.AlreadyCancelled,
+            3 => MuleCancellationOutcome.TooLate,
+            _ => MuleCancellationOutcome.NotFound
+        };
+        var serializedDate = (string)(RedisValue)values[1];
+        var effectiveDate = DateTimeOffset.TryParse(serializedDate, out var parsedDate)
+            ? parsedDate
+            : (DateTimeOffset?)null;
+
+        return new MuleCancellationResult(id, outcome, effectiveDate);
     }
 
     public async Task<IReadOnlyCollection<DurableAction>> TakeIntentFlushBatchAsync(int batchSize)

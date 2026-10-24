@@ -3,6 +3,7 @@ namespace Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Hosting;
 using Mule;
+using Mule.Cancellation;
 using Mule.Configuration;
 using Mule.Diagnostics;
 using Mule.Dispatching;
@@ -30,6 +31,7 @@ public static class MuleServiceCollectionExtensions
         services.TryAddSingleton<IMuleReplayCommitNotifier, AmbientTransactionMuleReplayCommitNotifier>();
         services.TryAddSingleton(TimeProvider.System);
         services.TryAddScoped<IMuleClient, MuleClient>();
+        services.TryAddScoped<IMuleCancellationService, MuleCancellationService>();
         services.TryAddScoped<IMuleReplayService, MuleReplayService>();
         services.AddSingleton<IHostedService, MuleDispatcherHostedService>();
         services.AddSingleton<IHostedService, MuleReplayHostedService>();

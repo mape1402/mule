@@ -34,6 +34,65 @@ internal sealed class InMemoryMuleStore
         }
     }
 
+    public MuleCancellationResult Cancel(Ulid actionId, DateTimeOffset now)
+    {
+        lock (_gate)
+        {
+            var action = _actions.SingleOrDefault(x => x.Id == actionId);
+            if (action != null)
+            {
+                if (action.Status == DurableActionStatus.Cancelled)
+                    return Result(actionId, MuleCancellationOutcome.AlreadyCancelled, action.CancelledOnUtc);
+                if (action.Status != DurableActionStatus.Pending)
+                    return Result(actionId, MuleCancellationOutcome.TooLate);
+
+                action.Status = DurableActionStatus.Cancelled;
+                action.CancelledOnUtc = now;
+                action.TerminalOnUtc = now;
+                action.NextAttemptOnUtc = null;
+                action.LockedOnUtc = null;
+                action.ConcurrencyToken = Ulid.NewUlid();
+                return Result(actionId, MuleCancellationOutcome.Cancelled, now);
+            }
+
+            var replay = _replays.SingleOrDefault(x => x.ReplayActionId == actionId);
+            if (replay == null)
+                return Result(actionId, MuleCancellationOutcome.NotFound);
+            if (replay.Status == MuleReplayStatus.Cancelled)
+                return Result(actionId, MuleCancellationOutcome.AlreadyCancelled, replay.CancelledOnUtc);
+            if (replay.Status != MuleReplayStatus.Scheduled || replay.LockedOnUtc != null)
+                return Result(actionId, MuleCancellationOutcome.TooLate);
+
+            replay.Status = MuleReplayStatus.Cancelled;
+            replay.CancelledOnUtc = now;
+            replay.NextAttemptOnUtc = null;
+            replay.ConcurrencyToken = Ulid.NewUlid();
+            return Result(actionId, MuleCancellationOutcome.Cancelled, now);
+        }
+    }
+
+    public bool MarkCancelled(Ulid actionId, DateTimeOffset now)
+    {
+        lock (_gate)
+        {
+            var action = _actions.SingleOrDefault(x => x.Id == actionId);
+            if (action == null)
+                return false;
+            if (action.Status == DurableActionStatus.Cancelled)
+                return true;
+            if (action.Status is not (DurableActionStatus.Pending or DurableActionStatus.Locked))
+                return false;
+
+            action.Status = DurableActionStatus.Cancelled;
+            action.CancelledOnUtc = now;
+            action.TerminalOnUtc = now;
+            action.NextAttemptOnUtc = null;
+            action.LockedOnUtc = null;
+            action.ConcurrencyToken = Ulid.NewUlid();
+            return true;
+        }
+    }
+
     public MuleReplayResult ScheduleReplay(Ulid sourceActionId, MuleReplayRequest request, DateTimeOffset now)
     {
         lock (_gate)
@@ -353,6 +412,7 @@ internal sealed class InMemoryMuleStore
                 Locked = _actions.Count(x => x.Status == DurableActionStatus.Locked),
                 Completed = _actions.Count(x => x.Status == DurableActionStatus.Completed),
                 Failed = _actions.Count(x => x.Status == DurableActionStatus.Failed),
+                Cancelled = _actions.Count(x => x.Status == DurableActionStatus.Cancelled),
                 LockExpired = _actions.Count(x => x.Status == DurableActionStatus.Locked && x.LockedOnUtc <= lockExpiration),
                 DuplicatesIgnored = runtime.DuplicatesIgnored,
                 ThroughputPerMinute = Math.Max(
@@ -427,6 +487,7 @@ internal sealed class InMemoryMuleStore
             StartedOnUtc = action.StartedOnUtc,
             NextAttemptOnUtc = action.NextAttemptOnUtc,
             CompletedOnUtc = action.CompletedOnUtc,
+            CancelledOnUtc = action.CancelledOnUtc,
             TerminalOnUtc = action.TerminalOnUtc
         };
 
@@ -455,8 +516,15 @@ internal sealed class InMemoryMuleStore
             LastError = replay.LastError,
             LockedOnUtc = replay.LockedOnUtc,
             LockToken = replay.LockToken,
-            MaterializedOnUtc = replay.MaterializedOnUtc
+            MaterializedOnUtc = replay.MaterializedOnUtc,
+            CancelledOnUtc = replay.CancelledOnUtc
         };
+
+    private static MuleCancellationResult Result(
+        Ulid actionId,
+        MuleCancellationOutcome outcome,
+        DateTimeOffset? cancelledOnUtc = null)
+        => new(actionId, outcome, cancelledOnUtc);
 
     private static bool IsBacklog(DurableAction action)
         => action.Status is DurableActionStatus.Pending or DurableActionStatus.Locked;

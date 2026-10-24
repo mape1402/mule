@@ -1,6 +1,6 @@
 namespace Mule.FastLane.Redis;
 
-internal sealed class FastLaneRedisStorage : IMuleStorage
+internal sealed class FastLaneRedisStorage : IMuleStorage, IMuleCancellationStorage
 {
     private readonly IMuleDurableStorage _durableStorage;
     private readonly RedisFastLaneBuffer _buffer;
@@ -122,6 +122,21 @@ internal sealed class FastLaneRedisStorage : IMuleStorage
             return;
 
         await _durableStorage.MarkFailedAsync(id, error, now, nextAttemptOnUtc, cancellationToken);
+    }
+
+    public async Task<MuleCancellationResult> CancelAsync(
+        Ulid actionId,
+        DateTimeOffset cancelledOnUtc,
+        CancellationToken cancellationToken = default)
+    {
+        var buffered = await _buffer.CancelAsync(actionId, cancelledOnUtc);
+        if (buffered.Outcome != MuleCancellationOutcome.NotFound)
+            return buffered;
+
+        if (_durableStorage is not IMuleCancellationStorage cancellationStorage)
+            return new MuleCancellationResult(actionId, MuleCancellationOutcome.NotSupported);
+
+        return await cancellationStorage.CancelAsync(actionId, cancelledOnUtc, cancellationToken);
     }
 
     public Task<int> CleanCompletedAsync(DateTimeOffset olderThanUtc, int batchSize, CancellationToken cancellationToken = default)

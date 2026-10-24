@@ -3,7 +3,11 @@ namespace Mule.InMemory;
 using System.Transactions;
 using Mule.Diagnostics;
 
-internal sealed class InMemoryMuleStorage : IMuleDurableStorage, IMuleReplayStorage
+internal sealed class InMemoryMuleStorage :
+    IMuleDurableStorage,
+    IMuleReplayStorage,
+    IMuleCancellationStorage,
+    IMuleTerminalCancellationStorage
 {
     private readonly InMemoryMuleStore _store;
     private readonly MuleRuntimeMetrics _metrics;
@@ -85,6 +89,18 @@ internal sealed class InMemoryMuleStorage : IMuleDurableStorage, IMuleReplayStor
 
     public Task<DateTimeOffset?> GetOldestCompletedOnUtcAsync(CancellationToken cancellationToken = default)
         => Task.FromResult(_store.GetOldestCompletedOnUtc());
+
+    public Task<MuleCancellationResult> CancelAsync(
+        Ulid actionId,
+        DateTimeOffset now,
+        CancellationToken cancellationToken = default)
+        => Task.FromResult(_store.Cancel(actionId, now));
+
+    public Task<bool> MarkCancelledAsync(
+        Ulid actionId,
+        DateTimeOffset cancelledOnUtc,
+        CancellationToken cancellationToken = default)
+        => Task.FromResult(_store.MarkCancelled(actionId, cancelledOnUtc));
 
     public Task<MuleReplayResult> ScheduleAsync(
         Ulid sourceActionId,
