@@ -4,6 +4,7 @@ using System.Reflection;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
+using NSubstitute;
 
 public sealed class FastLaneInMemoryCoverageTests
 {
@@ -150,6 +151,44 @@ public sealed class FastLaneInMemoryCoverageTests
     }
 
     [Fact]
+    public async Task Cancellation_Should_Cover_Buffer_Outcomes_And_Durable_Fallbacks()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var buffer = new InMemoryFastLaneBuffer();
+        var pending = CreateAction("cancel-pending", now);
+        var locked = CreateAction("cancel-locked", now, DurableActionStatus.Locked, now);
+        Assert.True(buffer.TryAdd(pending));
+        Assert.True(buffer.TryAdd(locked));
+
+        Assert.False(buffer.TryCancel(Ulid.NewUlid(), now, out var missing));
+        Assert.Null(missing);
+        Assert.True(buffer.TryCancel(pending.Id, now, out var cancelled));
+        Assert.Equal(MuleCancellationOutcome.Cancelled, cancelled.Outcome);
+        Assert.True(buffer.TryCancel(pending.Id, now.AddMinutes(1), out var repeated));
+        Assert.Equal(MuleCancellationOutcome.AlreadyCancelled, repeated.Outcome);
+        Assert.Equal(now, repeated.CancelledOnUtc);
+        Assert.True(buffer.TryCancel(locked.Id, now, out var tooLate));
+        Assert.Equal(MuleCancellationOutcome.TooLate, tooLate.Outcome);
+        Assert.Contains(
+            buffer.TakeIntentFlushBatch(10),
+            x => x.Id == pending.Id && x.Status == DurableActionStatus.Cancelled);
+
+        var unsupported = Substitute.For<IMuleDurableStorage>();
+        var unsupportedStorage = new FastLaneInMemoryStorage(unsupported, new InMemoryFastLaneBuffer());
+        Assert.Equal(
+            MuleCancellationOutcome.NotSupported,
+            (await unsupportedStorage.CancelAsync(Ulid.NewUlid(), now)).Outcome);
+
+        var supported = Substitute.For<IMuleDurableStorage, IMuleCancellationStorage>();
+        var expected = new MuleCancellationResult(Ulid.NewUlid(), MuleCancellationOutcome.Cancelled, now);
+        ((IMuleCancellationStorage)supported)
+            .CancelAsync(expected.ActionId, now, Arg.Any<CancellationToken>())
+            .Returns(expected);
+        var supportedStorage = new FastLaneInMemoryStorage(supported, new InMemoryFastLaneBuffer());
+        Assert.Same(expected, await supportedStorage.CancelAsync(expected.ActionId, now));
+    }
+
+    [Fact]
     public async Task GetNextPendingOnUtcAsync_Should_Return_Earlier_Durable_Due_Time()
     {
         var now = DateTimeOffset.UtcNow;
@@ -234,6 +273,35 @@ public sealed class FastLaneInMemoryCoverageTests
     }
 
     [Fact]
+    public async Task FlushService_Should_Reject_Unsupported_Or_Rejected_Cancellation()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var unsupported = Substitute.For<IMuleDurableStorage>();
+        var unsupportedBuffer = new InMemoryFastLaneBuffer();
+        var unsupportedAction = CreateAction("unsupported-cancel", now);
+        unsupportedBuffer.TryAdd(unsupportedAction);
+        var unsupportedService = CreateService(unsupportedBuffer, unsupported);
+        await InvokeFlushOnceAsync(unsupportedService);
+        unsupportedBuffer.TryCancel(unsupportedAction.Id, now, out _);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => InvokeFlushOnceAsync(unsupportedService));
+
+        var rejecting = Substitute.For<IMuleDurableStorage, IMuleTerminalCancellationStorage>();
+        ((IMuleTerminalCancellationStorage)rejecting)
+            .MarkCancelledAsync(Arg.Any<Ulid>(), Arg.Any<DateTimeOffset>(), Arg.Any<CancellationToken>())
+            .Returns(false);
+        var rejectingBuffer = new InMemoryFastLaneBuffer();
+        var rejectingAction = CreateAction("rejected-cancel", now);
+        rejectingBuffer.TryAdd(rejectingAction);
+        var rejectingService = CreateService(rejectingBuffer, rejecting);
+        await InvokeFlushOnceAsync(rejectingService);
+        rejectingBuffer.TryCancel(rejectingAction.Id, now, out _);
+        GetBufferedAction(rejectingBuffer, rejectingAction.Id).CancelledOnUtc = null;
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => InvokeFlushOnceAsync(rejectingService));
+    }
+
+    [Fact]
     public void Registration_And_Options_Should_Validate_Nulls()
     {
         Assert.Throws<ArgumentNullException>(() => new FastLaneInMemoryStorage(null, new InMemoryFastLaneBuffer()));
@@ -280,6 +348,7 @@ public sealed class FastLaneInMemoryCoverageTests
         terminalMatrix.CompleteIntentFlush([matrixAction.Id]);
         Assert.Empty(terminalMatrix.TakeTerminalFlushBatch(1));
         terminalMatrix.MarkCompleted(matrixAction.Id, now);
+        GetBufferedAction(terminalMatrix, matrixAction.Id).TerminalOnUtc = null;
         Assert.Single(terminalMatrix.TakeTerminalFlushBatch(1));
         Assert.Empty(terminalMatrix.TakeTerminalFlushBatch(1));
     }
@@ -301,7 +370,7 @@ public sealed class FastLaneInMemoryCoverageTests
 
     private static FastLaneInMemoryFlushService CreateService(
         InMemoryFastLaneBuffer buffer,
-        RecordingDurableStorage durable,
+        IMuleDurableStorage durable,
         TimeSpan? flushInterval = null)
     {
         var services = new ServiceCollection()

@@ -80,6 +80,37 @@ public sealed class SqlServerMuleTests
     }
 
     [SqlServerFact]
+    public async Task Cancel_And_Claim_Should_Have_A_Single_Winner_Across_Replicas()
+    {
+        using var database = SqlServerTestDatabase.Create();
+        using var host = CreateHost(database.ConnectionString);
+        await EnsureDatabaseAsync(host);
+        var actionId = await InsertActionAsync(host, DurableActionStatus.Pending);
+        var now = DateTimeOffset.UtcNow;
+        using var cancelScope = host.Services.CreateScope();
+        using var claimScope = host.Services.CreateScope();
+        var cancellationStorage = cancelScope.ServiceProvider.GetRequiredService<IMuleCancellationStorage>();
+        var actionStorage = claimScope.ServiceProvider.GetRequiredService<IMuleStorage>();
+
+        var cancellationTask = cancellationStorage.CancelAsync(actionId, now);
+        var claimTask = actionStorage.LockAsync(actionId, TimeSpan.FromMinutes(5), now);
+        await Task.WhenAll(cancellationTask, claimTask);
+
+        var cancellation = await cancellationTask;
+        var claim = await claimTask;
+        Assert.True(
+            (cancellation.IsCancelled && claim == null) ||
+            (cancellation.Outcome == MuleCancellationOutcome.TooLate && claim != null));
+
+        using var verificationScope = host.Services.CreateScope();
+        var db = verificationScope.ServiceProvider.GetRequiredService<MuleDbContext>();
+        var status = await db.Actions.AsNoTracking().Select(x => x.Status).SingleAsync();
+        Assert.Equal(
+            cancellation.IsCancelled ? DurableActionStatus.Cancelled : DurableActionStatus.Locked,
+            status);
+    }
+
+    [SqlServerFact]
     public async Task EnqueueManyAsync_Should_Persist_Batch()
     {
         using var database = SqlServerTestDatabase.Create();

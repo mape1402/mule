@@ -16,6 +16,52 @@ public sealed class RedisFastLaneTests
     private static readonly ActionKey Key = ActionKey.From("tests.fastlane.redis.capture.v1");
 
     [RedisFact]
+    public async Task CancelAsync_Should_Stop_Buffered_Action_And_Flush_Cancelled_State()
+    {
+        var keyPrefix = $"mule-tests:{Guid.NewGuid():N}";
+        using var host = CreateHost(out var databasePath, keyPrefix);
+
+        try
+        {
+            await EnsureDatabaseAsync(host);
+            Ulid id;
+            MuleCancellationResult result;
+            using (var scope = host.Services.CreateScope())
+            {
+                var hotStorage = scope.ServiceProvider.GetRequiredService<IMuleStorage>();
+                Assert.Same(hotStorage, scope.ServiceProvider.GetRequiredService<IMuleCancellationStorage>());
+                id = await scope.ServiceProvider
+                    .GetRequiredService<IMuleClient>()
+                    .EnqueueAsync(Key, new TestPayload("cancelled"));
+                result = await scope.ServiceProvider
+                    .GetRequiredService<IMuleCancellationService>()
+                    .CancelAsync(id);
+            }
+
+            await host.StartAsync();
+            await WaitForDurableCountAsync(host, DurableActionStatus.Cancelled, 1, keyPrefix);
+            await Task.Delay(100);
+
+            using (var scope = host.Services.CreateScope())
+            {
+                var repeated = await scope.ServiceProvider
+                    .GetRequiredService<IMuleCancellationService>()
+                    .CancelAsync(id);
+                Assert.Equal(MuleCancellationOutcome.AlreadyCancelled, repeated.Outcome);
+            }
+
+            await host.StopAsync();
+            Assert.Equal(MuleCancellationOutcome.Cancelled, result.Outcome);
+            Assert.Empty(host.Services.GetRequiredService<TestProbe>().Values);
+        }
+        finally
+        {
+            await CleanupRedisAsync(keyPrefix);
+            TryDelete(databasePath);
+        }
+    }
+
+    [RedisFact]
     public async Task EnqueueManyAsync_Should_Buffer_In_Redis_And_Flush_Durable_State_In_Order()
     {
         var keyPrefix = $"mule-tests:{Guid.NewGuid():N}";

@@ -472,7 +472,11 @@ public sealed class CoreCoverageTests
         metrics.RecordExecutorSaturation("blue");
         metrics.RecordWaitingExecution("blue", now.AddSeconds(-5));
         metrics.RecordExecutionStarted("blue", now.AddSeconds(-5), now);
+        metrics.RecordExecutionStarted("blue", now.AddSeconds(-4), now);
+        metrics.RecordExecutionStarted("never-queued", now.AddSeconds(-3), now);
         metrics.RecordExecutionStopped("blue");
+        metrics.RecordExecutionStopped("blue");
+        metrics.RecordExecutionStopped("never-queued");
         metrics.RecordWaitingExecutionCanceled("missing");
 
         var snapshot = metrics.GetSnapshot(now);
