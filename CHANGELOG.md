@@ -4,6 +4,8 @@ All notable changes to Mule packages will be documented in this file.
 
 ## [Unreleased]
 
+## [v2.2.0] - 2026-10-24
+
 ### Added
 
 - Added `IMuleCancellationService` for durable, idempotent cancellation of pending actions and scheduled replays by action ULID.
