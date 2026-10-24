@@ -50,6 +50,7 @@ public static class MuleModelBuilderExtensions
             entity.Property(x => x.Status).IsRequired();
             entity.Property(x => x.LastError);
             entity.Property(x => x.StartedOnUtc);
+            entity.Property(x => x.CancelledOnUtc);
             entity.Property(x => x.TerminalOnUtc);
             entity.HasIndex(x => new { x.Lane, x.Status, x.NextAttemptOnUtc, x.CreatedOnUtc });
             entity.HasIndex(x => new { x.Status, x.LockedOnUtc });
@@ -87,6 +88,7 @@ public static class MuleModelBuilderExtensions
             entity.Property(x => x.Reason);
             entity.Property(x => x.Metadata);
             entity.Property(x => x.LastError);
+            entity.Property(x => x.CancelledOnUtc);
             entity.HasIndex(x => x.ReplayActionId).IsUnique();
             entity.HasIndex(x => new { x.SourceActionId, x.BranchId }).IsUnique();
             entity.HasIndex(x => new { x.Status, x.ScheduleOnUtc, x.NextAttemptOnUtc });

@@ -381,7 +381,8 @@ internal partial class EntityFrameworkMuleStorage<TDbContext>
             LastError = replay.LastError,
             LockedOnUtc = replay.LockedOnUtc,
             LockToken = replay.LockToken,
-            MaterializedOnUtc = replay.MaterializedOnUtc
+            MaterializedOnUtc = replay.MaterializedOnUtc,
+            CancelledOnUtc = replay.CancelledOnUtc
         };
 
     private static MuleReplayResult ExistingRequestResult(

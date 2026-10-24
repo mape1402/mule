@@ -21,7 +21,11 @@ public static class MuleFastLaneInMemoryRegistrationBuilderExtensions
 
             services.AddOptions<FastLaneInMemoryOptions>();
             services.TryAddSingleton<InMemoryFastLaneBuffer>();
-            services.Replace(ServiceDescriptor.Scoped<IMuleStorage, FastLaneInMemoryStorage>());
+            services.Replace(ServiceDescriptor.Scoped<FastLaneInMemoryStorage, FastLaneInMemoryStorage>());
+            services.Replace(ServiceDescriptor.Scoped<IMuleStorage>(provider =>
+                provider.GetRequiredService<FastLaneInMemoryStorage>()));
+            services.Replace(ServiceDescriptor.Scoped<IMuleCancellationStorage>(provider =>
+                provider.GetRequiredService<FastLaneInMemoryStorage>()));
             services.AddHostedService<FastLaneInMemoryFlushService>();
         });
     }

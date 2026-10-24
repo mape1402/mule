@@ -23,7 +23,11 @@ public static class MuleFastLaneRedisRegistrationBuilderExtensions
             services.AddOptions<FastLaneRedisOptions>();
             services.TryAddSingleton<RedisFastLaneConnection>();
             services.TryAddSingleton<RedisFastLaneBuffer>();
-            services.Replace(ServiceDescriptor.Scoped<IMuleStorage, FastLaneRedisStorage>());
+            services.Replace(ServiceDescriptor.Scoped<FastLaneRedisStorage, FastLaneRedisStorage>());
+            services.Replace(ServiceDescriptor.Scoped<IMuleStorage>(provider =>
+                provider.GetRequiredService<FastLaneRedisStorage>()));
+            services.Replace(ServiceDescriptor.Scoped<IMuleCancellationStorage>(provider =>
+                provider.GetRequiredService<FastLaneRedisStorage>()));
             services.AddHostedService<FastLaneRedisFlushService>();
         });
     }

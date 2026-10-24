@@ -109,6 +109,21 @@ internal sealed class FastLaneInMemoryFlushService : BackgroundService
                         action.TerminalOnUtc ?? DateTimeOffset.UtcNow,
                         null,
                         cancellationToken);
+                    continue;
+                }
+
+                if (action.Status == DurableActionStatus.Cancelled)
+                {
+                    if (durableStorage is not IMuleTerminalCancellationStorage cancellationStorage)
+                        throw new InvalidOperationException("The durable storage does not support cancellation.");
+
+                    var cancelled = await cancellationStorage.MarkCancelledAsync(
+                        action.Id,
+                        action.CancelledOnUtc ?? DateTimeOffset.UtcNow,
+                        cancellationToken);
+
+                    if (!cancelled)
+                        throw new InvalidOperationException($"Could not flush cancellation for action '{action.Id}'.");
                 }
             }
 

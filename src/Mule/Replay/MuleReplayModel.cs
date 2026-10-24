@@ -67,7 +67,8 @@ internal static class MuleReplayModel
             Metadata = DeserializeMetadata(replay.Metadata),
             MaterializationAttempts = replay.Attempts,
             LastError = replay.LastError,
-            MaterializedOnUtc = replay.MaterializedOnUtc
+            MaterializedOnUtc = replay.MaterializedOnUtc,
+            CancelledOnUtc = replay.CancelledOnUtc
         };
     }
 

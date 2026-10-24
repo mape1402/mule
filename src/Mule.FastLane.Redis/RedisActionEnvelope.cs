@@ -36,6 +36,8 @@ internal sealed class RedisActionEnvelope
 
     public DateTimeOffset? CompletedOnUtc { get; set; }
 
+    public DateTimeOffset? CancelledOnUtc { get; set; }
+
     public DateTimeOffset? TerminalOnUtc { get; set; }
 
     public bool IntentPersisted { get; set; }
@@ -70,6 +72,7 @@ internal sealed class RedisActionEnvelope
             StartedOnUtc = StartedOnUtc,
             NextAttemptOnUtc = NextAttemptOnUtc,
             CompletedOnUtc = CompletedOnUtc,
+            CancelledOnUtc = CancelledOnUtc,
             TerminalOnUtc = TerminalOnUtc
         };
 
@@ -93,6 +96,7 @@ internal sealed class RedisActionEnvelope
             StartedOnUtc = action.StartedOnUtc,
             NextAttemptOnUtc = action.NextAttemptOnUtc,
             CompletedOnUtc = action.CompletedOnUtc,
+            CancelledOnUtc = action.CancelledOnUtc,
             TerminalOnUtc = action.TerminalOnUtc
         };
 }

@@ -47,4 +47,6 @@ public sealed class MuleReplay
     public Ulid LockToken { get; set; }
 
     public DateTimeOffset? MaterializedOnUtc { get; set; }
+
+    public DateTimeOffset? CancelledOnUtc { get; set; }
 }

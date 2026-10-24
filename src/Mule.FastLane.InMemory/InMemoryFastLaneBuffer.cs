@@ -141,6 +141,44 @@ internal sealed class InMemoryFastLaneBuffer
         }
     }
 
+    public bool TryCancel(Ulid id, DateTimeOffset cancelledOnUtc, out MuleCancellationResult result)
+    {
+        lock (_gate)
+        {
+            if (!_actions.TryGetValue(id, out var buffered))
+            {
+                result = null;
+                return false;
+            }
+
+            if (buffered.Action.Status == DurableActionStatus.Cancelled)
+            {
+                result = new MuleCancellationResult(
+                    id,
+                    MuleCancellationOutcome.AlreadyCancelled,
+                    buffered.Action.CancelledOnUtc);
+                return true;
+            }
+
+            if (buffered.Action.Status != DurableActionStatus.Pending)
+            {
+                result = new MuleCancellationResult(id, MuleCancellationOutcome.TooLate);
+                return true;
+            }
+
+            buffered.Action.Status = DurableActionStatus.Cancelled;
+            buffered.Action.CancelledOnUtc = cancelledOnUtc;
+            buffered.Action.TerminalOnUtc = cancelledOnUtc;
+            buffered.Action.LockedOnUtc = null;
+            buffered.Action.NextAttemptOnUtc = null;
+            buffered.Action.ConcurrencyToken = Ulid.NewUlid();
+            buffered.TerminalDirty = true;
+            buffered.TerminalFlushed = false;
+            result = new MuleCancellationResult(id, MuleCancellationOutcome.Cancelled, cancelledOnUtc);
+            return true;
+        }
+    }
+
     public IReadOnlyCollection<DurableAction> TakeIntentFlushBatch(int batchSize)
     {
         lock (_gate)
@@ -274,9 +312,10 @@ internal sealed class InMemoryFastLaneBuffer
     private static DurableAction CloneForDurableIntent(DurableAction action)
     {
         var clone = Clone(action);
-        if (clone.Status is DurableActionStatus.Completed or DurableActionStatus.Failed)
+        if (clone.Status is DurableActionStatus.Pending or DurableActionStatus.Completed or DurableActionStatus.Failed)
         {
             clone.Status = DurableActionStatus.Locked;
+            clone.LockedOnUtc ??= DateTimeOffset.UtcNow;
             if (action.Status == DurableActionStatus.Failed)
                 clone.Attempts = Math.Max(0, action.Attempts - 1);
             clone.CompletedOnUtc = null;
@@ -307,6 +346,7 @@ internal sealed class InMemoryFastLaneBuffer
             StartedOnUtc = action.StartedOnUtc,
             NextAttemptOnUtc = action.NextAttemptOnUtc,
             CompletedOnUtc = action.CompletedOnUtc,
+            CancelledOnUtc = action.CancelledOnUtc,
             TerminalOnUtc = action.TerminalOnUtc
         };
 
