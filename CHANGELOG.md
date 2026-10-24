@@ -4,6 +4,14 @@ All notable changes to Mule packages will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- Added `IMuleCancellationService` for durable, idempotent cancellation of pending actions and scheduled replays by action ULID.
+- Added replica-safe cancellation transitions for InMemory and EF Core storage, including optimistic concurrency against worker claims.
+- Added atomic FastLane cancellation for in-process and Redis buffers with ordered durable terminal flushing.
+- Added `Cancelled` action and replay states, cancellation timestamps, and cancelled action diagnostics.
+- Added focused unit, SQLite, Redis, and SQL Server coverage for cancellation outcomes, idempotency, replay cancellation, and claim races.
+
 ## [v2.1.0] - 2026-10-20
 
 ### Added
