@@ -20,9 +20,47 @@ public sealed class FastLaneInMemoryTests
         var replayStorage = scope.ServiceProvider.GetRequiredService<IMuleReplayStorage>();
         var durableStorage = scope.ServiceProvider.GetRequiredService<IMuleDurableStorage>();
         var hotStorage = scope.ServiceProvider.GetRequiredService<IMuleStorage>();
+        var cancellationStorage = scope.ServiceProvider.GetRequiredService<IMuleCancellationStorage>();
 
         Assert.Same(durableStorage, replayStorage);
         Assert.NotSame(hotStorage, replayStorage);
+        Assert.Same(hotStorage, cancellationStorage);
+        TryDelete(databasePath);
+    }
+
+    [Fact]
+    public async Task CancelAsync_Should_Stop_Buffered_Action_And_Flush_Cancelled_State()
+    {
+        using var host = CreateHost(out var databasePath);
+        await EnsureDatabaseAsync(host);
+        Ulid id;
+        MuleCancellationResult result;
+
+        using (var scope = host.Services.CreateScope())
+        {
+            id = await scope.ServiceProvider
+                .GetRequiredService<IMuleClient>()
+                .EnqueueAsync(Key, new TestPayload("cancelled"));
+            result = await scope.ServiceProvider
+                .GetRequiredService<IMuleCancellationService>()
+                .CancelAsync(id);
+        }
+
+        await host.StartAsync();
+        await WaitForDurableCountAsync(host, DurableActionStatus.Cancelled, 1);
+        await Task.Delay(100);
+
+        using (var scope = host.Services.CreateScope())
+        {
+            var repeated = await scope.ServiceProvider
+                .GetRequiredService<IMuleCancellationService>()
+                .CancelAsync(id);
+            Assert.Equal(MuleCancellationOutcome.AlreadyCancelled, repeated.Outcome);
+        }
+
+        await host.StopAsync();
+        Assert.Equal(MuleCancellationOutcome.Cancelled, result.Outcome);
+        Assert.Empty(host.Services.GetRequiredService<TestProbe>().Values);
         TryDelete(databasePath);
     }
 

@@ -266,6 +266,32 @@ public sealed class ReplayCoreTests
     }
 
     [Fact]
+    public void ReplayResult_Should_Expose_NonEmpty_Action_Ids()
+    {
+        var sourceId = Ulid.NewUlid();
+        var replayId = Ulid.NewUlid();
+        var result = new MuleReplayResult
+        {
+            Outcome = MuleReplayOutcome.Scheduled,
+            Replay = new MuleReplayInfo
+            {
+                RequestId = Ulid.NewUlid(),
+                ReplayOfActionId = sourceId,
+                ReplayRootActionId = sourceId,
+                ReplayActionId = replayId,
+                ReplaySequence = 1,
+                Status = MuleReplayStatus.Scheduled,
+                ActionKey = Key,
+                RequestedOnUtc = DateTimeOffset.UtcNow,
+                ScheduleOnUtc = DateTimeOffset.UtcNow
+            }
+        };
+
+        Assert.Equal(sourceId, result.OriginalActionId);
+        Assert.Equal(replayId, result.ReplayActionId);
+    }
+
+    [Fact]
     public async Task ReplayCommitNotifier_Should_Not_Signal_Rolled_Back_Transaction()
     {
         var signal = new MuleSchedulerSignal();

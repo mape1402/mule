@@ -31,6 +31,9 @@ public sealed class RedisCoverageTests
         Assert.Equal(action.Id, restored.Id);
         Assert.Equal(action.CompletedOnUtc, restored.CompletedOnUtc);
 
+        envelope.Lane = " ";
+        Assert.Equal(MuleSettings.DefaultLane, envelope.ToAction().Lane);
+
         action.Lane = "named";
         Assert.Equal("named", RedisActionEnvelope.FromAction(action).ToAction().Lane);
     }
@@ -53,6 +56,8 @@ public sealed class RedisCoverageTests
         var active = CreateAction("active", now, DurableActionStatus.Locked, lockedOnUtc: now);
         var expired = CreateAction("expired", now.AddSeconds(-4), DurableActionStatus.Locked, lockedOnUtc: now.AddMinutes(-10));
         var lockOnly = CreateAction("lock-only", now.AddSeconds(-5));
+        var cancel = CreateAction("cancel", now.AddSeconds(-7));
+        var leasedCancel = CreateAction("leased-cancel", now.AddSeconds(-8));
         var otherLane = CreateAction("other-lane", now.AddSeconds(-6));
         otherLane.Lane = "Lane-B";
 
@@ -69,7 +74,18 @@ public sealed class RedisCoverageTests
             Assert.Null(await buffer.FindByDeduplicationKeyAsync(Key, ""));
             Assert.Null(await buffer.LockAsync(Ulid.NewUlid(), TimeSpan.FromMinutes(1), now));
 
-            await buffer.TryAddRangeAsync([retry, future, active, expired, lockOnly, otherLane]);
+            await buffer.TryAddRangeAsync([retry, future, active, expired, lockOnly, cancel, leasedCancel, otherLane]);
+            Assert.Equal(MuleCancellationOutcome.NotFound, (await buffer.CancelAsync(Ulid.NewUlid(), now)).Outcome);
+            Assert.Equal(MuleCancellationOutcome.Cancelled, (await buffer.CancelAsync(cancel.Id, now)).Outcome);
+            var repeatedCancellation = await buffer.CancelAsync(cancel.Id, now.AddMinutes(1));
+            Assert.Equal(MuleCancellationOutcome.AlreadyCancelled, repeatedCancellation.Outcome);
+            Assert.Equal(now, repeatedCancellation.CancelledOnUtc);
+            var cancellationDatabase = await connection.GetDatabaseAsync();
+            await cancellationDatabase.StringSetAsync(
+                $"{prefix}:fastlane:lease:{leasedCancel.Id}",
+                "claim-owner",
+                TimeSpan.FromMinutes(1));
+            Assert.Equal(MuleCancellationOutcome.TooLate, (await buffer.CancelAsync(leasedCancel.Id, now)).Outcome);
             Assert.NotNull(await buffer.LockAsync(expired.Id, TimeSpan.FromMinutes(1), now));
             Assert.NotNull(await buffer.LockAsync(lockOnly.Id, TimeSpan.FromMinutes(1), now));
             Assert.Null(await buffer.LockAsync(lockOnly.Id, TimeSpan.FromMinutes(1), now));
@@ -193,6 +209,20 @@ public sealed class RedisCoverageTests
 
             Assert.True(durable.MarkCompletedCalled);
             Assert.True(durable.MarkFailedCalled);
+
+            var unsupported = Substitute.For<IMuleDurableStorage>();
+            var unsupportedStorage = new FastLaneRedisStorage(unsupported, buffer);
+            Assert.Equal(
+                MuleCancellationOutcome.NotSupported,
+                (await unsupportedStorage.CancelAsync(Ulid.NewUlid(), now)).Outcome);
+
+            var supported = Substitute.For<IMuleDurableStorage, IMuleCancellationStorage>();
+            var expected = new MuleCancellationResult(Ulid.NewUlid(), MuleCancellationOutcome.Cancelled, now);
+            ((IMuleCancellationStorage)supported)
+                .CancelAsync(expected.ActionId, now, Arg.Any<CancellationToken>())
+                .Returns(expected);
+            var supportedStorage = new FastLaneRedisStorage(supported, buffer);
+            Assert.Same(expected, await supportedStorage.CancelAsync(expected.ActionId, now));
         }
         finally
         {
@@ -337,6 +367,33 @@ public sealed class RedisCoverageTests
             Assert.True(await buffer.MarkCompletedAsync(nonBatchNullDate.Id, now));
             await ClearCompletedDateAsync(connection, nonBatchNullDate.Id);
             await InvokeFlushOnceAsync(nonBatchService);
+
+            var unsupportedCancellation = Substitute.For<IMuleDurableStorage>();
+            var unsupportedCancellationAction = CreateAction("unsupported-cancellation", now);
+            await buffer.TryAddAsync(unsupportedCancellationAction);
+            var unsupportedCancellationService = CreateFlushService(buffer, unsupportedCancellation);
+            await InvokeFlushOnceAsync(unsupportedCancellationService);
+            Assert.Equal(
+                MuleCancellationOutcome.Cancelled,
+                (await buffer.CancelAsync(unsupportedCancellationAction.Id, now)).Outcome);
+            await Assert.ThrowsAsync<InvalidOperationException>(() =>
+                InvokeFlushOnceAsync(unsupportedCancellationService));
+            await buffer.CompleteTerminalFlushAsync([unsupportedCancellationAction.Id]);
+
+            var rejectedCancellation = Substitute.For<IMuleDurableStorage, IMuleTerminalCancellationStorage>();
+            ((IMuleTerminalCancellationStorage)rejectedCancellation)
+                .MarkCancelledAsync(Arg.Any<Ulid>(), Arg.Any<DateTimeOffset>(), Arg.Any<CancellationToken>())
+                .Returns(false);
+            var rejectedCancellationAction = CreateAction("rejected-cancellation", now);
+            await buffer.TryAddAsync(rejectedCancellationAction);
+            var rejectedCancellationService = CreateFlushService(buffer, rejectedCancellation);
+            await InvokeFlushOnceAsync(rejectedCancellationService);
+            Assert.Equal(
+                MuleCancellationOutcome.Cancelled,
+                (await buffer.CancelAsync(rejectedCancellationAction.Id, now)).Outcome);
+            await ClearCancelledDateAsync(connection, rejectedCancellationAction.Id);
+            await Assert.ThrowsAsync<InvalidOperationException>(() =>
+                InvokeFlushOnceAsync(rejectedCancellationService));
         }
         finally
         {
@@ -560,6 +617,17 @@ public sealed class RedisCoverageTests
         var options = new JsonSerializerOptions(JsonSerializerDefaults.Web);
         var envelope = JsonSerializer.Deserialize<RedisActionEnvelope>((string)value, options);
         envelope.CompletedOnUtc = null;
+        await database.StringSetAsync(key, JsonSerializer.Serialize(envelope, options));
+    }
+
+    private static async Task ClearCancelledDateAsync(RedisFastLaneConnection connection, Ulid id)
+    {
+        var database = await connection.GetDatabaseAsync();
+        var key = $"{connection.Prefix}:fastlane:action:{id}";
+        var value = await database.StringGetAsync(key);
+        var options = new JsonSerializerOptions(JsonSerializerDefaults.Web);
+        var envelope = JsonSerializer.Deserialize<RedisActionEnvelope>((string)value, options);
+        envelope.CancelledOnUtc = null;
         await database.StringSetAsync(key, JsonSerializer.Serialize(envelope, options));
     }
 
