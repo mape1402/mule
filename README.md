@@ -411,7 +411,7 @@ services.AddMule(mule => mule
     .AddActionsFromAssemblyContaining<SendReceiptAction>());
 ```
 
-With FastLane InMemory, `EnqueueAsync` and `EnqueueManyAsync` acknowledge after the intent is accepted by the in-process buffer. Mule can execute that buffered work immediately, while a background flusher persists intents to the durable provider in batches. Terminal states are also buffered and flushed after their intents have been persisted, so durable storage observes the intent before `Completed` or `Failed`.
+With FastLane InMemory, `EnqueueAsync` and `EnqueueManyAsync` acknowledge after the intent is accepted by the in-process buffer. Mule can execute that buffered work immediately, while a background flusher persists intents to the durable provider in batches. Terminal states are also buffered and flushed after their intents have been persisted, so durable storage observes the intent before `Completed`, `Failed`, or `Cancelled`.
 
 This mode is faster than direct EF Core writes, but it is intentionally less durable. If the process exits before a flush, buffered intents or terminal updates that have not reached the durable provider can be lost. Use it when the producer can tolerate that window.
 
@@ -477,7 +477,7 @@ services.AddMule(mule => mule
 
 When multiple connection options are provided, Mule resolves Redis in this order: `ConnectionFactory`, `ConfigurationOptions`, then `ConnectionString`. Mule disposes internally-created connections by default. When using a shared connection from DI, set `DisposeConnection = false` so the application keeps ownership.
 
-Intent and terminal flush batches are claimed in Redis before durable storage is touched. This prevents multiple replicas from flushing the same buffered item concurrently, and prevents a terminal state such as `Completed` from being flushed before the original durable intent exists in the durable provider. If durable persistence fails, Mule releases the flush claim so another flush cycle can retry.
+Intent and terminal flush batches are claimed in Redis before durable storage is touched. This prevents multiple replicas from flushing the same buffered item concurrently, and prevents a terminal state such as `Completed` or `Cancelled` from being flushed before the original durable intent exists in the durable provider. If durable persistence fails, Mule releases the flush claim so another flush cycle can retry.
 
 Redis does not replace EF Core durable storage. Treat it as a fast shared front buffer in front of the durable provider. If Redis is configured with volatile persistence or data is evicted before Mule flushes it, unflushed intents can be lost. Use Redis persistence and memory policies that match the durability window your workload can tolerate.
 
@@ -498,6 +498,58 @@ Test shape: .NET 10, local SQL Server test database, local Redis container, `Wor
 | FastLane Redis + SQL | 20,000 | 10.22s | 1,956/s | 5.63s | 0 |
 | FastLane Redis + SQL | 50,000 | 22.14s | 2,257/s | 14.22s | 0 |
 | FastLane Redis + SQL, handler 1ms | 50,000 | 23.46s | 2,130/s | 13.77s | 0 |
+
+## Cancelling Pending Actions
+
+Resolve `IMuleCancellationService` and pass the `Ulid` returned by `EnqueueAsync`:
+
+```csharp
+var mule = scope.ServiceProvider.GetRequiredService<IMuleClient>();
+var cancellations = scope.ServiceProvider.GetRequiredService<IMuleCancellationService>();
+
+var actionId = await mule.EnqueueAsync(
+    BillingActionKeys.CapturePayment,
+    new CapturePayment(orderId, amount),
+    cancellationToken);
+
+var result = await cancellations.CancelAsync(actionId, cancellationToken);
+
+if (result.IsCancelled)
+{
+    logger.LogInformation("Action {ActionId} will not execute.", result.ActionId);
+}
+```
+
+Cancellation is durable and idempotent. It succeeds only while the action is `Pending`, including an action waiting for its next retry. Mule atomically competes cancellation against worker claims, so exactly one transition wins across replicas:
+
+| Outcome | Meaning |
+|---|---|
+| `Cancelled` | The pending action was moved to its terminal cancelled state. |
+| `AlreadyCancelled` | The same action had already been cancelled; the request is an idempotent success. |
+| `TooLate` | A worker already claimed the action, or the action is already terminal. |
+| `NotFound` | Neither an action nor a scheduled replay uses that action id. |
+| `NotSupported` | The configured custom storage provider does not implement cancellation. |
+
+Mule does not interrupt a handler that is already running. A `Locked`, `Completed`, or `Failed` action returns `TooLate`; use cooperative cancellation inside the business operation when in-flight interruption is a domain requirement.
+
+The action remains stored with `DurableActionStatus.Cancelled`, `CancelledOnUtc`, and `TerminalOnUtc` for audit. Normal completed-action cleanup does not remove cancelled actions, and its deduplication key remains reserved.
+
+FastLane InMemory resolves cancel-versus-claim under the buffer lock. FastLane Redis performs the same transition with an atomic Lua operation that checks the action status and lease. Both modes persist `Cancelled` to the durable provider without exposing executable pending work during terminal flushing.
+
+### Cancelling A Scheduled Replay
+
+`MuleReplayResult.ReplayActionId` is reserved as soon as a replay is scheduled. Pass that id to the same cancellation service before the replay worker claims it:
+
+```csharp
+var scheduled = await replays.ReplayAsync(failedActionId, request, cancellationToken);
+var cancelled = await cancellations.CancelAsync(
+    scheduled.ReplayActionId,
+    cancellationToken);
+```
+
+A successful request changes the schedule to `MuleReplayStatus.Cancelled`, and no replay action is materialized. If the replay worker wins the claim race, cancellation returns `TooLate`. After materialization, the reserved id belongs to the new durable action, so a later cancellation request follows the normal action rules: it succeeds while that action is still `Pending` and returns `TooLate` after it is locked.
+
+EF Core hosts must add a migration for `DurableAction.CancelledOnUtc` and `MuleReplay.CancelledOnUtc`. Mule adds both properties to its provider-agnostic model automatically, and hosts can customize their persistence through the existing `ConfigureActions(...)` and `ConfigureReplays(...)` callbacks.
 
 ## Manual Replay
 
