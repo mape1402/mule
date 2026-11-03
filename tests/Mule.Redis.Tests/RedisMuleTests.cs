@@ -195,13 +195,19 @@ public sealed class RedisMuleTests : IAsyncLifetime
     {
         using var provider = CreateServices().BuildServiceProvider();
         using var scope = provider.CreateScope();
-        using var transaction = new TransactionScope(TransactionScopeAsyncFlowOption.Enabled);
+        var client = scope.ServiceProvider.GetRequiredService<IMuleClient>();
+        InvalidOperationException exception;
+        using (var transaction = new TransactionScope(TransactionScopeAsyncFlowOption.Enabled))
+        {
+            exception = await Assert.ThrowsAsync<InvalidOperationException>(async () =>
+                await client.EnqueueAsync(CaptureKey, new TestPayload("transaction")));
+        }
 
-        var exception = await Assert.ThrowsAsync<InvalidOperationException>(async () =>
-            await scope.ServiceProvider.GetRequiredService<IMuleClient>()
-                .EnqueueAsync(CaptureKey, new TestPayload("transaction")));
+        await client.EnqueueAsync(CaptureKey, new TestPayload("accepted"));
+        var snapshot = await scope.ServiceProvider.GetRequiredService<IMuleDiagnostics>().GetSnapshotAsync();
 
         Assert.Contains("cannot participate atomically", exception.Message);
+        Assert.Equal(1, snapshot.Pending);
     }
 
     [RedisFact]

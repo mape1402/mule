@@ -35,6 +35,8 @@ internal sealed partial class RedisMuleStorage :
         if (action == null)
             throw new ArgumentNullException(nameof(action));
 
+        EnsureCanWrite();
+        cancellationToken.ThrowIfCancellationRequested();
         _pendingAdds.Add(action);
         return Task.CompletedTask;
     }
@@ -44,6 +46,8 @@ internal sealed partial class RedisMuleStorage :
         if (actions == null)
             throw new ArgumentNullException(nameof(actions));
 
+        EnsureCanWrite();
+        cancellationToken.ThrowIfCancellationRequested();
         foreach (var action in actions)
         {
             if (action == null)
