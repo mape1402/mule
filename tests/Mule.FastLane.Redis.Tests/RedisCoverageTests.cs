@@ -111,7 +111,7 @@ public sealed class RedisCoverageTests
             Assert.NotEmpty(intents);
             Assert.Contains(intents, x => x.Status == DurableActionStatus.Locked);
             await buffer.CompleteIntentFlushAsync([]);
-            await buffer.CompleteIntentFlushAsync(intents.Select(x => x.Id).Append(Ulid.NewUlid()).ToArray());
+            await buffer.CompleteIntentFlushAsync(intents.Append(new DurableAction { Id = Ulid.NewUlid() }).ToArray());
 
             Assert.True(await buffer.MarkCompletedAsync(action.Id, now.AddSeconds(3)));
             Assert.False(await buffer.MarkCompletedAsync(Ulid.NewUlid(), now));
@@ -122,7 +122,7 @@ public sealed class RedisCoverageTests
             await buffer.CancelTerminalFlushAsync(terminals.Select(x => x.Id).Append(Ulid.NewUlid()).ToArray());
             terminals = await buffer.TakeTerminalFlushBatchAsync(10);
             await buffer.CompleteTerminalFlushAsync([]);
-            await buffer.CompleteTerminalFlushAsync(terminals.Select(x => x.Id).Append(Ulid.NewUlid()).ToArray());
+            await buffer.CompleteTerminalFlushAsync(terminals.Append(new DurableAction { Id = Ulid.NewUlid() }).ToArray());
 
             var completedBeforeIntent = CreateAction("completed-before-intent", now, DurableActionStatus.Completed);
             completedBeforeIntent.Attempts = 3;
@@ -378,7 +378,8 @@ public sealed class RedisCoverageTests
                 (await buffer.CancelAsync(unsupportedCancellationAction.Id, now)).Outcome);
             await Assert.ThrowsAsync<InvalidOperationException>(() =>
                 InvokeFlushOnceAsync(unsupportedCancellationService));
-            await buffer.CompleteTerminalFlushAsync([unsupportedCancellationAction.Id]);
+            var unsupportedTerminal = await buffer.TakeTerminalFlushBatchAsync(1);
+            await buffer.CompleteTerminalFlushAsync(unsupportedTerminal);
 
             var rejectedCancellation = Substitute.For<IMuleDurableStorage, IMuleTerminalCancellationStorage>();
             ((IMuleTerminalCancellationStorage)rejectedCancellation)
@@ -493,17 +494,8 @@ public sealed class RedisCoverageTests
     }
 
     [Fact]
-    public void Buffer_Helpers_Should_Cover_Every_Lock_State_And_Option_Default()
+    public void Buffer_Helpers_Should_Normalize_Lanes_And_Option_Defaults()
     {
-        var now = DateTimeOffset.UtcNow;
-        Assert.True(InvokeCanLock(CreateAction("pending-null", now), now));
-        Assert.True(InvokeCanLock(CreateAction("pending-due", now, nextAttemptOnUtc: now.AddSeconds(-1)), now));
-        Assert.False(InvokeCanLock(CreateAction("pending-future", now, nextAttemptOnUtc: now.AddSeconds(1)), now));
-        Assert.True(InvokeCanLock(CreateAction("locked-expired", now, DurableActionStatus.Locked, now.AddMinutes(-2)), now));
-        Assert.False(InvokeCanLock(CreateAction("locked-active", now, DurableActionStatus.Locked, now), now));
-        Assert.False(InvokeCanLock(CreateAction("locked-null", now, DurableActionStatus.Locked), now));
-        Assert.False(InvokeCanLock(CreateAction("completed", now, DurableActionStatus.Completed), now));
-
         var normalize = typeof(RedisFastLaneBuffer).GetMethod("NormalizeLane", BindingFlags.Static | BindingFlags.NonPublic);
         Assert.Equal(MuleSettings.DefaultLane, normalize.Invoke(null, [" "]));
         Assert.Equal("lane", normalize.Invoke(null, ["lane"]));
@@ -513,12 +505,6 @@ public sealed class RedisCoverageTests
             Options.Create(new FastLaneRedisOptions { LeaseDuration = TimeSpan.Zero }));
         var getLease = typeof(RedisFastLaneBuffer).GetMethod("GetLeaseDuration", BindingFlags.Instance | BindingFlags.NonPublic);
         Assert.Equal(TimeSpan.FromMinutes(2), getLease.Invoke(zeroOptionsBuffer, null));
-    }
-
-    private static bool InvokeCanLock(DurableAction action, DateTimeOffset now)
-    {
-        var method = typeof(RedisFastLaneBuffer).GetMethod("CanLock", BindingFlags.Static | BindingFlags.NonPublic);
-        return (bool)method.Invoke(null, [action, TimeSpan.FromMinutes(1), now]);
     }
 
     private static RedisFastLaneBuffer CreateRedisBuffer()
