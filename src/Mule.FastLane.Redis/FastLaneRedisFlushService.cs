@@ -71,7 +71,7 @@ internal sealed class FastLaneRedisFlushService : BackgroundService
             var durableStorage = scope.ServiceProvider.GetRequiredService<IMuleDurableStorage>();
             await durableStorage.AddRangeAsync(intents, cancellationToken);
             await durableStorage.SaveChangesAsync(cancellationToken);
-            await _buffer.CompleteIntentFlushAsync(ids);
+            await _buffer.CompleteIntentFlushAsync(intents);
         }
         catch
         {
@@ -141,7 +141,7 @@ internal sealed class FastLaneRedisFlushService : BackgroundService
             }
 
             await durableStorage.SaveChangesAsync(cancellationToken);
-            await _buffer.CompleteTerminalFlushAsync(ids);
+            await _buffer.CompleteTerminalFlushAsync(terminals);
         }
         catch
         {
