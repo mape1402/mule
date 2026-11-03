@@ -4,6 +4,18 @@ All notable changes to Mule packages will be documented in this file.
 
 ## [Unreleased]
 
+## [v2.3.0] - 2026-11-03
+
+### Added
+
+- Added `Mule.DurableActions.Redis` as an authoritative Redis storage provider that operates without EF Core or another database.
+- Added atomic Redis state transitions for batch enqueue, deduplication, claims, retries, completion, cancellation, replay materialization, cleanup, and diagnostics.
+- Added startup recovery and lease reclamation for multi-replica Redis-only deployments.
+- Added flexible Redis connection setup through connection strings, `ConfigurationOptions`, or an application-owned `IConnectionMultiplexer` factory.
+- Added optional replica acknowledgement through Redis `WAIT`, explicit ambient transaction handling, and keyspace schema validation.
+- Added a Redis-only executable sample and production guidance for persistence, eviction, replication, connection ownership, and Redis Cluster hash slots.
+- Added focused unit, integration, concurrency, restart recovery, and 1,000-action batch coverage for .NET 8, .NET 9, and .NET 10.
+
 ## [v2.2.0] - 2026-10-24
 
 ### Added
