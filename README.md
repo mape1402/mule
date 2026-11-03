@@ -20,6 +20,7 @@ Mule provides **at-least-once execution**. Actions should be idempotent, or you 
 dotnet add package Mule.DurableActions
 dotnet add package Mule.DurableActions.InMemory
 dotnet add package Mule.DurableActions.EntityFrameworkCore
+dotnet add package Mule.DurableActions.Redis
 dotnet add package Mule.DurableActions.FastLane.InMemory
 dotnet add package Mule.DurableActions.FastLane.Redis
 dotnet add package Mule.DurableActions.Testing
@@ -28,6 +29,7 @@ dotnet add package Mule.DurableActions.Testing
 - `Mule.DurableActions`: core API, dispatcher, registration, serialization, and contracts.
 - `Mule.DurableActions.InMemory`: in-memory provider for tests, samples, and local experiments.
 - `Mule.DurableActions.EntityFrameworkCore`: EF Core provider for durable storage.
+- `Mule.DurableActions.Redis`: Redis provider that stores actions, retries, replay schedules, cancellation, cleanup state, and diagnostics without EF Core.
 - `Mule.DurableActions.FastLane.InMemory`: optional in-memory buffer that accepts foreground work quickly and flushes durable storage in batches.
 - `Mule.DurableActions.FastLane.Redis`: optional Redis-backed buffer for high-throughput, multi-replica foreground work.
 - `Mule.DurableActions.Testing`: test harness helpers for durable action assertions.
@@ -39,6 +41,7 @@ using Mule;
 using Mule.Configuration;
 using Mule.InMemory;
 using Mule.EntityFrameworkCore;
+using Mule.Redis;
 using Mule.FastLane.InMemory;
 using Mule.FastLane.Redis;
 using Mule.Testing;
@@ -51,7 +54,7 @@ using StackExchange.Redis;
 - **Payload**: the serialized data Mule stores with the intent.
 - **Action**: a class that implements `IMuleAction<TPayload>`.
 - **Client**: `IMuleClient`, used by foreground code to enqueue work.
-- **Storage provider**: InMemory or EF Core.
+- **Storage provider**: InMemory, EF Core, or Redis.
 - **Dispatcher**: a hosted background service that locks and executes pending actions.
 - **Durable id**: every action id is a `Ulid`, so ids are typed, compact, sortable, and storage-friendly.
 
@@ -395,6 +398,74 @@ services.AddMule(mule => mule
 
 The EF provider does not require you to add `DbSet<DurableAction>` or edit `OnModelCreating` manually. Mule attaches its model through the DbContext options pipeline.
 
+### Redis
+
+Use `Mule.DurableActions.Redis` when Redis itself should be Mule's authoritative storage. This mode does not require EF Core or another database:
+
+```csharp
+services.AddMule(mule => mule
+    .UseRedis(options =>
+    {
+        options.ConnectionString = redisConnectionString;
+        options.KeyPrefix = "checkout";
+        options.WriteBatchSize = 500;
+    })
+    .AddActionsFromAssemblyContaining<SendReceiptAction>());
+```
+
+The provider stores pending and terminal actions, retry schedules, leases, deduplication keys, replay schedules, cancellation state, cleanup indices, and diagnostics in Redis. Claims and state transitions use atomic Lua scripts, so multiple application replicas can dispatch, retry, replay, cancel, and clean the same logical workload without a process-local coordinator.
+
+Mule checks the durable indices when the application starts. Pending actions and expired leases are therefore recovered after a process restart just as they are with the EF provider. No polling of another database is involved.
+
+Connection setup follows the same flexible model as FastLane Redis. Resolution order is `ConnectionFactory`, `ConfigurationOptions`, then `ConnectionString`:
+
+```csharp
+services.AddSingleton<IConnectionMultiplexer>(serviceProvider =>
+{
+    // Authentication, certificates, managed identity, and token refresh belong here.
+    return ConnectionMultiplexer.Connect(redisConfiguration);
+});
+
+services.AddMule(mule => mule
+    .UseRedis(options =>
+    {
+        options.ConnectionFactory = (serviceProvider, cancellationToken) =>
+            ValueTask.FromResult(serviceProvider.GetRequiredService<IConnectionMultiplexer>());
+        options.DisposeConnection = false;
+        options.KeyPrefix = "checkout";
+    })
+    .AddActionsFromAssemblyContaining<SendReceiptAction>());
+```
+
+`DisposeConnection` defaults to `true` for connections Mule creates and `false` for a connection returned by `ConnectionFactory`. Set it explicitly when ownership differs. `Database` selects the logical Redis database, and `KeyPrefix` isolates an application's data. Every key for one prefix shares a Redis Cluster hash slot so each state transition remains atomic; use different prefixes for independently sharded workloads.
+
+The Redis-specific options are:
+
+| Option | Default | Purpose |
+| --- | --- | --- |
+| `ConnectionString` | `localhost:6379` | Simple StackExchange.Redis connection string. |
+| `ConfigurationOptions` | `null` | Full StackExchange.Redis configuration. |
+| `ConnectionFactory` | `null` | Application-owned connection creation and authentication. |
+| `DisposeConnection` | inferred | Controls whether Mule disposes the multiplexer. |
+| `KeyPrefix` | `mule` | Isolates the keyspace and Redis Cluster hash slot. |
+| `Database` | `-1` | Redis logical database selected by StackExchange.Redis. |
+| `WriteBatchSize` | `500` | Maximum actions written or completed by one storage batch. |
+| `MinimumReplicaAcknowledgements` | `0` | Number of replicas that must acknowledge a write through Redis `WAIT`. |
+| `ReplicaAcknowledgementTimeout` | `1 second` | Maximum wait for replica acknowledgements. |
+| `AmbientTransactions` | `Reject` | Rejects or explicitly allows writes inside `TransactionScope`. |
+
+Redis cannot participate atomically in a database `TransactionScope`. Mule rejects ambient transactions by default rather than creating a false atomicity guarantee. Set `AmbientTransactions = RedisAmbientTransactionMode.Immediate` only when the Redis intent is intentionally independent from the surrounding transaction.
+
+Redis-only operation is as durable as the Redis deployment behind it. For production durable actions:
+
+- Enable AOF, or use an RDB/AOF strategy whose possible loss window your workload accepts.
+- Use a non-evicting policy such as `noeviction`; evicting Mule keys can lose actions or indices.
+- Configure replication and failover for the required availability level.
+- Set `MinimumReplicaAcknowledgements` when the producer must fail if too few replicas observe a write. Redis `WAIT` improves replica acknowledgement but does not replace disk persistence.
+- Monitor Redis memory, persistence errors, replication health, and Mule diagnostics.
+
+`Mule.DurableActions.Redis` can be used directly for the simplest Redis-only path. `Mule.DurableActions.FastLane.Redis` remains a separate optional front buffer; it is mainly useful when another provider, such as EF Core, is the authoritative store.
+
 ### FastLane InMemory
 
 FastLane InMemory is an optional buffer for high-throughput producers:
@@ -479,7 +550,7 @@ When multiple connection options are provided, Mule resolves Redis in this order
 
 Intent and terminal flush batches are claimed in Redis before durable storage is touched. This prevents multiple replicas from flushing the same buffered item concurrently, and prevents a terminal state such as `Completed` or `Cancelled` from being flushed before the original durable intent exists in the durable provider. If durable persistence fails, Mule releases the flush claim so another flush cycle can retry.
 
-Redis does not replace EF Core durable storage. Treat it as a fast shared front buffer in front of the durable provider. If Redis is configured with volatile persistence or data is evicted before Mule flushes it, unflushed intents can be lost. Use Redis persistence and memory policies that match the durability window your workload can tolerate.
+FastLane Redis does not replace its configured durable provider. Treat it as a fast shared front buffer in front of EF Core or another authoritative provider. If Redis is configured with volatile persistence or data is evicted before Mule flushes it, unflushed intents can be lost. Use Redis persistence and memory policies that match the durability window your workload can tolerate. To use Redis itself as the authoritative provider, install `Mule.DurableActions.Redis` and register `UseRedis(...)` instead.
 
 For high-throughput workloads, tune `IntentFlushSize` and `CompletionFlushSize` together with `DispatchBatchSize`, `ExecutionQueueCapacity`, and lane `MaxDegreeOfParallelism`. Larger flush batches reduce durable storage round trips; larger dispatch batches reduce Redis claim overhead. Keep `LeaseDuration` comfortably above the normal execution time for an action so another replica does not reclaim work that is still running.
 
@@ -963,3 +1034,12 @@ dotnet run --project samples/Mule.Samples.Replay/Mule.Samples.Replay.csproj --fr
 ```
 
 The sample intentionally fails an action, schedules a replay after the dependency recovers, and waits for the new action to complete while the original remains failed.
+
+Run the Redis-only sample against a local Redis instance:
+
+```bash
+docker run --rm -p 6379:6379 redis:7-alpine redis-server --appendonly yes
+dotnet run --project samples/Mule.Samples.Redis/Mule.Samples.Redis.csproj --framework net8.0
+```
+
+Set `MULE_REDIS_CONNECTION_STRING` when Redis is not available at `localhost:6379`. The sample enqueues a payment action, waits for its handler, and reads the completed count from `IMuleDiagnostics` backed entirely by Redis.
