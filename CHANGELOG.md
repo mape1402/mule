@@ -4,6 +4,12 @@ All notable changes to Mule packages will be documented in this file.
 
 ## [Unreleased]
 
+## [v2.3.1] - 2026-11-03
+
+### Fixed
+
+- Fixed Redis FastLane coordination so stale lock and flush operations cannot overwrite newer durable action state.
+
 ## [v2.3.0] - 2026-11-03
 
 ### Added
