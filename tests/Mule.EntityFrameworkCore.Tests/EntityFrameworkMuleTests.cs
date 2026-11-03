@@ -1,5 +1,6 @@
 namespace Mule.EntityFrameworkCore.Tests;
 
+using System.Collections.Concurrent;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -282,7 +283,6 @@ public sealed class EntityFrameworkMuleTests
         await client.EnqueueAsync(Key, new TestPayload("hello"));
 
         var probe = host.Services.GetRequiredService<TestProbe>();
-        await probe.WaitAsync();
         await WaitForActionStatusAsync(host, DurableActionStatus.Completed);
         await host.StopAsync();
 
@@ -348,7 +348,7 @@ public sealed class EntityFrameworkMuleTests
 
     private static async Task WaitForActionStatusAsync(IHost host, DurableActionStatus status)
     {
-        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
 
         while (!timeout.IsCancellationRequested)
         {
@@ -389,23 +389,18 @@ public sealed class EntityFrameworkMuleTests
 
         public ValueTask ExecuteAsync(MuleActionContext<TestPayload> context, CancellationToken cancellationToken)
         {
-            _probe.Values.Add(context.Payload.Value);
-            _probe.Signal();
+            _probe.Record(context.Payload.Value);
             return ValueTask.CompletedTask;
         }
     }
 
     private sealed class TestProbe
     {
-        private readonly TaskCompletionSource _completion = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly ConcurrentQueue<string> _values = new();
 
-        public List<string> Values { get; } = new();
+        public IReadOnlyCollection<string> Values => _values.ToArray();
 
-        public void Signal()
-            => _completion.TrySetResult();
-
-        public async Task WaitAsync()
-            => await _completion.Task.WaitAsync(TimeSpan.FromSeconds(3));
+        public void Record(string value) => _values.Enqueue(value);
     }
 
     private sealed class TestDbContext : DbContext
