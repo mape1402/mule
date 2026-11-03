@@ -166,11 +166,9 @@ jobs:
             exit 0
           fi
 
-          MARKER_CHANGED=false
-          if git diff --name-only "${{ github.event.before }}" "${{ github.sha }}" | grep -qx "$RELEASE_MARKER_PATH"; then
-            MARKER_CHANGED=true
-          else
-            echo "$RELEASE_MARKER_PATH did not change in this push. Checking for a pending release."
+          if ! git diff --name-only "${{ github.event.before }}" "${{ github.sha }}" | grep -qx "$RELEASE_MARKER_PATH"; then
+            echo "$RELEASE_MARKER_PATH did not change in this push. Skipping release."
+            exit 0
           fi
 
           if [[ ! -f "$RELEASE_MARKER_PATH" ]]; then
@@ -197,15 +195,6 @@ jobs:
 
           VERSION="${TAG#v}"
           BRANCH="$RELEASE_BRANCH_PREFIX$TAG"
-
-          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
-            echo "Release tag $TAG already exists. Skipping release."
-            exit 0
-          fi
-
-          if [[ "$MARKER_CHANGED" != "true" ]]; then
-            echo "Release tag $TAG does not exist. Resuming pending release from $RELEASE_MARKER_PATH."
-          fi
 
           echo "should_release=true" >> "$GITHUB_OUTPUT"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
