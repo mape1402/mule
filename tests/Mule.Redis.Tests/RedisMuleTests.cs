@@ -223,6 +223,10 @@ public sealed class RedisMuleTests : IAsyncLifetime
                 .EnqueueAsync(ResilientKey, new TestPayload("retry"));
 
         await probe.WaitForSuccessAsync("retry");
+        await WaitForSnapshotAsync(
+            host,
+            snapshot => snapshot.Completed == 1
+                && snapshot.RetriesByActionKey.GetValueOrDefault(ResilientKey) == 1);
         using (var scope = host.Services.CreateScope())
         {
             var snapshot = await scope.ServiceProvider.GetRequiredService<IMuleDiagnostics>().GetSnapshotAsync();
