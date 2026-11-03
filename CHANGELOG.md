@@ -4,6 +4,12 @@ All notable changes to Mule packages will be documented in this file.
 
 ## [Unreleased]
 
+## [v2.3.2] - 2026-11-03
+
+### Fixed
+
+- Stabilized EF Core hosted-service integration coverage by waiting for the durable completion state under constrained runners.
+
 ## [v2.3.1] - 2026-11-03
 
 ### Fixed
