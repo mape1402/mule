@@ -7,6 +7,7 @@ using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using Mule.Diagnostics;
 using Mule.Dispatching;
+using NSubstitute;
 
 public sealed class DispatcherCoverageTests
 {
@@ -24,6 +25,17 @@ public sealed class DispatcherCoverageTests
         Assert.Throws<ArgumentNullException>(() => new MuleDispatcherHostedService(fixture.ScopeFactory, fixture.Queue, fixture.Executor, fixture.Signal, null, fixture.Metrics, fixture.Logger));
         Assert.Throws<ArgumentNullException>(() => new MuleDispatcherHostedService(fixture.ScopeFactory, fixture.Queue, fixture.Executor, fixture.Signal, fixture.Settings, null, fixture.Logger));
         Assert.Throws<ArgumentNullException>(() => new MuleDispatcherHostedService(fixture.ScopeFactory, fixture.Queue, fixture.Executor, fixture.Signal, fixture.Settings, fixture.Metrics, null));
+
+        Assert.Throws<ArgumentNullException>(() => new MuleDispatcherHostedService(
+            fixture.ScopeFactory, fixture.Queue, fixture.Executor, null, fixture.Signal, fixture.Settings, fixture.Metrics, fixture.Logger));
+        Assert.Throws<ArgumentNullException>(() => new MuleDispatcherHostedService(
+            fixture.ScopeFactory, fixture.Queue, fixture.Executor, fixture.ExecutionKeys, null, fixture.Settings, fixture.Metrics, fixture.Logger));
+        Assert.Throws<ArgumentNullException>(() => new MuleDispatcherHostedService(
+            fixture.ScopeFactory, fixture.Queue, fixture.Executor, fixture.ExecutionKeys, fixture.Signal, null, fixture.Metrics, fixture.Logger));
+        var nullValueSettings = Substitute.For<IOptions<MuleSettings>>();
+        nullValueSettings.Value.Returns((MuleSettings)null);
+        Assert.Throws<ArgumentNullException>(() => new MuleDispatcherHostedService(
+            fixture.ScopeFactory, fixture.Queue, fixture.Executor, fixture.ExecutionKeys, fixture.Signal, nullValueSettings, fixture.Metrics, fixture.Logger));
     }
 
     [Fact]
@@ -95,6 +107,92 @@ public sealed class DispatcherCoverageTests
         Assert.Equal(now.AddDays(-1), await InvokeAsync<DateTimeOffset?>(dispatcher, "GetNextCleanupOnUtcAsync", CancellationToken.None));
         storage.OldestCompleted = null;
         Assert.Null(await InvokeAsync<DateTimeOffset?>(dispatcher, "GetNextCleanupOnUtcAsync", CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task Keyed_Dispatch_Should_Release_Contended_And_Unclaimed_Keys()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var candidate = CreateAction(now);
+        candidate.CorrelationId = "instance:1";
+        var storage = new ScriptedStorage();
+        var settings = new MuleSettings
+        {
+            ExecutionKeySelector = action => ExecutionKey.From(action.CorrelationId),
+            ExecutionKeyContentionDelay = TimeSpan.Zero,
+            ExecutionKeyCandidateBatchSize = 1,
+            DispatchBatchSize = 1
+        };
+        var fixture = new DispatcherFixture(settings, storage);
+        var dispatcher = fixture.Create();
+
+        await InvokeAsync(
+            dispatcher,
+            "DispatchKeyedQueuedActionAsync",
+            new MuleDispatchItem(candidate.Id, candidate.Lane),
+            CancellationToken.None);
+
+        storage.FindResult = candidate;
+        storage.LockResult = null;
+        await InvokeAsync(
+            dispatcher,
+            "DispatchKeyedQueuedActionAsync",
+            new MuleDispatchItem(candidate.Id, candidate.Lane),
+            CancellationToken.None);
+
+        storage.Candidates = [candidate];
+        await InvokeAsync(
+            dispatcher,
+            "ReadAndDispatchKeyedLaneCoreAsync",
+            MuleSettings.DefaultLane,
+            CancellationToken.None);
+
+        Assert.True(fixture.ExecutionKeys.TryAcquire(candidate, out var lease, out _));
+        try
+        {
+            await InvokeAsync(
+                dispatcher,
+                "ReadAndDispatchKeyedLaneCoreAsync",
+                MuleSettings.DefaultLane,
+                CancellationToken.None);
+        }
+        finally
+        {
+            lease.Dispose();
+        }
+
+        storage.LockResult = candidate;
+        await InvokeAsync(
+            dispatcher,
+            "DispatchKeyedQueuedActionAsync",
+            new MuleDispatchItem(candidate.Id, candidate.Lane),
+            CancellationToken.None);
+
+        var secondCandidate = CreateAction(now.AddSeconds(1));
+        secondCandidate.CorrelationId = "instance:2";
+        storage.Candidates = [secondCandidate];
+        storage.LockResult = secondCandidate;
+        await InvokeAsync(
+            dispatcher,
+            "ReadAndDispatchKeyedLaneCoreAsync",
+            MuleSettings.DefaultLane,
+            CancellationToken.None);
+
+        var positiveDelayFixture = new DispatcherFixture(new MuleSettings
+        {
+            ExecutionKeySelector = action => ExecutionKey.From(action.CorrelationId),
+            ExecutionKeyContentionDelay = TimeSpan.FromSeconds(1)
+        });
+        positiveDelayFixture.Signal.SignalRecovery();
+        await InvokeAsync(
+            positiveDelayFixture.Create(),
+            "WaitForKeyContentionAsync",
+            CancellationToken.None);
+
+        var unsupported = new ScriptedStorageWithoutExecution();
+        var method = GetMethod(typeof(MuleDispatcherHostedService), "RequireExecutionStorage");
+        var exception = Assert.Throws<TargetInvocationException>(() => method.Invoke(null, [unsupported]));
+        Assert.IsType<InvalidOperationException>(exception.InnerException);
     }
 
     [Fact]
@@ -452,6 +550,7 @@ public sealed class DispatcherCoverageTests
             Metrics = new MuleRuntimeMetrics();
             ScopeFactory = _services.GetRequiredService<IServiceScopeFactory>();
             Logger = NullLogger<MuleDispatcherHostedService>.Instance;
+            ExecutionKeys = new MuleExecutionKeyCoordinator(Signal, Settings);
             Executor = new MuleActionExecutor(ScopeFactory, Signal, Settings, Metrics, NullLogger<MuleActionExecutor>.Instance);
             var stopped = new CancellationTokenSource();
             stopped.Cancel();
@@ -461,13 +560,14 @@ public sealed class DispatcherCoverageTests
         public IServiceScopeFactory ScopeFactory { get; }
         public IMuleDispatchQueue Queue { get; }
         public MuleActionExecutor Executor { get; }
+        public MuleExecutionKeyCoordinator ExecutionKeys { get; }
         public MuleSchedulerSignal Signal { get; }
         public IOptions<MuleSettings> Settings { get; }
         public MuleRuntimeMetrics Metrics { get; }
         public ILogger<MuleDispatcherHostedService> Logger { get; }
 
         public MuleDispatcherHostedService Create()
-            => new(ScopeFactory, Queue, Executor, Signal, Settings, Metrics, Logger);
+            => new(ScopeFactory, Queue, Executor, ExecutionKeys, Signal, Settings, Metrics, Logger);
     }
 
     private sealed class ScriptedQueue : IMuleDispatchQueue
@@ -525,7 +625,7 @@ public sealed class DispatcherCoverageTests
         }
     }
 
-    private sealed class ScriptedStorage : IMuleStorage
+    private sealed class ScriptedStorage : IMuleStorage, IMuleExecutionStorage
     {
         public Queue<IReadOnlyCollection<DurableAction>> Claims { get; } = new();
         public DurableAction LockResult { get; set; }
@@ -534,6 +634,8 @@ public sealed class DispatcherCoverageTests
         public int CleanResult { get; set; }
         public int ClaimCalls { get; private set; }
         public bool Saved { get; set; }
+        public DurableAction FindResult { get; set; }
+        public IReadOnlyCollection<DurableAction> Candidates { get; set; } = [];
         public Func<int, CancellationToken, Task<IReadOnlyCollection<DurableAction>>> ClaimHandler { get; set; }
         public Func<int, CancellationToken, Task<int>> CleanHandler { get; set; }
         public Func<CancellationToken, Task<DateTimeOffset?>> NextPendingHandler { get; set; }
@@ -560,5 +662,30 @@ public sealed class DispatcherCoverageTests
         public Task<DateTimeOffset?> GetOldestCompletedOnUtcAsync(CancellationToken cancellationToken = default)
             => OldestCompletedHandler?.Invoke(cancellationToken) ?? Task.FromResult(OldestCompleted);
         public Task SaveChangesAsync(CancellationToken cancellationToken = default) { Saved = true; return Task.CompletedTask; }
+        public Task<IReadOnlyCollection<DurableAction>> ReadPendingCandidatesAsync(string lane, int offset, int batchSize, TimeSpan lockTimeout, DateTimeOffset now, CancellationToken cancellationToken = default)
+            => Task.FromResult(Candidates);
+        public Task<DurableAction> FindActionAsync(Ulid id, CancellationToken cancellationToken = default)
+            => Task.FromResult(FindResult);
+        public Task<MuleActionTransitionOutcome> CompleteClaimAsync(Ulid id, Ulid expectedConcurrencyToken, DateTimeOffset completedOnUtc, CancellationToken cancellationToken = default)
+            => Task.FromResult(MuleActionTransitionOutcome.Applied);
+        public Task<MuleActionTransitionOutcome> FailClaimAsync(Ulid id, Ulid expectedConcurrencyToken, string error, DateTimeOffset now, DateTimeOffset? nextAttemptOnUtc, CancellationToken cancellationToken = default)
+            => Task.FromResult(MuleActionTransitionOutcome.Applied);
+        public Task<MuleActionTransitionOutcome> DeferClaimAsync(Ulid id, Ulid expectedConcurrencyToken, DateTimeOffset deferredOnUtc, DateTimeOffset notBeforeUtc, DeferralReason reason, CancellationToken cancellationToken = default)
+            => Task.FromResult(MuleActionTransitionOutcome.Applied);
+    }
+
+    private sealed class ScriptedStorageWithoutExecution : IMuleStorage
+    {
+        public Task AddAsync(DurableAction action, CancellationToken cancellationToken = default) => Task.CompletedTask;
+        public Task AddRangeAsync(IReadOnlyCollection<DurableAction> actions, CancellationToken cancellationToken = default) => Task.CompletedTask;
+        public Task<Ulid?> FindByDeduplicationKeyAsync(ActionKey key, string deduplicationKey, CancellationToken cancellationToken = default) => Task.FromResult<Ulid?>(null);
+        public Task<IReadOnlyCollection<DurableAction>> ClaimPendingAsync(string lane, int batchSize, TimeSpan lockTimeout, DateTimeOffset now, CancellationToken cancellationToken = default) => Task.FromResult<IReadOnlyCollection<DurableAction>>([]);
+        public Task<DateTimeOffset?> GetNextPendingOnUtcAsync(TimeSpan lockTimeout, DateTimeOffset now, CancellationToken cancellationToken = default) => Task.FromResult<DateTimeOffset?>(null);
+        public Task<DurableAction> LockAsync(Ulid id, TimeSpan lockTimeout, DateTimeOffset now, CancellationToken cancellationToken = default) => Task.FromResult<DurableAction>(null);
+        public Task MarkCompletedAsync(Ulid id, DateTimeOffset completedOnUtc, CancellationToken cancellationToken = default) => Task.CompletedTask;
+        public Task MarkFailedAsync(Ulid id, string error, DateTimeOffset now, DateTimeOffset? nextAttemptOnUtc, CancellationToken cancellationToken = default) => Task.CompletedTask;
+        public Task<int> CleanCompletedAsync(DateTimeOffset olderThanUtc, int batchSize, CancellationToken cancellationToken = default) => Task.FromResult(0);
+        public Task<DateTimeOffset?> GetOldestCompletedOnUtcAsync(CancellationToken cancellationToken = default) => Task.FromResult<DateTimeOffset?>(null);
+        public Task SaveChangesAsync(CancellationToken cancellationToken = default) => Task.CompletedTask;
     }
 }

@@ -4,6 +4,7 @@ using System.Transactions;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
+using Mule.Diagnostics;
 
 internal sealed class AmbientTransactionMuleCommitNotifier : IMuleCommitNotifier
 {
@@ -11,35 +12,39 @@ internal sealed class AmbientTransactionMuleCommitNotifier : IMuleCommitNotifier
     private readonly MuleSchedulerSignal _schedulerSignal;
     private readonly MuleSettings _settings;
     private readonly ILogger<AmbientTransactionMuleCommitNotifier> _logger;
+    private readonly MuleRuntimeMetrics _metrics;
 
     public AmbientTransactionMuleCommitNotifier(
         IMuleDispatchQueue dispatchQueue,
         MuleSchedulerSignal schedulerSignal,
         IOptions<MuleSettings> settings,
-        ILogger<AmbientTransactionMuleCommitNotifier> logger = null)
+        ILogger<AmbientTransactionMuleCommitNotifier> logger = null,
+        MuleRuntimeMetrics metrics = null)
     {
         _dispatchQueue = dispatchQueue ?? throw new ArgumentNullException(nameof(dispatchQueue));
         _schedulerSignal = schedulerSignal ?? throw new ArgumentNullException(nameof(schedulerSignal));
         _settings = settings?.Value ?? throw new ArgumentNullException(nameof(settings));
         _logger = logger ?? NullLogger<AmbientTransactionMuleCommitNotifier>.Instance;
+        _metrics = metrics ?? new MuleRuntimeMetrics();
     }
 
-    public async ValueTask NotifySavedAsync(Ulid actionId, string lane, CancellationToken cancellationToken = default)
+    public ValueTask NotifySavedAsync(Ulid actionId, string lane, CancellationToken cancellationToken = default)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         if (!_settings.ImmediateDispatch)
         {
             if (_settings.RecoveryMode == MuleRecoveryMode.Scheduled)
                 _schedulerSignal.SignalRecovery();
 
-            return;
+            return ValueTask.CompletedTask;
         }
 
         var transaction = Transaction.Current;
 
         if (transaction == null)
         {
-            await _dispatchQueue.EnqueueAsync(actionId, lane, cancellationToken);
-            return;
+            NotifyCommittedAction(actionId, lane);
+            return ValueTask.CompletedTask;
         }
 
         transaction.TransactionCompleted += (_, args) =>
@@ -47,19 +52,21 @@ internal sealed class AmbientTransactionMuleCommitNotifier : IMuleCommitNotifier
             if (args.Transaction.TransactionInformation.Status != TransactionStatus.Committed)
                 return;
 
-            ThreadPool.QueueUserWorkItem(_ => _ = EnqueueCommittedActionAsync(actionId, lane));
+            NotifyCommittedAction(actionId, lane);
         };
+
+        return ValueTask.CompletedTask;
     }
 
-    private async Task EnqueueCommittedActionAsync(Ulid actionId, string lane)
+    private void NotifyCommittedAction(Ulid actionId, string lane)
     {
-        try
-        {
-            await _dispatchQueue.EnqueueAsync(actionId, lane);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Mule action {MuleActionId} could not be queued after transaction commit.", actionId);
-        }
+        if (_dispatchQueue.TryEnqueue(actionId, lane))
+            return;
+
+        _metrics.RecordActivationOmitted();
+        _schedulerSignal.SignalRecovery();
+        _logger.LogDebug(
+            "Mule action {MuleActionId} activation was coalesced because the immediate queue is full.",
+            actionId);
     }
 }

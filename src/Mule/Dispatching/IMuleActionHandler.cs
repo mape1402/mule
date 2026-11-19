@@ -4,5 +4,5 @@ internal interface IMuleActionHandler
 {
     ActionKey Key { get; }
 
-    ValueTask ExecuteAsync(DurableAction action, IServiceProvider services, CancellationToken cancellationToken);
+    ValueTask<MuleActionDeferral> ExecuteAsync(DurableAction action, IServiceProvider services, CancellationToken cancellationToken);
 }

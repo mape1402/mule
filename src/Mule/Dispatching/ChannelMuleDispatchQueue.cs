@@ -27,6 +27,14 @@ internal sealed class ChannelMuleDispatchQueue : IMuleDispatchQueue
         _signals.Writer.TryWrite(true);
     }
 
+    public bool TryEnqueue(Ulid actionId, string lane)
+    {
+        var written = GetChannel(lane).Writer.TryWrite(actionId);
+        if (written)
+            _signals.Writer.TryWrite(true);
+        return written;
+    }
+
     public async ValueTask<MuleDispatchItem> DequeueAsync(CancellationToken cancellationToken = default)
         => await DequeueFromLanesAsync(
             () => GetFairLaneNames(),

@@ -20,7 +20,7 @@ internal sealed class MuleActionHandler<TService, TPayload> : IMuleActionHandler
 
     public ActionKey Key { get; }
 
-    public async ValueTask ExecuteAsync(DurableAction action, IServiceProvider services, CancellationToken cancellationToken)
+    public async ValueTask<MuleActionDeferral> ExecuteAsync(DurableAction action, IServiceProvider services, CancellationToken cancellationToken)
     {
         var serializer = services.GetRequiredService<IMuleSerializer>();
         var service = services.GetRequiredService<TService>();
@@ -29,6 +29,7 @@ internal sealed class MuleActionHandler<TService, TPayload> : IMuleActionHandler
         var context = new MuleActionContext<TPayload>(action, services, payload);
 
         await _execute(service, context, cancellationToken);
+        return context.GetDeferral();
     }
 }
 
@@ -45,7 +46,7 @@ internal sealed class ActivatorMuleActionHandler<TAction, TPayload> : IMuleActio
 
     public ActionKey Key { get; }
 
-    public async ValueTask ExecuteAsync(DurableAction action, IServiceProvider services, CancellationToken cancellationToken)
+    public async ValueTask<MuleActionDeferral> ExecuteAsync(DurableAction action, IServiceProvider services, CancellationToken cancellationToken)
     {
         var serializer = services.GetRequiredService<IMuleSerializer>();
         var payloadType = Type.GetType(action.PayloadType, throwOnError: true);
@@ -54,6 +55,7 @@ internal sealed class ActivatorMuleActionHandler<TAction, TPayload> : IMuleActio
         var handler = ActivatorUtilities.CreateInstance<TAction>(services);
 
         await handler.ExecuteAsync(context, cancellationToken);
+        return context.GetDeferral();
     }
 }
 
@@ -74,7 +76,7 @@ internal sealed class ActivatorMuleActionHandler : IMuleActionHandler
 
     public ActionKey Key { get; }
 
-    public async ValueTask ExecuteAsync(DurableAction action, IServiceProvider services, CancellationToken cancellationToken)
+    public async ValueTask<MuleActionDeferral> ExecuteAsync(DurableAction action, IServiceProvider services, CancellationToken cancellationToken)
     {
         var serializer = services.GetRequiredService<IMuleSerializer>();
         var storedPayloadType = Type.GetType(action.PayloadType, throwOnError: true);
@@ -93,5 +95,6 @@ internal sealed class ActivatorMuleActionHandler : IMuleActionHandler
 
         var result = method.Invoke(handler, new[] { context, cancellationToken });
         await (ValueTask)result;
+        return ((MuleActionContext)context).GetDeferral();
     }
 }

@@ -18,6 +18,14 @@ public sealed class MuleSettings
 
     public int MaxDegreeOfParallelism { get; set; } = 1;
 
+    public Func<DurableAction, ExecutionKey?> ExecutionKeySelector { get; set; }
+
+    public int ExecutionKeyCandidateBatchSize { get; set; } = 256;
+
+    public TimeSpan ExecutionKeyContentionDelay { get; set; } = TimeSpan.FromMilliseconds(100);
+
+    public TimeSpan MinimumDeferralDelay { get; set; } = TimeSpan.FromMilliseconds(100);
+
     public MuleCleanupMode CleanupMode { get; set; } = MuleCleanupMode.Polling;
 
     public TimeSpan CleanupInterval { get; set; } = TimeSpan.FromMinutes(10);

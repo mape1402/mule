@@ -4,6 +4,10 @@ public sealed class MuleDiagnosticsSnapshot
 {
     public int Pending { get; init; }
 
+    public int Ready { get; init; }
+
+    public int Deferred { get; init; }
+
     public int Locked { get; init; }
 
     public int Completed { get; init; }
@@ -33,6 +37,10 @@ public sealed class MuleDiagnosticsSnapshot
     public int ReplayRetried { get; init; }
 
     public int ReplayMaterializationFailures { get; init; }
+
+    public int ActivationsOmitted { get; init; }
+
+    public int ActivationsRecovered { get; init; }
 
     public DateTimeOffset? OldestPendingOnUtc { get; init; }
 
@@ -73,6 +81,12 @@ public sealed class MuleDiagnosticsSnapshot
     public IReadOnlyDictionary<string, int> ExecutingByLane { get; init; } = new Dictionary<string, int>();
 
     public IReadOnlyDictionary<string, int> ExecutorSaturationByLane { get; init; } = new Dictionary<string, int>();
+
+    public IReadOnlyDictionary<string, int> DeferredByLane { get; init; } = new Dictionary<string, int>();
+
+    public IReadOnlyDictionary<DeferralReason, int> DeferredByReason { get; init; } = new Dictionary<DeferralReason, int>();
+
+    public IReadOnlyDictionary<string, int> ExecutionKeyContentionByLane { get; init; } = new Dictionary<string, int>();
 
     public IReadOnlyDictionary<string, TimeSpan?> OldestWaitingExecutionAgeByLane { get; init; } = new Dictionary<string, TimeSpan?>();
 }

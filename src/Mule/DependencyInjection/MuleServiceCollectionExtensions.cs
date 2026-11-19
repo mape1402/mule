@@ -27,6 +27,7 @@ public static class MuleServiceCollectionExtensions
         services.TryAddSingleton<MuleActionExecutor>();
         services.TryAddSingleton<IMuleActionExecutor>(provider => provider.GetRequiredService<MuleActionExecutor>());
         services.TryAddSingleton<MuleSchedulerSignal>();
+        services.TryAddSingleton<MuleExecutionKeyCoordinator>();
         services.TryAddSingleton<IMuleCommitNotifier, AmbientTransactionMuleCommitNotifier>();
         services.TryAddSingleton<IMuleReplayCommitNotifier, AmbientTransactionMuleReplayCommitNotifier>();
         services.TryAddSingleton(TimeProvider.System);
