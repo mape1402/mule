@@ -4,7 +4,7 @@ using StackExchange.Redis;
 
 internal static class RedisMuleActionCodec
 {
-    public const int ArgumentCount = 22;
+    public const int ArgumentCount = 24;
 
     public static RedisValue[] ToArguments(DurableAction action, RedisMuleKeyspace keyspace, TimeSpan lockTimeout)
     {
@@ -31,6 +31,8 @@ internal static class RedisMuleActionCodec
                 ? string.Empty
                 : keyspace.DedupeField(action.Key, action.DeduplicationKey),
             (int)action.Status,
+            (int)action.PendingReason,
+            action.DeferralReasonCode ?? string.Empty,
             action.Attempts,
             action.LastError ?? string.Empty,
             Milliseconds(action.CreatedOnUtc),
@@ -62,6 +64,8 @@ internal static class RedisMuleActionCodec
             CorrelationId = Value(values, "correlation"),
             DeduplicationKey = Value(values, "dedupe"),
             Status = (DurableActionStatus)Integer(values, "status"),
+            PendingReason = (DurableActionPendingReason)Integer(values, "pendingReason"),
+            DeferralReasonCode = Value(values, "deferralReason"),
             Attempts = Integer(values, "attempts"),
             LastError = Value(values, "error"),
             CreatedOnUtc = Date(values, "created") ?? DateTimeOffset.UnixEpoch,

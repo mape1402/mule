@@ -245,6 +245,93 @@ public sealed class InMemoryStorageCoverageTests
         Assert.NotNull(await defaultLock.GetSnapshotAsync());
     }
 
+    [Fact]
+    public async Task Execution_Storage_Should_Cover_Candidates_Ownership_And_State_Projection()
+    {
+        var store = new InMemoryMuleStore();
+        var now = DateTimeOffset.UtcNow;
+        var due = CreateAction("candidate", now.AddMinutes(-2));
+        var dueWithDate = CreateAction("candidate-date", now, nextAttemptOnUtc: now.AddSeconds(-1));
+        var future = CreateAction("future-candidate", now, nextAttemptOnUtc: now.AddMinutes(1));
+        var expired = CreateAction("expired-candidate", now, DurableActionStatus.Locked, now.AddMinutes(-2));
+        var otherLane = CreateAction("candidate-other-lane", now);
+        otherLane.Lane = "other";
+        Assert.True(store.Add(due));
+        Assert.True(store.Add(dueWithDate));
+        Assert.True(store.Add(future));
+        Assert.True(store.Add(expired));
+        Assert.True(store.Add(otherLane));
+
+        var candidates = store.ReadPendingCandidates("Lane-A", -1, 10, TimeSpan.FromMinutes(1), now);
+        Assert.Contains(candidates, x => x.Id == due.Id);
+        Assert.Contains(candidates, x => x.Id == dueWithDate.Id);
+        Assert.Contains(candidates, x => x.Id == expired.Id);
+        Assert.DoesNotContain(candidates, x => x.Id == future.Id);
+        Assert.Null(store.FindAction(Ulid.NewUlid()));
+        Assert.Equal(due.Id, store.FindAction(due.Id).Id);
+
+        var completed = store.Lock(due.Id, TimeSpan.FromMinutes(1), now);
+        Assert.Equal(MuleActionTransitionOutcome.NotFound,
+            store.CompleteClaim(Ulid.NewUlid(), Ulid.NewUlid(), now));
+        Assert.Equal(MuleActionTransitionOutcome.LeaseLost,
+            store.CompleteClaim(completed.Id, Ulid.NewUlid(), now));
+        Assert.Equal(MuleActionTransitionOutcome.Applied,
+            store.CompleteClaim(completed.Id, completed.ConcurrencyToken, now));
+
+        var fail = CreateAction("fail-claim", now);
+        Assert.True(store.Add(fail));
+        fail = store.Lock(fail.Id, TimeSpan.FromMinutes(1), now);
+        Assert.Equal(MuleActionTransitionOutcome.NotFound,
+            store.FailClaim(Ulid.NewUlid(), Ulid.NewUlid(), "missing", now, null));
+        Assert.Equal(MuleActionTransitionOutcome.LeaseLost,
+            store.FailClaim(fail.Id, Ulid.NewUlid(), "stale", now, null));
+        Assert.Equal(MuleActionTransitionOutcome.Applied,
+            store.FailClaim(fail.Id, fail.ConcurrencyToken, "retry", now, now.AddSeconds(1)));
+
+        var deferred = CreateAction("defer-claim", now);
+        Assert.True(store.Add(deferred));
+        deferred = store.Lock(deferred.Id, TimeSpan.FromMinutes(1), now);
+        Assert.Equal(MuleActionTransitionOutcome.NotFound,
+            store.DeferClaim(Ulid.NewUlid(), Ulid.NewUlid(), now, DeferralReason.From("missing")));
+        Assert.Equal(MuleActionTransitionOutcome.LeaseLost,
+            store.DeferClaim(deferred.Id, Ulid.NewUlid(), now, DeferralReason.From("stale")));
+        Assert.Equal(MuleActionTransitionOutcome.Applied,
+            store.DeferClaim(deferred.Id, deferred.ConcurrencyToken, now.AddMinutes(1), DeferralReason.From("busy")));
+
+        Assert.Throws<ArgumentNullException>(() => store.ProjectStateRange(null));
+        Assert.Throws<ArgumentException>(() => store.ProjectStateRange([null]));
+        var missing = CreateAction("missing-projection", now);
+        Assert.Equal(MuleActionTransitionOutcome.NotFound,
+            Assert.Single(store.ProjectStateRange([
+                new MuleActionStateProjection(missing, Ulid.NewUlid())])).Outcome);
+
+        var projected = CreateAction("new-projection", now);
+        Assert.Equal(MuleActionTransitionOutcome.Applied,
+            Assert.Single(store.ProjectStateRange([
+                new MuleActionStateProjection(projected, null)])).Outcome);
+        Assert.Equal(MuleActionTransitionOutcome.Applied,
+            Assert.Single(store.ProjectStateRange([
+                new MuleActionStateProjection(projected, projected.ConcurrencyToken)])).Outcome);
+
+        var replacement = CreateAction("replacement", now);
+        replacement.Id = projected.Id;
+        Assert.Equal(MuleActionTransitionOutcome.LeaseLost,
+            Assert.Single(store.ProjectStateRange([
+                new MuleActionStateProjection(replacement, null)])).Outcome);
+        Assert.Equal(MuleActionTransitionOutcome.LeaseLost,
+            Assert.Single(store.ProjectStateRange([
+                new MuleActionStateProjection(replacement, Ulid.NewUlid())])).Outcome);
+        Assert.Equal(MuleActionTransitionOutcome.Applied,
+            Assert.Single(store.ProjectStateRange([
+                new MuleActionStateProjection(replacement, projected.ConcurrencyToken)])).Outcome);
+
+        var storage = new InMemoryMuleStorage(store, new MuleRuntimeMetrics());
+        Assert.NotEmpty(await storage.ProjectStateRangeAsync([
+            new MuleActionStateProjection(replacement, replacement.ConcurrencyToken)]));
+        await storage.MarkCompletedAsync(expired.Id, now);
+        await storage.MarkFailedAsync(future.Id, "legacy", now, null);
+    }
+
     private static DurableAction CreateAction(
         string value,
         DateTimeOffset createdOnUtc,

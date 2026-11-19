@@ -48,11 +48,14 @@ public static class MuleModelBuilderExtensions
             entity.Property(x => x.CorrelationId).HasMaxLength(128);
             entity.Property(x => x.DeduplicationKey).HasMaxLength(256);
             entity.Property(x => x.Status).IsRequired();
+            entity.Property(x => x.PendingReason).IsRequired();
+            entity.Property(x => x.DeferralReasonCode).HasMaxLength(128);
             entity.Property(x => x.LastError);
             entity.Property(x => x.StartedOnUtc);
             entity.Property(x => x.CancelledOnUtc);
             entity.Property(x => x.TerminalOnUtc);
             entity.HasIndex(x => new { x.Lane, x.Status, x.NextAttemptOnUtc, x.CreatedOnUtc });
+            entity.HasIndex(x => new { x.Status, x.PendingReason, x.NextAttemptOnUtc });
             entity.HasIndex(x => new { x.Status, x.LockedOnUtc });
             entity.HasIndex(x => new { x.Status, x.CompletedOnUtc });
             entity.HasIndex(x => new { x.Key, x.DeduplicationKey });

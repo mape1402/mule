@@ -7,6 +7,7 @@ using StackExchange.Redis;
 
 internal sealed partial class RedisMuleStorage :
     IMuleDurableStorage,
+    IMuleExecutionStorage,
     IMuleBatchTerminalStorage,
     IMuleReplayStorage,
     IMuleCancellationStorage,
@@ -144,6 +145,122 @@ internal sealed partial class RedisMuleStorage :
             return null;
 
         return await ReadActionAsync(database, id, cancellationToken);
+    }
+
+    public async Task<IReadOnlyCollection<DurableAction>> ReadPendingCandidatesAsync(
+        string lane,
+        int offset,
+        int batchSize,
+        TimeSpan lockTimeout,
+        DateTimeOffset now,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var database = await _connection.GetDatabaseAsync(cancellationToken);
+        var ids = await database.SortedSetRangeByScoreAsync(
+            _keys.LaneDue(NormalizeLane(lane)),
+            double.NegativeInfinity,
+            RedisMuleActionCodec.Milliseconds(now),
+            Exclude.None,
+            Order.Ascending,
+            Math.Max(0, offset),
+            Math.Max(1, batchSize));
+        cancellationToken.ThrowIfCancellationRequested();
+        return await ReadActionsAsync(
+            database,
+            ids.Select(value => Ulid.Parse(value.ToString())).ToArray(),
+            cancellationToken);
+    }
+
+    public async Task<DurableAction> FindActionAsync(Ulid id, CancellationToken cancellationToken = default)
+    {
+        var database = await _connection.GetDatabaseAsync(cancellationToken);
+        return await ReadActionAsync(database, id, cancellationToken);
+    }
+
+    public async Task<MuleActionTransitionOutcome> CompleteClaimAsync(
+        Ulid id,
+        Ulid expectedConcurrencyToken,
+        DateTimeOffset completedOnUtc,
+        CancellationToken cancellationToken = default)
+    {
+        EnsureCanWrite();
+        var database = await _connection.GetDatabaseAsync(cancellationToken);
+        var result = (long)await database.ScriptEvaluateAsync(
+            RedisMuleScripts.CompleteClaim,
+            RedisKeys(
+                _keys.Action(id),
+                _keys.ActionsDue,
+                _keys.Pending,
+                _keys.Locked,
+                _keys.Completed,
+                _keys.BacklogByLane,
+                _keys.BacklogByActionKey,
+                _keys.Latencies),
+            RedisValues(
+                expectedConcurrencyToken.ToString(),
+                RedisMuleActionCodec.Milliseconds(completedOnUtc),
+                Ulid.NewUlid().ToString()));
+        if (result > 0)
+            await _connection.AcknowledgeReplicationAsync(database, cancellationToken);
+        return TransitionOutcome(result);
+    }
+
+    public async Task<MuleActionTransitionOutcome> FailClaimAsync(
+        Ulid id,
+        Ulid expectedConcurrencyToken,
+        string error,
+        DateTimeOffset now,
+        DateTimeOffset? nextAttemptOnUtc,
+        CancellationToken cancellationToken = default)
+    {
+        EnsureCanWrite();
+        var database = await _connection.GetDatabaseAsync(cancellationToken);
+        var result = (long)await database.ScriptEvaluateAsync(
+            RedisMuleScripts.FailClaim,
+            RedisKeys(
+                _keys.Action(id),
+                _keys.ActionsDue,
+                _keys.Pending,
+                _keys.Locked,
+                _keys.Failed,
+                _keys.BacklogByLane,
+                _keys.BacklogByActionKey,
+                _keys.RetriesByActionKey,
+                _keys.FailuresByActionKey,
+                _keys.Latencies),
+            RedisValues(
+                expectedConcurrencyToken.ToString(),
+                RedisMuleActionCodec.Milliseconds(now),
+                error ?? string.Empty,
+                RedisMuleActionCodec.Milliseconds(nextAttemptOnUtc),
+                Ulid.NewUlid().ToString()));
+        if (result > 0)
+            await _connection.AcknowledgeReplicationAsync(database, cancellationToken);
+        return TransitionOutcome(result);
+    }
+
+    public async Task<MuleActionTransitionOutcome> DeferClaimAsync(
+        Ulid id,
+        Ulid expectedConcurrencyToken,
+        DateTimeOffset deferredOnUtc,
+        DateTimeOffset notBeforeUtc,
+        DeferralReason reason,
+        CancellationToken cancellationToken = default)
+    {
+        EnsureCanWrite();
+        var database = await _connection.GetDatabaseAsync(cancellationToken);
+        var result = (long)await database.ScriptEvaluateAsync(
+            RedisMuleScripts.DeferClaim,
+            RedisKeys(_keys.Action(id), _keys.ActionsDue, _keys.Pending, _keys.Locked),
+            RedisValues(
+                expectedConcurrencyToken.ToString(),
+                RedisMuleActionCodec.Milliseconds(notBeforeUtc),
+                reason.Value,
+                Ulid.NewUlid().ToString()));
+        if (result > 0)
+            await _connection.AcknowledgeReplicationAsync(database, cancellationToken);
+        return TransitionOutcome(result);
     }
 
     public Task MarkCompletedAsync(
@@ -340,6 +457,14 @@ internal sealed partial class RedisMuleStorage :
 
     private static TimeSpan NormalizeTimeout(TimeSpan value)
         => value <= TimeSpan.Zero ? TimeSpan.FromMinutes(5) : value;
+
+    private static MuleActionTransitionOutcome TransitionOutcome(long result)
+        => result switch
+        {
+            > 0 => MuleActionTransitionOutcome.Applied,
+            < 0 => MuleActionTransitionOutcome.LeaseLost,
+            _ => MuleActionTransitionOutcome.NotFound
+        };
 
     private static string NormalizeLane(string lane)
         => string.IsNullOrWhiteSpace(lane) ? MuleSettings.DefaultLane : lane;

@@ -323,6 +323,79 @@ public sealed class RedisMuleTests : IAsyncLifetime
         }
     }
 
+    [RedisFact]
+    public async Task Deferred_And_Expired_Claims_Should_Respect_The_Current_Redis_Owner()
+    {
+        using var provider = CreateServices().BuildServiceProvider();
+        var now = DateTimeOffset.UtcNow;
+        Ulid actionId;
+        DurableAction firstClaim;
+
+        using (var scope = provider.CreateScope())
+        {
+            actionId = await scope.ServiceProvider.GetRequiredService<IMuleClient>().EnqueueAsync(
+                CaptureKey,
+                new TestPayload("deferred-owner"));
+            var storage = scope.ServiceProvider.GetRequiredService<IMuleStorage>();
+            var execution = Assert.IsAssignableFrom<IMuleExecutionStorage>(storage);
+            Assert.Contains(
+                await execution.ReadPendingCandidatesAsync(
+                    MuleSettings.DefaultLane, -1, 10, TimeSpan.FromSeconds(1), DateTimeOffset.UtcNow.AddSeconds(1)),
+                x => x.Id == actionId);
+            Assert.Null(await execution.FindActionAsync(Ulid.NewUlid()));
+            Assert.Equal(
+                MuleActionTransitionOutcome.NotFound,
+                await execution.CompleteClaimAsync(Ulid.NewUlid(), Ulid.NewUlid(), now));
+            firstClaim = await storage.LockAsync(actionId, TimeSpan.FromSeconds(1), now);
+
+            Assert.Equal(
+                MuleActionTransitionOutcome.Applied,
+                await execution.DeferClaimAsync(
+                    actionId,
+                    firstClaim.ConcurrencyToken,
+                    now,
+                    now.AddSeconds(2),
+                    DeferralReason.From("redis-lease-busy")));
+            var deferred = await execution.FindActionAsync(actionId);
+            Assert.Equal(DurableActionPendingReason.Deferred, deferred.PendingReason);
+            Assert.Equal("redis-lease-busy", deferred.DeferralReasonCode);
+            Assert.Equal(0, deferred.Attempts);
+        }
+
+        using (var scope = provider.CreateScope())
+        {
+            var storage = scope.ServiceProvider.GetRequiredService<IMuleStorage>();
+            var execution = Assert.IsAssignableFrom<IMuleExecutionStorage>(storage);
+            var secondClaim = await storage.LockAsync(actionId, TimeSpan.FromSeconds(1), now.AddSeconds(3));
+
+            Assert.NotNull(secondClaim);
+            Assert.Equal(
+                MuleActionTransitionOutcome.LeaseLost,
+                await execution.CompleteClaimAsync(actionId, firstClaim.ConcurrencyToken, now.AddSeconds(3)));
+            Assert.Equal(
+                MuleActionTransitionOutcome.Applied,
+                await execution.CompleteClaimAsync(actionId, secondClaim.ConcurrencyToken, now.AddSeconds(3)));
+
+            var failedId = await scope.ServiceProvider.GetRequiredService<IMuleClient>().EnqueueAsync(
+                CaptureKey,
+                new TestPayload("claim-failure"));
+            var failedClaim = await storage.LockAsync(failedId, TimeSpan.FromSeconds(1), now.AddSeconds(3));
+            Assert.Equal(
+                MuleActionTransitionOutcome.LeaseLost,
+                await execution.FailClaimAsync(
+                    failedId, Ulid.NewUlid(), "stale", now.AddSeconds(3), null));
+            Assert.Equal(
+                MuleActionTransitionOutcome.Applied,
+                await execution.FailClaimAsync(
+                    failedId, failedClaim.ConcurrencyToken, "retry", now.AddSeconds(3), now.AddSeconds(4)));
+            failedClaim = await storage.LockAsync(failedId, TimeSpan.FromSeconds(1), now.AddSeconds(5));
+            Assert.Equal(
+                MuleActionTransitionOutcome.Applied,
+                await execution.FailClaimAsync(
+                    failedId, failedClaim.ConcurrencyToken, "terminal", now.AddSeconds(5), null));
+        }
+    }
+
     public Task InitializeAsync() => Task.CompletedTask;
 
     public async Task DisposeAsync() => await CleanupAsync(_prefix);

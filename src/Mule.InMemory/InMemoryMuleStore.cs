@@ -285,6 +285,8 @@ internal sealed class InMemoryMuleStore
                 action.Status = DurableActionStatus.Locked;
                 action.LockedOnUtc = now;
                 action.StartedOnUtc ??= now;
+                action.PendingReason = DurableActionPendingReason.None;
+                action.DeferralReasonCode = null;
                 action.ConcurrencyToken = Ulid.NewUlid();
             }
 
@@ -310,9 +312,160 @@ internal sealed class InMemoryMuleStore
             action.Status = DurableActionStatus.Locked;
             action.LockedOnUtc = now;
             action.StartedOnUtc ??= now;
+            action.PendingReason = DurableActionPendingReason.None;
+            action.DeferralReasonCode = null;
             action.ConcurrencyToken = Ulid.NewUlid();
 
             return Clone(action);
+        }
+    }
+
+    public IReadOnlyCollection<DurableAction> ReadPendingCandidates(
+        string lane,
+        int offset,
+        int batchSize,
+        TimeSpan lockTimeout,
+        DateTimeOffset now)
+    {
+        lock (_gate)
+        {
+            var lockExpiration = now.Subtract(lockTimeout);
+            return _actions
+                .Where(x => IsLane(x, lane) && CanLock(x, lockExpiration, now))
+                .OrderBy(x => x.NextAttemptOnUtc ?? x.CreatedOnUtc)
+                .ThenBy(x => x.CreatedOnUtc)
+                .ThenBy(x => x.Id)
+                .Skip(Math.Max(0, offset))
+                .Take(Math.Max(1, batchSize))
+                .Select(Clone)
+                .ToArray();
+        }
+    }
+
+    public DurableAction FindAction(Ulid id)
+    {
+        lock (_gate)
+        {
+            var action = _actions.SingleOrDefault(x => x.Id == id);
+            return action == null ? null : Clone(action);
+        }
+    }
+
+    public MuleActionTransitionOutcome CompleteClaim(Ulid id, Ulid expectedToken, DateTimeOffset completedOnUtc)
+    {
+        lock (_gate)
+        {
+            var action = _actions.SingleOrDefault(x => x.Id == id);
+            if (action == null)
+                return MuleActionTransitionOutcome.NotFound;
+            if (action.Status != DurableActionStatus.Locked || action.ConcurrencyToken != expectedToken)
+                return MuleActionTransitionOutcome.LeaseLost;
+
+            MarkCompletedCore(action, completedOnUtc);
+            return MuleActionTransitionOutcome.Applied;
+        }
+    }
+
+    public IReadOnlyCollection<MuleActionStateProjectionResult> ProjectStateRange(
+        IReadOnlyCollection<MuleActionStateProjection> projections)
+    {
+        if (projections == null)
+            throw new ArgumentNullException(nameof(projections));
+
+        lock (_gate)
+        {
+            var results = new List<MuleActionStateProjectionResult>(projections.Count);
+            foreach (var projection in projections)
+            {
+                if (projection == null)
+                    throw new ArgumentException("Projection collection cannot contain null values.", nameof(projections));
+
+                var state = projection.Action;
+                var index = _actions.FindIndex(x => x.Id == state.Id);
+                if (index < 0)
+                {
+                    if (projection.ExpectedConcurrencyToken != null)
+                    {
+                        results.Add(new(state.Id, MuleActionTransitionOutcome.NotFound));
+                        continue;
+                    }
+
+                    _actions.Add(Clone(state));
+                    results.Add(new(state.Id, MuleActionTransitionOutcome.Applied));
+                    continue;
+                }
+
+                var current = _actions[index];
+                if (current.ConcurrencyToken == state.ConcurrencyToken)
+                {
+                    results.Add(new(state.Id, MuleActionTransitionOutcome.Applied));
+                    continue;
+                }
+
+                if (projection.ExpectedConcurrencyToken is { } expected)
+                {
+                    if (current.ConcurrencyToken != expected)
+                    {
+                        results.Add(new(state.Id, MuleActionTransitionOutcome.LeaseLost));
+                        continue;
+                    }
+                }
+                else if (current.ConcurrencyToken != state.ConcurrencyToken)
+                {
+                    results.Add(new(state.Id, MuleActionTransitionOutcome.LeaseLost));
+                    continue;
+                }
+
+                _actions[index] = Clone(state);
+                results.Add(new(state.Id, MuleActionTransitionOutcome.Applied));
+            }
+
+            return results;
+        }
+    }
+
+    public MuleActionTransitionOutcome FailClaim(
+        Ulid id,
+        Ulid expectedToken,
+        string error,
+        DateTimeOffset now,
+        DateTimeOffset? nextAttemptOnUtc)
+    {
+        lock (_gate)
+        {
+            var action = _actions.SingleOrDefault(x => x.Id == id);
+            if (action == null)
+                return MuleActionTransitionOutcome.NotFound;
+            if (action.Status != DurableActionStatus.Locked || action.ConcurrencyToken != expectedToken)
+                return MuleActionTransitionOutcome.LeaseLost;
+
+            MarkFailedCore(action, error, now, nextAttemptOnUtc);
+            return MuleActionTransitionOutcome.Applied;
+        }
+    }
+
+    public MuleActionTransitionOutcome DeferClaim(
+        Ulid id,
+        Ulid expectedToken,
+        DateTimeOffset notBeforeUtc,
+        DeferralReason reason)
+    {
+        lock (_gate)
+        {
+            var action = _actions.SingleOrDefault(x => x.Id == id);
+            if (action == null)
+                return MuleActionTransitionOutcome.NotFound;
+            if (action.Status != DurableActionStatus.Locked || action.ConcurrencyToken != expectedToken)
+                return MuleActionTransitionOutcome.LeaseLost;
+
+            action.Status = DurableActionStatus.Pending;
+            action.LockedOnUtc = null;
+            action.NextAttemptOnUtc = notBeforeUtc;
+            action.PendingReason = DurableActionPendingReason.Deferred;
+            action.DeferralReasonCode = reason.Value;
+            action.TerminalOnUtc = null;
+            action.ConcurrencyToken = Ulid.NewUlid();
+            return MuleActionTransitionOutcome.Applied;
         }
     }
 
@@ -334,13 +487,7 @@ internal sealed class InMemoryMuleStore
         lock (_gate)
         {
             var action = Find(id);
-            action.Status = DurableActionStatus.Completed;
-            action.CompletedOnUtc = completedOnUtc;
-            action.TerminalOnUtc = completedOnUtc;
-            action.LockedOnUtc = null;
-            action.NextAttemptOnUtc = null;
-            action.LastError = null;
-            action.ConcurrencyToken = Ulid.NewUlid();
+            MarkCompletedCore(action, completedOnUtc);
         }
     }
 
@@ -349,13 +496,7 @@ internal sealed class InMemoryMuleStore
         lock (_gate)
         {
             var action = Find(id);
-            action.Attempts++;
-            action.Status = nextAttemptOnUtc == null ? DurableActionStatus.Failed : DurableActionStatus.Pending;
-            action.LastError = error;
-            action.LockedOnUtc = null;
-            action.NextAttemptOnUtc = nextAttemptOnUtc;
-            action.TerminalOnUtc = nextAttemptOnUtc == null ? DateTimeOffset.UtcNow : null;
-            action.ConcurrencyToken = Ulid.NewUlid();
+            MarkFailedCore(action, error, DateTimeOffset.UtcNow, nextAttemptOnUtc);
         }
     }
 
@@ -409,6 +550,12 @@ internal sealed class InMemoryMuleStore
             return new MuleDiagnosticsSnapshot
             {
                 Pending = _actions.Count(x => x.Status == DurableActionStatus.Pending),
+                Ready = _actions.Count(x =>
+                    x.Status == DurableActionStatus.Pending &&
+                    (x.NextAttemptOnUtc == null || x.NextAttemptOnUtc <= now)),
+                Deferred = _actions.Count(x =>
+                    x.Status == DurableActionStatus.Pending &&
+                    x.PendingReason == DurableActionPendingReason.Deferred),
                 Locked = _actions.Count(x => x.Status == DurableActionStatus.Locked),
                 Completed = _actions.Count(x => x.Status == DurableActionStatus.Completed),
                 Failed = _actions.Count(x => x.Status == DurableActionStatus.Failed),
@@ -426,6 +573,8 @@ internal sealed class InMemoryMuleStore
                 ReplayRejected = runtime.ReplayRejected,
                 ReplayRetried = runtime.ReplayRetried,
                 ReplayMaterializationFailures = runtime.ReplayMaterializationFailures,
+                ActivationsOmitted = runtime.ActivationsOmitted,
+                ActivationsRecovered = runtime.ActivationsRecovered,
                 OldestPendingOnUtc = oldestPendingOnUtc,
                 OldestLockedOnUtc = oldestLockedOnUtc,
                 OldestFailedOnUtc = _actions
@@ -462,6 +611,9 @@ internal sealed class InMemoryMuleStore
                 WaitingExecutionByLane = runtime.WaitingExecutionByLane,
                 ExecutingByLane = runtime.ExecutingByLane,
                 ExecutorSaturationByLane = runtime.ExecutorSaturationByLane,
+                DeferredByLane = runtime.DeferredByLane,
+                DeferredByReason = runtime.DeferredByReason,
+                ExecutionKeyContentionByLane = runtime.ExecutionKeyContentionByLane,
                 OldestWaitingExecutionAgeByLane = runtime.OldestWaitingExecutionAgeByLane
             };
         }
@@ -486,6 +638,8 @@ internal sealed class InMemoryMuleStore
             LockedOnUtc = action.LockedOnUtc,
             StartedOnUtc = action.StartedOnUtc,
             NextAttemptOnUtc = action.NextAttemptOnUtc,
+            PendingReason = action.PendingReason,
+            DeferralReasonCode = action.DeferralReasonCode,
             CompletedOnUtc = action.CompletedOnUtc,
             CancelledOnUtc = action.CancelledOnUtc,
             TerminalOnUtc = action.TerminalOnUtc
@@ -582,6 +736,38 @@ internal sealed class InMemoryMuleStore
 
         _actions.Add(Clone(action));
         return true;
+    }
+
+    private static void MarkCompletedCore(DurableAction action, DateTimeOffset completedOnUtc)
+    {
+        action.Status = DurableActionStatus.Completed;
+        action.CompletedOnUtc = completedOnUtc;
+        action.TerminalOnUtc = completedOnUtc;
+        action.LockedOnUtc = null;
+        action.NextAttemptOnUtc = null;
+        action.PendingReason = DurableActionPendingReason.None;
+        action.DeferralReasonCode = null;
+        action.LastError = null;
+        action.ConcurrencyToken = Ulid.NewUlid();
+    }
+
+    private static void MarkFailedCore(
+        DurableAction action,
+        string error,
+        DateTimeOffset now,
+        DateTimeOffset? nextAttemptOnUtc)
+    {
+        action.Attempts++;
+        action.Status = nextAttemptOnUtc == null ? DurableActionStatus.Failed : DurableActionStatus.Pending;
+        action.LastError = error;
+        action.LockedOnUtc = null;
+        action.NextAttemptOnUtc = nextAttemptOnUtc;
+        action.PendingReason = nextAttemptOnUtc == null
+            ? DurableActionPendingReason.None
+            : DurableActionPendingReason.Retry;
+        action.DeferralReasonCode = null;
+        action.TerminalOnUtc = nextAttemptOnUtc == null ? now : null;
+        action.ConcurrencyToken = Ulid.NewUlid();
     }
 
     private static DateTimeOffset? GetNextPendingOnUtc(

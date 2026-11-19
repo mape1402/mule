@@ -251,6 +251,25 @@ public sealed class EntityFrameworkStorageCoverageTests
         Assert.False(InvokeStorageHelper("IsUniqueConstraintViolation", new DbUpdateException("x")));
         Assert.Equal(MuleSettings.DefaultLane, InvokeStorageHelper<string>("NormalizeLane", " "));
         Assert.Equal("lane", InvokeStorageHelper<string>("NormalizeLane", "lane"));
+
+        var now = DateTimeOffset.UtcNow;
+        var lockTimeout = TimeSpan.FromMinutes(1);
+        var expiration = now.Subtract(lockTimeout);
+        Assert.Equal(now, InvokeStorageHelper<DateTimeOffset?>(
+            "GetNextPendingOnUtc", DurableActionStatus.Pending, null, null, expiration, lockTimeout, now));
+        Assert.Equal(now, InvokeStorageHelper<DateTimeOffset?>(
+            "GetNextPendingOnUtc", DurableActionStatus.Pending, null, now.AddSeconds(-1), expiration, lockTimeout, now));
+        Assert.Equal(now.AddSeconds(1), InvokeStorageHelper<DateTimeOffset?>(
+            "GetNextPendingOnUtc", DurableActionStatus.Pending, null, now.AddSeconds(1), expiration, lockTimeout, now));
+        Assert.Null(InvokeStorageHelper<DateTimeOffset?>(
+            "GetNextPendingOnUtc", DurableActionStatus.Locked, null, null, expiration, lockTimeout, now));
+        Assert.Equal(now, InvokeStorageHelper<DateTimeOffset?>(
+            "GetNextPendingOnUtc", DurableActionStatus.Locked, expiration, null, expiration, lockTimeout, now));
+        var activeLock = now.AddSeconds(-10);
+        Assert.Equal(activeLock.Add(lockTimeout), InvokeStorageHelper<DateTimeOffset?>(
+            "GetNextPendingOnUtc", DurableActionStatus.Locked, activeLock, null, expiration, lockTimeout, now));
+        Assert.Null(InvokeStorageHelper<DateTimeOffset?>(
+            "GetNextPendingOnUtc", DurableActionStatus.Completed, null, null, expiration, lockTimeout, now));
     }
 
     [Fact]
@@ -339,12 +358,12 @@ public sealed class EntityFrameworkStorageCoverageTests
     private static bool InvokeStorageHelper(string method, Exception exception)
         => InvokeStorageHelper<bool>(method, exception);
 
-    private static T InvokeStorageHelper<T>(string method, object argument)
+    private static T InvokeStorageHelper<T>(string method, params object[] arguments)
     {
         var methodInfo = typeof(EntityFrameworkMuleStorage<TestDbContext>).GetMethod(
             method,
             BindingFlags.Static | BindingFlags.NonPublic);
-        return (T)methodInfo.Invoke(null, [argument]);
+        return (T)methodInfo.Invoke(null, arguments);
     }
 
     private static IHost CreateHost(
