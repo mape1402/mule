@@ -4,6 +4,26 @@ All notable changes to Mule packages will be documented in this file.
 
 ## [Unreleased]
 
+## [v2.4.0] - 2026-11-19
+
+### Added
+
+- Added typed execution keys and candidate-first scheduling so contended actions do not occupy executor capacity while unrelated keys continue in parallel.
+- Added cooperative action deferral through `MuleActionContext.DeferUntil(...)`, preserving the durable action identity without consuming the retry budget.
+- Added persisted pending and deferral reasons, due-time recovery, and diagnostics for ready, deferred, contended, omitted, and recovered work.
+- Added token-aware execution and state-projection contracts for durable providers, with implementations for InMemory, EF Core, Redis, and both FastLane providers.
+
+### Changed
+
+- Changed foreground activation to use a nonblocking in-memory dispatch attempt and fall back to durable recovery when the dispatch queue is full.
+- Changed recovery to read candidates in batches before claiming them, rotate around contended execution keys, and wake when a key becomes available.
+- Changed FastLane flushing to project complete versioned action state in order, with expiring ownership tokens for replica-safe retries.
+
+### Fixed
+
+- Fixed FastLane insert-versus-terminal races where completion, failure, cancellation, retry, or deferral could reach durable storage before the original intent.
+- Fixed stale Redis FastLane flush owners being able to acknowledge or release a newer replica's reservation.
+
 ## [v2.3.2] - 2026-11-03
 
 ### Fixed
