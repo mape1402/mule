@@ -26,4 +26,14 @@ public sealed record MuleRuntimeMetricsSnapshot(
     public int ReplayRetried { get; init; }
 
     public int ReplayMaterializationFailures { get; init; }
+
+    public IReadOnlyDictionary<string, int> DeferredByLane { get; init; } = new Dictionary<string, int>();
+
+    public IReadOnlyDictionary<DeferralReason, int> DeferredByReason { get; init; } = new Dictionary<DeferralReason, int>();
+
+    public IReadOnlyDictionary<string, int> ExecutionKeyContentionByLane { get; init; } = new Dictionary<string, int>();
+
+    public int ActivationsOmitted { get; init; }
+
+    public int ActivationsRecovered { get; init; }
 }

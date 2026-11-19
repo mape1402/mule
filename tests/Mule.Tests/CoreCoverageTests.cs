@@ -26,6 +26,28 @@ public sealed class CoreCoverageTests
         Assert.True(ActionKey.From("a.b") != ActionKey.From("a.c"));
         Assert.False(ActionKey.From("a.b").Equals("a.b"));
 
+        var executionKey = ExecutionKey.From("instance:1");
+        Assert.Equal("instance:1", executionKey.Value);
+        Assert.Equal("instance:1", executionKey.ToString());
+        Assert.True(executionKey.Equals((object)ExecutionKey.From("instance:1")));
+        Assert.True(executionKey == ExecutionKey.From("instance:1"));
+        Assert.True(executionKey != ExecutionKey.From("instance:2"));
+        Assert.False(executionKey.Equals("instance:1"));
+        Assert.Equal(default(ExecutionKey).GetHashCode(), default(ExecutionKey).GetHashCode());
+        Assert.Throws<ArgumentException>(() => ExecutionKey.From(" "));
+        Assert.Throws<ArgumentException>(() => ExecutionKey.From(new string('x', 513)));
+
+        var reason = DeferralReason.From("lease-busy");
+        Assert.Equal("lease-busy", reason.Value);
+        Assert.Equal("lease-busy", reason.ToString());
+        Assert.True(reason.Equals((object)DeferralReason.From("lease-busy")));
+        Assert.True(reason == DeferralReason.From("lease-busy"));
+        Assert.True(reason != DeferralReason.From("quota"));
+        Assert.False(reason.Equals("lease-busy"));
+        Assert.Equal(default(DeferralReason).GetHashCode(), default(DeferralReason).GetHashCode());
+        Assert.Throws<ArgumentException>(() => DeferralReason.From(" "));
+        Assert.Throws<ArgumentException>(() => DeferralReason.From(new string('x', 129)));
+
         Assert.Equal("00000000000000000000000000", Ulid.Empty.ToString());
         var first = Ulid.Parse("01ARZ3NDEKTSV4RRFFQ69G5FAV");
         var second = Ulid.Parse("01ARZ3NDEKTSV4RRFFQ69G5FAW");
@@ -85,8 +107,21 @@ public sealed class CoreCoverageTests
         Assert.Same(services, context.Services);
         Assert.Empty(new MuleActionContext(new DurableAction(), services).Metadata);
         Assert.Empty(new MuleActionContext(new DurableAction { Metadata = "null" }, services).Metadata);
+        Assert.Throws<ArgumentException>(() => context.DeferUntil(default, DeferralReason.From("invalid-date")));
+        Assert.Throws<ArgumentException>(() => context.DeferUntil(DateTimeOffset.UtcNow, default));
+        var notBefore = DateTimeOffset.UtcNow.AddMinutes(1);
+        context.DeferUntil(notBefore, DeferralReason.From("capacity"));
+        Assert.Equal(notBefore, context.GetDeferral().NotBeforeUtc);
         Assert.Throws<ArgumentNullException>(() => new MuleActionContext(null, services));
         Assert.Throws<ArgumentNullException>(() => new MuleActionContext(action, null));
+
+        var projectionToken = Ulid.NewUlid();
+        var projection = new MuleActionStateProjection(action, action.ConcurrencyToken, projectionToken);
+        Assert.Same(action, projection.Action);
+        Assert.Equal(action.ConcurrencyToken, projection.ExpectedConcurrencyToken);
+        Assert.Equal(projectionToken, projection.ProjectionToken);
+        Assert.NotEqual(Ulid.Empty, new MuleActionStateProjection(action, null).ProjectionToken);
+        Assert.Throws<ArgumentNullException>(() => new MuleActionStateProjection(null, null));
     }
 
     [Fact]
@@ -322,6 +357,39 @@ public sealed class CoreCoverageTests
     }
 
     [Fact]
+    public void ExecutionKeyCoordinator_Should_Reject_Default_Keys()
+    {
+        var disabled = new MuleExecutionKeyCoordinator(
+            new MuleSchedulerSignal(),
+            Options.Create(new MuleSettings()));
+        Assert.True(disabled.TryAcquire(new DurableAction(), out var noLease, out var noKey));
+        Assert.Null(noLease);
+        Assert.Null(noKey);
+
+        var coordinator = new MuleExecutionKeyCoordinator(
+            new MuleSchedulerSignal(),
+            Options.Create(new MuleSettings
+            {
+                ExecutionKeySelector = _ => default(ExecutionKey)
+            }));
+
+        Assert.Throws<InvalidOperationException>(() =>
+            coordinator.TryAcquire(new DurableAction(), out _, out _));
+
+        var keyed = new MuleExecutionKeyCoordinator(
+            new MuleSchedulerSignal(),
+            Options.Create(new MuleSettings
+            {
+                ExecutionKeySelector = _ => ExecutionKey.From("instance:1")
+            }));
+        Assert.True(keyed.TryAcquire(new DurableAction(), out var lease, out var executionKey));
+        Assert.Equal(ExecutionKey.From("instance:1"), executionKey);
+        Assert.False(keyed.TryAcquire(new DurableAction(), out _, out _));
+        lease.Dispose();
+        lease.Dispose();
+    }
+
+    [Fact]
     public async Task ChannelQueue_Should_Dequeue_By_Lane_And_Unassigned_Lanes()
     {
         var settings = Options.Create(new MuleSettings
@@ -396,10 +464,11 @@ public sealed class CoreCoverageTests
             signal,
             Options.Create(new MuleSettings()));
         var id = Ulid.NewUlid();
+        queue.TryEnqueue(id, "lane").Returns(true);
 
         await immediate.NotifySavedAsync(id, "lane");
 
-        await queue.Received(1).EnqueueAsync(id, "lane", Arg.Any<CancellationToken>());
+        queue.Received(1).TryEnqueue(id, "lane");
 
         var transactionalQueue = Substitute.For<IMuleDispatchQueue>();
         var transactional = new AmbientTransactionMuleCommitNotifier(
@@ -407,10 +476,11 @@ public sealed class CoreCoverageTests
             signal,
             Options.Create(new MuleSettings()));
         var committedId = Ulid.NewUlid();
+        transactionalQueue.TryEnqueue(committedId, "tx").Returns(true);
         using (var scope = new TransactionScope(TransactionScopeAsyncFlowOption.Enabled))
         {
             await transactional.NotifySavedAsync(committedId, "tx");
-            await transactionalQueue.DidNotReceiveWithAnyArgs().EnqueueAsync(default, default);
+            transactionalQueue.DidNotReceiveWithAnyArgs().TryEnqueue(default, default);
             scope.Complete();
         }
 
@@ -418,7 +488,7 @@ public sealed class CoreCoverageTests
         {
             try
             {
-                await transactionalQueue.Received(1).EnqueueAsync(committedId, "tx", Arg.Any<CancellationToken>());
+                transactionalQueue.Received(1).TryEnqueue(committedId, "tx");
                 return true;
             }
             catch
@@ -478,6 +548,7 @@ public sealed class CoreCoverageTests
         metrics.RecordExecutionStopped("blue");
         metrics.RecordExecutionStopped("never-queued");
         metrics.RecordWaitingExecutionCanceled("missing");
+        metrics.RecordActivationRecovered(0);
 
         var snapshot = metrics.GetSnapshot(now);
 
@@ -546,6 +617,27 @@ public sealed class CoreCoverageTests
         await saturated.EnqueueAsync(CreateStoredAction("queued"));
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
             saturated.EnqueueAsync(CreateStoredAction("blocked"), canceled.Token).AsTask());
+
+        var keyCoordinator = new MuleExecutionKeyCoordinator(
+            new MuleSchedulerSignal(),
+            Options.Create(new MuleSettings
+            {
+                ExecutionKeySelector = _ => ExecutionKey.From("lease:test")
+            }));
+        Assert.True(keyCoordinator.TryAcquire(
+            CreateStoredAction("leased-blocked"),
+            out var executionKeyLease,
+            out _));
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            saturated.EnqueueAsync(
+                CreateStoredAction("leased-blocked"),
+                executionKeyLease,
+                canceled.Token).AsTask());
+        Assert.True(keyCoordinator.TryAcquire(
+            CreateStoredAction("lease-released"),
+            out var reacquiredLease,
+            out _));
+        reacquiredLease.Dispose();
 
         Assert.Throws<ArgumentNullException>(() => new MuleActionExecutor(null, new MuleSchedulerSignal(), settings, new MuleRuntimeMetrics(), NullLogger<MuleActionExecutor>.Instance));
         Assert.Throws<ArgumentNullException>(() => new MuleActionExecutor(services.GetRequiredService<IServiceScopeFactory>(), null, settings, new MuleRuntimeMetrics(), NullLogger<MuleActionExecutor>.Instance));
@@ -636,6 +728,90 @@ public sealed class CoreCoverageTests
         await running.CancelAsync();
     }
 
+    [Fact]
+    public async Task ActionExecutor_Should_Ignore_Stale_Claim_Transitions_And_Propagate_Shutdown()
+    {
+        var storage = Substitute.For<IMuleStorage, IMuleExecutionStorage>();
+        var executionStorage = (IMuleExecutionStorage)storage;
+        executionStorage.FailClaimAsync(
+                Arg.Any<Ulid>(), Arg.Any<Ulid>(), Arg.Any<string>(), Arg.Any<DateTimeOffset>(), Arg.Any<DateTimeOffset?>(), Arg.Any<CancellationToken>())
+            .Returns(MuleActionTransitionOutcome.LeaseLost);
+        executionStorage.DeferClaimAsync(
+                Arg.Any<Ulid>(), Arg.Any<Ulid>(), Arg.Any<DateTimeOffset>(), Arg.Any<DateTimeOffset>(), Arg.Any<DeferralReason>(), Arg.Any<CancellationToken>())
+            .Returns(MuleActionTransitionOutcome.LeaseLost);
+        executionStorage.CompleteClaimAsync(
+                Arg.Any<Ulid>(), Arg.Any<Ulid>(), Arg.Any<DateTimeOffset>(), Arg.Any<CancellationToken>())
+            .Returns(MuleActionTransitionOutcome.LeaseLost);
+
+        var registry = new MuleActionRegistry();
+        registry.Add(new MuleActionHandler<ServiceActionProbe, Payload>(
+            Key,
+            static (_, context, cancellationToken) => context.Payload.Value switch
+            {
+                "fail" => ValueTask.FromException(new InvalidOperationException("handler failed")),
+                "cancel" => ValueTask.FromException(new OperationCanceledException(cancellationToken)),
+                "defer" => Defer(context),
+                "defer-future" => DeferFuture(context),
+                _ => ValueTask.CompletedTask
+            }));
+        using var services = new ServiceCollection()
+            .AddSingleton<IMuleStorage>(storage)
+            .AddSingleton(registry)
+            .AddSingleton(new ServiceActionProbe())
+            .AddSingleton<IMuleSerializer, JsonMuleSerializer>()
+            .BuildServiceProvider();
+        var executor = new MuleActionExecutor(
+            services.GetRequiredService<IServiceScopeFactory>(),
+            new MuleSchedulerSignal(),
+            Options.Create(new MuleSettings
+            {
+                MinimumDeferralDelay = TimeSpan.Zero,
+                MaxAttempts = 1
+            }),
+            new MuleRuntimeMetrics(),
+            NullLogger<MuleActionExecutor>.Instance);
+
+        await InvokeExecutorActionAsync(executor, CreateStoredAction("fail"), CancellationToken.None);
+        await InvokeExecutorActionAsync(executor, CreateStoredAction("defer"), CancellationToken.None);
+        executionStorage.DeferClaimAsync(
+                Arg.Any<Ulid>(), Arg.Any<Ulid>(), Arg.Any<DateTimeOffset>(), Arg.Any<DateTimeOffset>(), Arg.Any<DeferralReason>(), Arg.Any<CancellationToken>())
+            .Returns(MuleActionTransitionOutcome.Applied);
+        await InvokeExecutorActionAsync(executor, CreateStoredAction("defer"), CancellationToken.None);
+        await InvokeExecutorActionAsync(executor, CreateStoredAction("defer-future"), CancellationToken.None);
+        await InvokeExecutorActionAsync(executor, CreateStoredAction("complete"), CancellationToken.None);
+        using var cancelled = new CancellationTokenSource();
+        cancelled.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            InvokeExecutorActionAsync(executor, CreateStoredAction("cancel"), cancelled.Token));
+
+        using var legacyServices = new ServiceCollection()
+            .AddSingleton<IMuleStorage>(new RecordingStorage())
+            .AddSingleton(registry)
+            .AddSingleton(new ServiceActionProbe())
+            .AddSingleton<IMuleSerializer, JsonMuleSerializer>()
+            .BuildServiceProvider();
+        var legacyExecutor = new MuleActionExecutor(
+            legacyServices.GetRequiredService<IServiceScopeFactory>(),
+            new MuleSchedulerSignal(),
+            Options.Create(new MuleSettings()),
+            new MuleRuntimeMetrics(),
+            NullLogger<MuleActionExecutor>.Instance);
+        await Assert.ThrowsAsync<NotSupportedException>(() =>
+            InvokeExecutorActionAsync(legacyExecutor, CreateStoredAction("defer"), CancellationToken.None));
+
+        static ValueTask Defer(MuleActionContext<Payload> context)
+        {
+            context.DeferUntil(DateTimeOffset.UtcNow.AddMinutes(-1), DeferralReason.From("busy"));
+            return ValueTask.CompletedTask;
+        }
+
+        static ValueTask DeferFuture(MuleActionContext<Payload> context)
+        {
+            context.DeferUntil(DateTimeOffset.UtcNow.AddMinutes(1), DeferralReason.From("future"));
+            return ValueTask.CompletedTask;
+        }
+    }
+
     private static DurableAction CreateAction<T>(T payload)
         => new()
         {
@@ -646,6 +822,17 @@ public sealed class CoreCoverageTests
 
     private static DurableAction CreateStoredAction(string value)
         => CreateAction(new Payload(value));
+
+    private static async Task InvokeExecutorActionAsync(
+        MuleActionExecutor executor,
+        DurableAction action,
+        CancellationToken cancellationToken)
+    {
+        var method = typeof(MuleActionExecutor).GetMethod(
+            "ExecuteActionAsync",
+            BindingFlags.Instance | BindingFlags.NonPublic);
+        await (Task)method.Invoke(executor, [action, cancellationToken]);
+    }
 
     private static async Task WaitUntilAsync(Func<Task<bool>> condition)
     {

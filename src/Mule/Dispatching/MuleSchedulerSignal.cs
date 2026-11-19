@@ -4,9 +4,9 @@ using System.Threading.Channels;
 
 internal sealed class MuleSchedulerSignal
 {
-    private readonly Channel<bool> _recoverySignals = Channel.CreateUnbounded<bool>();
-    private readonly Channel<bool> _cleanupSignals = Channel.CreateUnbounded<bool>();
-    private readonly Channel<bool> _replaySignals = Channel.CreateUnbounded<bool>();
+    private readonly Channel<bool> _recoverySignals = CreateSignalChannel();
+    private readonly Channel<bool> _cleanupSignals = CreateSignalChannel();
+    private readonly Channel<bool> _replaySignals = CreateSignalChannel();
 
     public void SignalRecovery()
         => _recoverySignals.Writer.TryWrite(true);
@@ -33,15 +33,13 @@ internal sealed class MuleSchedulerSignal
         => await _replaySignals.Reader.ReadAsync(cancellationToken);
 
     private static void SignalAt(Channel<bool> channel, DateTimeOffset dueOnUtc)
-    {
-        _ = Task.Run(async () =>
+        => channel.Writer.TryWrite(true);
+
+    private static Channel<bool> CreateSignalChannel()
+        => Channel.CreateBounded<bool>(new BoundedChannelOptions(1)
         {
-            var delay = dueOnUtc - DateTimeOffset.UtcNow;
-
-            if (delay > TimeSpan.Zero)
-                await Task.Delay(delay);
-
-            channel.Writer.TryWrite(true);
+            FullMode = BoundedChannelFullMode.DropWrite,
+            SingleReader = false,
+            SingleWriter = false
         });
-    }
 }

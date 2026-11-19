@@ -1,5 +1,6 @@
 namespace Mule.Dispatching;
 
+using System.Collections.Concurrent;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -11,11 +12,14 @@ internal sealed class MuleDispatcherHostedService : BackgroundService
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly IMuleDispatchQueue _dispatchQueue;
     private readonly MuleActionExecutor _executor;
+    private readonly MuleExecutionKeyCoordinator _executionKeys;
     private readonly MuleSchedulerSignal _schedulerSignal;
     private readonly MuleSettings _settings;
     private readonly MuleRuntimeMetrics _metrics;
     private readonly ILogger<MuleDispatcherHostedService> _logger;
     private readonly Dictionary<string, DateTimeOffset> _nextLanePollingOnUtc = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, int> _candidateOffsets = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, SemaphoreSlim> _keyedLaneScans = new(StringComparer.OrdinalIgnoreCase);
     private int _fairScheduleCursor;
 
     public MuleDispatcherHostedService(
@@ -26,10 +30,32 @@ internal sealed class MuleDispatcherHostedService : BackgroundService
         IOptions<MuleSettings> settings,
         MuleRuntimeMetrics metrics,
         ILogger<MuleDispatcherHostedService> logger)
+        : this(
+            scopeFactory,
+            dispatchQueue,
+            executor,
+            new MuleExecutionKeyCoordinator(schedulerSignal, settings),
+            schedulerSignal,
+            settings,
+            metrics,
+            logger)
+    {
+    }
+
+    public MuleDispatcherHostedService(
+        IServiceScopeFactory scopeFactory,
+        IMuleDispatchQueue dispatchQueue,
+        MuleActionExecutor executor,
+        MuleExecutionKeyCoordinator executionKeys,
+        MuleSchedulerSignal schedulerSignal,
+        IOptions<MuleSettings> settings,
+        MuleRuntimeMetrics metrics,
+        ILogger<MuleDispatcherHostedService> logger)
     {
         _scopeFactory = scopeFactory ?? throw new ArgumentNullException(nameof(scopeFactory));
         _dispatchQueue = dispatchQueue ?? throw new ArgumentNullException(nameof(dispatchQueue));
         _executor = executor ?? throw new ArgumentNullException(nameof(executor));
+        _executionKeys = executionKeys ?? throw new ArgumentNullException(nameof(executionKeys));
         _schedulerSignal = schedulerSignal ?? throw new ArgumentNullException(nameof(schedulerSignal));
         _settings = settings?.Value ?? throw new ArgumentNullException(nameof(settings));
         _metrics = metrics ?? throw new ArgumentNullException(nameof(metrics));
@@ -38,6 +64,7 @@ internal sealed class MuleDispatcherHostedService : BackgroundService
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
+        ValidateExecutionStorage();
         var assignedLanes = GetLaneNames().ToArray();
         var queueWorkers = assignedLanes
             .SelectMany(lane => Enumerable
@@ -248,6 +275,12 @@ internal sealed class MuleDispatcherHostedService : BackgroundService
 
     private async Task ClaimAndDispatchLaneAsync(string lane, CancellationToken cancellationToken)
     {
+        if (_executionKeys.IsEnabled)
+        {
+            await ReadAndDispatchKeyedLaneAsync(lane, cancellationToken);
+            return;
+        }
+
         var batches = 0;
         var actionsClaimed = 0;
 
@@ -274,6 +307,7 @@ internal sealed class MuleDispatcherHostedService : BackgroundService
             batches++;
             actionsClaimed += actions.Count;
             _metrics.RecordClaimed(lane, actions.Count);
+            _metrics.RecordActivationRecovered(actions.Count);
 
             await _executor.EnqueueRangeAsync(actions, cancellationToken);
 
@@ -297,6 +331,12 @@ internal sealed class MuleDispatcherHostedService : BackgroundService
 
     private async Task DispatchQueuedActionAsync(MuleDispatchItem item, CancellationToken cancellationToken)
     {
+        if (_executionKeys.IsEnabled)
+        {
+            await DispatchKeyedQueuedActionAsync(item, cancellationToken);
+            return;
+        }
+
         await _executor.WaitForCapacityAsync(item.Lane, cancellationToken);
 
         using var scope = _scopeFactory.CreateScope();
@@ -311,6 +351,151 @@ internal sealed class MuleDispatcherHostedService : BackgroundService
 
         await _executor.EnqueueAsync(action, cancellationToken);
     }
+
+    private async Task DispatchKeyedQueuedActionAsync(MuleDispatchItem item, CancellationToken cancellationToken)
+    {
+        using var scope = _scopeFactory.CreateScope();
+        var storage = scope.ServiceProvider.GetRequiredService<IMuleStorage>();
+        var executionStorage = RequireExecutionStorage(storage);
+        var candidate = await executionStorage.FindActionAsync(item.ActionId, cancellationToken);
+        if (candidate == null)
+            return;
+
+        if (!_executionKeys.TryAcquire(candidate, out var keyLease, out _))
+        {
+            _metrics.RecordExecutionKeyContention(item.Lane);
+            _schedulerSignal.SignalRecovery();
+            return;
+        }
+
+        try
+        {
+            await _executor.WaitForCapacityAsync(item.Lane, cancellationToken);
+            var action = await storage.LockAsync(item.ActionId, GetLockTimeout(), DateTimeOffset.UtcNow, cancellationToken);
+            if (action == null)
+                return;
+
+            await storage.SaveChangesAsync(cancellationToken);
+            _metrics.RecordClaimed(action.Lane, 1);
+            await _executor.EnqueueAsync(action, keyLease, cancellationToken);
+            keyLease = null;
+        }
+        finally
+        {
+            keyLease?.Dispose();
+        }
+    }
+
+    private async Task ReadAndDispatchKeyedLaneAsync(string lane, CancellationToken cancellationToken)
+    {
+        var normalizedLane = NormalizeLane(lane);
+        var scanGate = _keyedLaneScans.GetOrAdd(normalizedLane, static _ => new SemaphoreSlim(1, 1));
+        await scanGate.WaitAsync(cancellationToken);
+        try
+        {
+            await ReadAndDispatchKeyedLaneCoreAsync(normalizedLane, cancellationToken);
+        }
+        finally
+        {
+            scanGate.Release();
+        }
+    }
+
+    private async Task ReadAndDispatchKeyedLaneCoreAsync(string normalizedLane, CancellationToken cancellationToken)
+    {
+        var target = GetDispatchBatchSize(normalizedLane);
+        var candidateBatchSize = Math.Max(target, _settings.ExecutionKeyCandidateBatchSize);
+        var offset = _candidateOffsets.TryGetValue(normalizedLane, out var currentOffset) ? currentOffset : 0;
+        using var scope = _scopeFactory.CreateScope();
+        var storage = scope.ServiceProvider.GetRequiredService<IMuleStorage>();
+        var executionStorage = RequireExecutionStorage(storage);
+        var candidates = await executionStorage.ReadPendingCandidatesAsync(
+            normalizedLane,
+            offset,
+            candidateBatchSize,
+            GetLockTimeout(),
+            DateTimeOffset.UtcNow,
+            cancellationToken);
+
+        if (candidates.Count == 0 && offset > 0)
+        {
+            offset = 0;
+            candidates = await executionStorage.ReadPendingCandidatesAsync(
+                normalizedLane,
+                offset,
+                candidateBatchSize,
+                GetLockTimeout(),
+                DateTimeOffset.UtcNow,
+                cancellationToken);
+        }
+
+        _candidateOffsets[normalizedLane] = candidates.Count < candidateBatchSize
+            ? 0
+            : checked(offset + candidates.Count);
+
+        var dispatched = 0;
+        var contended = false;
+        foreach (var candidate in candidates)
+        {
+            if (dispatched >= target)
+                break;
+
+            if (!_executionKeys.TryAcquire(candidate, out var keyLease, out _))
+            {
+                contended = true;
+                _metrics.RecordExecutionKeyContention(normalizedLane);
+                continue;
+            }
+
+            try
+            {
+                await _executor.WaitForCapacityAsync(normalizedLane, cancellationToken);
+                var action = await storage.LockAsync(candidate.Id, GetLockTimeout(), DateTimeOffset.UtcNow, cancellationToken);
+                if (action == null)
+                    continue;
+
+                await storage.SaveChangesAsync(cancellationToken);
+                _metrics.RecordClaimed(action.Lane, 1);
+                _metrics.RecordActivationRecovered();
+                await _executor.EnqueueAsync(action, keyLease, cancellationToken);
+                keyLease = null;
+                dispatched++;
+            }
+            finally
+            {
+                keyLease?.Dispose();
+            }
+        }
+
+        if (dispatched == 0 && contended)
+            await WaitForKeyContentionAsync(cancellationToken);
+    }
+
+    private async Task WaitForKeyContentionAsync(CancellationToken cancellationToken)
+    {
+        var delay = _settings.ExecutionKeyContentionDelay <= TimeSpan.Zero
+            ? TimeSpan.FromMilliseconds(100)
+            : _settings.ExecutionKeyContentionDelay;
+        await WaitForSignalOrDueAsync(
+            token => _schedulerSignal.WaitForRecoveryAsync(token).AsTask(),
+            DateTimeOffset.UtcNow.Add(delay),
+            cancellationToken);
+    }
+
+    private void ValidateExecutionStorage()
+    {
+        if (!_executionKeys.IsEnabled)
+            return;
+
+        using var scope = _scopeFactory.CreateScope();
+        var storage = scope.ServiceProvider.GetRequiredService<IMuleStorage>();
+        _ = RequireExecutionStorage(storage);
+    }
+
+    private static IMuleExecutionStorage RequireExecutionStorage(IMuleStorage storage)
+        => storage as IMuleExecutionStorage
+            ?? throw new InvalidOperationException(
+                $"Execution-key scheduling requires an IMuleExecutionStorage provider. '{storage.GetType().FullName}' does not support it.");
 
     private async Task CleanCompletedAsync(CancellationToken cancellationToken)
     {

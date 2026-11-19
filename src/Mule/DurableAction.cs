@@ -34,6 +34,10 @@ public sealed class DurableAction
 
     public DateTimeOffset? NextAttemptOnUtc { get; set; }
 
+    public DurableActionPendingReason PendingReason { get; set; }
+
+    public string DeferralReasonCode { get; set; }
+
     public DateTimeOffset? CompletedOnUtc { get; set; }
 
     public DateTimeOffset? CancelledOnUtc { get; set; }

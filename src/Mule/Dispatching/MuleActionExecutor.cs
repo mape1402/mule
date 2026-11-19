@@ -10,6 +10,7 @@ internal sealed class MuleActionExecutor : IMuleActionExecutor
 {
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly MuleSchedulerSignal _schedulerSignal;
+    private readonly TimeProvider _timeProvider;
     private readonly MuleSettings _settings;
     private readonly MuleRuntimeMetrics _metrics;
     private readonly ILogger<MuleActionExecutor> _logger;
@@ -22,13 +23,15 @@ internal sealed class MuleActionExecutor : IMuleActionExecutor
         MuleSchedulerSignal schedulerSignal,
         IOptions<MuleSettings> settings,
         MuleRuntimeMetrics metrics,
-        ILogger<MuleActionExecutor> logger)
+        ILogger<MuleActionExecutor> logger,
+        TimeProvider timeProvider = null)
     {
         _scopeFactory = scopeFactory ?? throw new ArgumentNullException(nameof(scopeFactory));
         _schedulerSignal = schedulerSignal ?? throw new ArgumentNullException(nameof(schedulerSignal));
         _settings = settings?.Value ?? throw new ArgumentNullException(nameof(settings));
         _metrics = metrics ?? throw new ArgumentNullException(nameof(metrics));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        _timeProvider = timeProvider ?? TimeProvider.System;
     }
 
     public IReadOnlyCollection<Task> Start(CancellationToken stoppingToken)
@@ -62,6 +65,12 @@ internal sealed class MuleActionExecutor : IMuleActionExecutor
         await EnqueueRangeAsync([action], cancellationToken);
     }
 
+    internal ValueTask EnqueueAsync(
+        DurableAction action,
+        MuleExecutionKeyCoordinator.MuleExecutionKeyLease executionKeyLease,
+        CancellationToken cancellationToken = default)
+        => EnqueueCoreAsync(action, executionKeyLease, cancellationToken);
+
     public async ValueTask EnqueueRangeAsync(IReadOnlyCollection<DurableAction> actions, CancellationToken cancellationToken = default)
     {
         if (actions == null)
@@ -72,11 +81,14 @@ internal sealed class MuleActionExecutor : IMuleActionExecutor
             if (action == null)
                 throw new ArgumentException("Action collection cannot contain null values.", nameof(actions));
 
-            await EnqueueCoreAsync(action, cancellationToken);
+            await EnqueueCoreAsync(action, null, cancellationToken);
         }
     }
 
-    private async ValueTask EnqueueCoreAsync(DurableAction action, CancellationToken cancellationToken)
+    private async ValueTask EnqueueCoreAsync(
+        DurableAction action,
+        MuleExecutionKeyCoordinator.MuleExecutionKeyLease executionKeyLease,
+        CancellationToken cancellationToken)
     {
         var lane = NormalizeLane(action.Lane);
         var executor = GetLaneExecutor(lane);
@@ -86,15 +98,16 @@ internal sealed class MuleActionExecutor : IMuleActionExecutor
 
         try
         {
-            if (!writer.TryWrite(new ExecutionItem(action, queuedOnUtc)))
+            if (!writer.TryWrite(new ExecutionItem(action, queuedOnUtc, executionKeyLease)))
             {
                 _metrics.RecordExecutorSaturation(lane);
-                await writer.WriteAsync(new ExecutionItem(action, queuedOnUtc), cancellationToken);
+                await writer.WriteAsync(new ExecutionItem(action, queuedOnUtc, executionKeyLease), cancellationToken);
             }
         }
         catch
         {
             _metrics.RecordWaitingExecutionCanceled(lane);
+            executionKeyLease?.Dispose();
             throw;
         }
     }
@@ -150,9 +163,10 @@ internal sealed class MuleActionExecutor : IMuleActionExecutor
         while (!cancellationToken.IsCancellationRequested)
         {
             var executing = false;
+            ExecutionItem item = null;
             try
             {
-                var item = await channel.Reader.ReadAsync(cancellationToken);
+                item = await channel.Reader.ReadAsync(cancellationToken);
                 executing = true;
                 _metrics.RecordExecutionStarted(lane, item.QueuedOnUtc, DateTimeOffset.UtcNow);
                 await ExecuteActionAsync(item.Action, cancellationToken);
@@ -169,6 +183,7 @@ internal sealed class MuleActionExecutor : IMuleActionExecutor
             {
                 if (executing)
                     _metrics.RecordExecutionStopped(lane);
+                item?.ExecutionKeyLease?.Dispose();
             }
         }
     }
@@ -180,35 +195,132 @@ internal sealed class MuleActionExecutor : IMuleActionExecutor
         var registry = scope.ServiceProvider.GetRequiredService<MuleActionRegistry>();
         DateTimeOffset? nextAttemptOnUtc = null;
         DateTimeOffset? completedOnUtc = null;
+        DateTimeOffset? deferredUntilUtc = null;
+        MuleActionDeferral deferral;
 
         try
         {
             if (!registry.TryGetHandler(action.Key, out var handler))
                 throw new InvalidOperationException($"No Mule handler is registered for action key '{action.Key}'.");
 
-            await handler.ExecuteAsync(action, scope.ServiceProvider, cancellationToken);
-            completedOnUtc = DateTimeOffset.UtcNow;
-            await storage.MarkCompletedAsync(action.Id, completedOnUtc.Value, cancellationToken);
-            _metrics.RecordCompleted(action.Lane, action.Key, completedOnUtc.Value);
+            deferral = await handler.ExecuteAsync(action, scope.ServiceProvider, cancellationToken);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
         }
         catch (Exception ex)
         {
             var nextAttempt = action.Attempts + 1;
             var retryPolicy = GetRetryPolicy(action.Lane);
+            var now = _timeProvider.GetUtcNow();
             nextAttemptOnUtc = nextAttempt >= retryPolicy.MaxAttempts
                 ? null
-                : DateTimeOffset.UtcNow.Add(retryPolicy.GetDelay(nextAttempt));
+                : now.Add(retryPolicy.GetDelay(nextAttempt));
 
-            await storage.MarkFailedAsync(action.Id, ex.ToString(), DateTimeOffset.UtcNow, nextAttemptOnUtc, cancellationToken);
-            if (nextAttemptOnUtc == null)
+            var applied = true;
+            if (storage is IMuleExecutionStorage executionStorage)
+            {
+                var outcome = await executionStorage.FailClaimAsync(
+                    action.Id,
+                    action.ConcurrencyToken,
+                    ex.ToString(),
+                    now,
+                    nextAttemptOnUtc,
+                    cancellationToken);
+                applied = outcome == MuleActionTransitionOutcome.Applied;
+                if (!applied)
+                    _logger.LogWarning(
+                        "Mule action {MuleActionId} with claim {MuleClaimToken} lost its claim before failure persistence.",
+                        action.Id,
+                        action.ConcurrencyToken);
+            }
+            else
+            {
+                await storage.MarkFailedAsync(action.Id, ex.ToString(), now, nextAttemptOnUtc, cancellationToken);
+                await storage.SaveChangesAsync(cancellationToken);
+            }
+
+            if (applied && nextAttemptOnUtc == null)
                 _metrics.RecordFailed(action.Lane, action.Key);
-            _logger.LogError(ex, "Mule action {MuleActionId} failed.", action.Id);
+            _logger.LogError(
+                ex,
+                "Mule action {MuleActionId} with claim {MuleClaimToken} failed in lane {MuleLane}.",
+                action.Id,
+                action.ConcurrencyToken,
+                action.Lane);
+
+            if (_settings.RecoveryMode == MuleRecoveryMode.Scheduled && nextAttemptOnUtc != null)
+                _schedulerSignal.SignalRecoveryAt(nextAttemptOnUtc.Value);
+
+            return;
         }
 
-        await storage.SaveChangesAsync(cancellationToken);
+        if (deferral != null)
+        {
+            var now = _timeProvider.GetUtcNow();
+            deferredUntilUtc = NormalizeDeferral(deferral.NotBeforeUtc, now);
+            var executionStorage = RequireExecutionStorage(storage);
+            var outcome = await executionStorage.DeferClaimAsync(
+                action.Id,
+                action.ConcurrencyToken,
+                now,
+                deferredUntilUtc.Value,
+                deferral.Reason,
+                cancellationToken);
+            if (outcome == MuleActionTransitionOutcome.Applied)
+            {
+                _metrics.RecordDeferred(action.Lane, deferral.Reason);
+                _logger.LogDebug(
+                    "Deferred Mule action {MuleActionId} with claim {MuleClaimToken} in lane {MuleLane} until {MuleNotBeforeUtc} for {MuleDeferralReason}.",
+                    action.Id,
+                    action.ConcurrencyToken,
+                    action.Lane,
+                    deferredUntilUtc,
+                    deferral.Reason.Value);
+            }
+            else
+            {
+                deferredUntilUtc = null;
+                _logger.LogWarning(
+                    "Mule action {MuleActionId} with claim {MuleClaimToken} lost its claim before deferral ({MuleTransitionOutcome}).",
+                    action.Id,
+                    action.ConcurrencyToken,
+                    outcome);
+            }
+        }
+        else
+        {
+            completedOnUtc = _timeProvider.GetUtcNow();
+            if (storage is IMuleExecutionStorage executionStorage)
+            {
+                var outcome = await executionStorage.CompleteClaimAsync(
+                    action.Id,
+                    action.ConcurrencyToken,
+                    completedOnUtc.Value,
+                    cancellationToken);
+                if (outcome != MuleActionTransitionOutcome.Applied)
+                {
+                    completedOnUtc = null;
+                    _logger.LogWarning(
+                        "Mule action {MuleActionId} with claim {MuleClaimToken} lost its claim before completion ({MuleTransitionOutcome}).",
+                        action.Id,
+                        action.ConcurrencyToken,
+                        outcome);
+                }
+            }
+            else
+            {
+                await storage.MarkCompletedAsync(action.Id, completedOnUtc.Value, cancellationToken);
+                await storage.SaveChangesAsync(cancellationToken);
+            }
 
-        if (_settings.RecoveryMode == MuleRecoveryMode.Scheduled && nextAttemptOnUtc != null)
-            _schedulerSignal.SignalRecoveryAt(nextAttemptOnUtc.Value);
+            if (completedOnUtc != null)
+                _metrics.RecordCompleted(action.Lane, action.Key, completedOnUtc.Value);
+        }
+
+        if (_settings.RecoveryMode == MuleRecoveryMode.Scheduled && deferredUntilUtc != null)
+            _schedulerSignal.SignalRecoveryAt(deferredUntilUtc.Value);
 
         if (_settings.CleanupMode == MuleCleanupMode.Scheduled && completedOnUtc != null)
             _schedulerSignal.SignalCleanupAt(completedOnUtc.Value.Add(GetCompletedRetention()));
@@ -269,7 +381,24 @@ internal sealed class MuleActionExecutor : IMuleActionExecutor
     private static string NormalizeLane(string lane)
         => string.IsNullOrWhiteSpace(lane) ? MuleSettings.DefaultLane : lane;
 
-    private sealed record ExecutionItem(DurableAction Action, DateTimeOffset QueuedOnUtc);
+    private DateTimeOffset NormalizeDeferral(DateTimeOffset requested, DateTimeOffset now)
+    {
+        var minimumDelay = _settings.MinimumDeferralDelay <= TimeSpan.Zero
+            ? TimeSpan.FromMilliseconds(100)
+            : _settings.MinimumDeferralDelay;
+        var minimum = now.Add(minimumDelay);
+        return requested < minimum ? minimum : requested;
+    }
+
+    private static IMuleExecutionStorage RequireExecutionStorage(IMuleStorage storage)
+        => storage as IMuleExecutionStorage
+            ?? throw new NotSupportedException(
+                $"Storage '{storage.GetType().FullName}' does not support cooperative deferral.");
+
+    private sealed record ExecutionItem(
+        DurableAction Action,
+        DateTimeOffset QueuedOnUtc,
+        MuleExecutionKeyCoordinator.MuleExecutionKeyLease ExecutionKeyLease);
 
     private sealed record LaneExecutor(Channel<ExecutionItem> Channel, IReadOnlyCollection<Task> Workers, bool IsBounded);
 }

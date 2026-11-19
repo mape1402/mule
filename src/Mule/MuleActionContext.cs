@@ -4,6 +4,8 @@ using System.Text.Json;
 
 public class MuleActionContext
 {
+    private MuleActionDeferral _deferral;
+
     public MuleActionContext(DurableAction action, IServiceProvider services)
     {
         Action = action ?? throw new ArgumentNullException(nameof(action));
@@ -28,6 +30,19 @@ public class MuleActionContext
         => string.IsNullOrWhiteSpace(Action.Metadata)
             ? new Dictionary<string, string>()
             : JsonSerializer.Deserialize<Dictionary<string, string>>(Action.Metadata) ?? new Dictionary<string, string>();
+
+    public void DeferUntil(DateTimeOffset notBeforeUtc, DeferralReason reason)
+    {
+        if (notBeforeUtc == default)
+            throw new ArgumentException("A valid deferral date is required.", nameof(notBeforeUtc));
+        if (string.IsNullOrWhiteSpace(reason.Value))
+            throw new ArgumentException("A deferral reason is required.", nameof(reason));
+
+        _deferral = new MuleActionDeferral(notBeforeUtc, reason);
+    }
+
+    internal MuleActionDeferral GetDeferral()
+        => _deferral;
 }
 
 public sealed class MuleActionContext<TPayload> : MuleActionContext
@@ -40,3 +55,5 @@ public sealed class MuleActionContext<TPayload> : MuleActionContext
 
     public TPayload Payload { get; }
 }
+
+internal sealed record MuleActionDeferral(DateTimeOffset NotBeforeUtc, DeferralReason Reason);

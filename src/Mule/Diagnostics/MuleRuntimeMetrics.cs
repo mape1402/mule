@@ -10,6 +10,9 @@ public sealed class MuleRuntimeMetrics
     private readonly Dictionary<string, int> _waitingExecutionByLane = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, int> _executingByLane = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, int> _executorSaturationByLane = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, int> _deferredByLane = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<DeferralReason, int> _deferredByReason = new();
+    private readonly Dictionary<string, int> _executionKeyContentionByLane = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, Queue<DateTimeOffset>> _waitingExecutionOnUtcByLane = new(StringComparer.OrdinalIgnoreCase);
     private int _completed;
     private int _failed;
@@ -20,6 +23,9 @@ public sealed class MuleRuntimeMetrics
     private int _replayRejected;
     private int _replayRetried;
     private int _replayMaterializationFailures;
+    private int _activationsOmitted;
+    private int _activationsRecovered;
+    private int _activationsAwaitingRecovery;
 
     public void RecordCompleted(string lane, ActionKey key, DateTimeOffset completedOnUtc)
     {
@@ -98,6 +104,43 @@ public sealed class MuleRuntimeMetrics
             Increment(_executorSaturationByLane, NormalizeLane(lane));
     }
 
+    public void RecordDeferred(string lane, DeferralReason reason)
+    {
+        lock (_gate)
+        {
+            Increment(_deferredByLane, NormalizeLane(lane));
+            Increment(_deferredByReason, reason);
+        }
+    }
+
+    public void RecordExecutionKeyContention(string lane)
+    {
+        lock (_gate)
+            Increment(_executionKeyContentionByLane, NormalizeLane(lane));
+    }
+
+    public void RecordActivationOmitted()
+    {
+        lock (_gate)
+        {
+            _activationsOmitted++;
+            _activationsAwaitingRecovery++;
+        }
+    }
+
+    public void RecordActivationRecovered(int count = 1)
+    {
+        if (count <= 0)
+            return;
+
+        lock (_gate)
+        {
+            var recovered = Math.Min(count, _activationsAwaitingRecovery);
+            _activationsAwaitingRecovery -= recovered;
+            _activationsRecovered += recovered;
+        }
+    }
+
     public void RecordWaitingExecution(string lane, DateTimeOffset queuedOnUtc)
     {
         lane = NormalizeLane(lane);
@@ -171,7 +214,12 @@ public sealed class MuleRuntimeMetrics
                 ReplayAlreadyScheduled = _replayAlreadyScheduled,
                 ReplayRejected = _replayRejected,
                 ReplayRetried = _replayRetried,
-                ReplayMaterializationFailures = _replayMaterializationFailures
+                ReplayMaterializationFailures = _replayMaterializationFailures,
+                DeferredByLane = new Dictionary<string, int>(_deferredByLane, StringComparer.OrdinalIgnoreCase),
+                DeferredByReason = new Dictionary<DeferralReason, int>(_deferredByReason),
+                ExecutionKeyContentionByLane = new Dictionary<string, int>(_executionKeyContentionByLane, StringComparer.OrdinalIgnoreCase),
+                ActivationsOmitted = _activationsOmitted,
+                ActivationsRecovered = _activationsRecovered
             };
         }
     }
