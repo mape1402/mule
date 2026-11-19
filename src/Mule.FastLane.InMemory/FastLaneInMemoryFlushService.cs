@@ -55,7 +55,6 @@ internal sealed class FastLaneInMemoryFlushService : BackgroundService
     private async Task FlushOnceAsync(CancellationToken cancellationToken)
     {
         await FlushIntentsAsync(cancellationToken);
-        await FlushTerminalsAsync(cancellationToken);
     }
 
     private async Task FlushIntentsAsync(CancellationToken cancellationToken)
@@ -68,80 +67,34 @@ internal sealed class FastLaneInMemoryFlushService : BackgroundService
         {
             using var scope = _scopeFactory.CreateScope();
             var durableStorage = scope.ServiceProvider.GetRequiredService<IMuleDurableStorage>();
-            await durableStorage.AddRangeAsync(intents, cancellationToken);
-            await durableStorage.SaveChangesAsync(cancellationToken);
-            _buffer.CompleteIntentFlush(intents.Select(x => x.Id).ToArray());
-        }
-        catch
-        {
-            _buffer.CancelIntentFlush(intents.Select(x => x.Id).ToArray());
-            throw;
-        }
-    }
+            var projectionStorage = durableStorage as IMuleStateProjectionStorage
+                ?? throw new NotSupportedException(
+                    $"Durable storage '{durableStorage.GetType().FullName}' does not support FastLane state projection.");
+            var results = await projectionStorage.ProjectStateRangeAsync(intents, cancellationToken);
+            var appliedIds = results
+                .Where(x => x.Outcome == MuleActionTransitionOutcome.Applied)
+                .Select(x => x.ActionId)
+                .ToHashSet();
+            var applied = intents.Where(x => appliedIds.Contains(x.Action.Id)).ToArray();
+            _buffer.CompleteIntentFlush(applied);
 
-    private async Task FlushTerminalsAsync(CancellationToken cancellationToken)
-    {
-        var terminals = _buffer.TakeTerminalFlushBatch(GetCompletionFlushSize());
-        if (terminals.Count == 0)
-            return;
-
-        try
-        {
-            using var scope = _scopeFactory.CreateScope();
-            var durableStorage = scope.ServiceProvider.GetRequiredService<IMuleDurableStorage>();
-
-            foreach (var action in terminals)
+            var rejected = results.Where(x => x.Outcome != MuleActionTransitionOutcome.Applied).ToArray();
+            if (rejected.Length > 0)
             {
-                if (action.Status == DurableActionStatus.Completed)
-                {
-                    await durableStorage.MarkCompletedAsync(
-                        action.Id,
-                        action.CompletedOnUtc ?? DateTimeOffset.UtcNow,
-                        cancellationToken);
-                    continue;
-                }
-
-                if (action.Status == DurableActionStatus.Failed)
-                {
-                    await durableStorage.MarkFailedAsync(
-                        action.Id,
-                        action.LastError,
-                        action.TerminalOnUtc ?? DateTimeOffset.UtcNow,
-                        null,
-                        cancellationToken);
-                    continue;
-                }
-
-                if (action.Status == DurableActionStatus.Cancelled)
-                {
-                    if (durableStorage is not IMuleTerminalCancellationStorage cancellationStorage)
-                        throw new InvalidOperationException("The durable storage does not support cancellation.");
-
-                    var cancelled = await cancellationStorage.MarkCancelledAsync(
-                        action.Id,
-                        action.CancelledOnUtc ?? DateTimeOffset.UtcNow,
-                        cancellationToken);
-
-                    if (!cancelled)
-                        throw new InvalidOperationException($"Could not flush cancellation for action '{action.Id}'.");
-                }
+                _buffer.CancelIntentFlush(intents.Where(x => rejected.Any(r => r.ActionId == x.Action.Id)).ToArray());
+                throw new InvalidOperationException(
+                    $"FastLane durable projection rejected {rejected.Length} action state(s).");
             }
-
-            await durableStorage.SaveChangesAsync(cancellationToken);
-            _buffer.CompleteTerminalFlush(terminals.Select(x => x.Id).ToArray());
         }
         catch
         {
-            _buffer.CancelTerminalFlush(terminals.Select(x => x.Id).ToArray());
+            _buffer.CancelIntentFlush(intents);
             throw;
         }
     }
 
     private int GetIntentFlushSize()
         => Math.Max(1, _options.IntentFlushSize);
-
-    private int GetCompletionFlushSize()
-        => Math.Max(1, _options.CompletionFlushSize);
 
     private TimeSpan GetFlushInterval()
         => _options.FlushInterval <= TimeSpan.Zero ? TimeSpan.FromMilliseconds(50) : _options.FlushInterval;

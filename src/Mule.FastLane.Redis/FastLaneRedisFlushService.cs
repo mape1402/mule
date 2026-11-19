@@ -55,7 +55,6 @@ internal sealed class FastLaneRedisFlushService : BackgroundService
     private async Task FlushOnceAsync(CancellationToken cancellationToken)
     {
         await FlushIntentsAsync(cancellationToken);
-        await FlushTerminalsAsync(cancellationToken);
     }
 
     private async Task FlushIntentsAsync(CancellationToken cancellationToken)
@@ -64,97 +63,40 @@ internal sealed class FastLaneRedisFlushService : BackgroundService
         if (intents.Count == 0)
             return;
 
-        var ids = intents.Select(x => x.Id).ToArray();
         try
         {
             using var scope = _scopeFactory.CreateScope();
             var durableStorage = scope.ServiceProvider.GetRequiredService<IMuleDurableStorage>();
-            await durableStorage.AddRangeAsync(intents, cancellationToken);
-            await durableStorage.SaveChangesAsync(cancellationToken);
-            await _buffer.CompleteIntentFlushAsync(intents);
-        }
-        catch
-        {
-            await _buffer.CancelIntentFlushAsync(ids);
-            throw;
-        }
-    }
+            var projectionStorage = durableStorage as IMuleStateProjectionStorage
+                ?? throw new NotSupportedException(
+                    $"Durable storage '{durableStorage.GetType().FullName}' does not support FastLane state projection.");
+            var results = await projectionStorage.ProjectStateRangeAsync(intents, cancellationToken);
+            var appliedIds = results
+                .Where(x => x.Outcome == MuleActionTransitionOutcome.Applied)
+                .Select(x => x.ActionId)
+                .ToHashSet();
+            var applied = intents.Where(x => appliedIds.Contains(x.Action.Id)).ToArray();
+            await _buffer.CompleteIntentFlushAsync(applied);
 
-    private async Task FlushTerminalsAsync(CancellationToken cancellationToken)
-    {
-        var terminals = await _buffer.TakeTerminalFlushBatchAsync(GetCompletionFlushSize());
-        if (terminals.Count == 0)
-            return;
-
-        var ids = terminals.Select(x => x.Id).ToArray();
-        try
-        {
-            using var scope = _scopeFactory.CreateScope();
-            var durableStorage = scope.ServiceProvider.GetRequiredService<IMuleDurableStorage>();
-            var completed = terminals
-                .Where(x => x.Status == DurableActionStatus.Completed)
-                .Select(x => new MuleCompletedAction(x.Id, x.CompletedOnUtc ?? DateTimeOffset.UtcNow))
-                .ToArray();
-            var batchTerminalStorage = durableStorage as IMuleBatchTerminalStorage;
-
-            if (batchTerminalStorage != null && completed.Length > 0)
-                await batchTerminalStorage.MarkCompletedRangeAsync(completed, cancellationToken);
-
-            foreach (var action in terminals)
+            var rejected = results.Where(x => x.Outcome != MuleActionTransitionOutcome.Applied).ToArray();
+            if (rejected.Length > 0)
             {
-                if (action.Status == DurableActionStatus.Completed)
-                {
-                    if (batchTerminalStorage != null)
-                        continue;
-
-                    await durableStorage.MarkCompletedAsync(
-                        action.Id,
-                        action.CompletedOnUtc ?? DateTimeOffset.UtcNow,
-                        cancellationToken);
-                    continue;
-                }
-
-                if (action.Status == DurableActionStatus.Failed)
-                {
-                    await durableStorage.MarkFailedAsync(
-                        action.Id,
-                        action.LastError,
-                        action.TerminalOnUtc ?? DateTimeOffset.UtcNow,
-                        null,
-                        cancellationToken);
-                    continue;
-                }
-
-                if (action.Status == DurableActionStatus.Cancelled)
-                {
-                    if (durableStorage is not IMuleTerminalCancellationStorage cancellationStorage)
-                        throw new InvalidOperationException("The durable storage does not support cancellation.");
-
-                    var cancelled = await cancellationStorage.MarkCancelledAsync(
-                        action.Id,
-                        action.CancelledOnUtc ?? DateTimeOffset.UtcNow,
-                        cancellationToken);
-
-                    if (!cancelled)
-                        throw new InvalidOperationException($"Could not flush cancellation for action '{action.Id}'.");
-                }
+                await _buffer.CancelIntentFlushAsync(
+                    intents.Where(x => rejected.Any(r => r.ActionId == x.Action.Id)).ToArray());
+                throw new InvalidOperationException(
+                    $"FastLane durable projection rejected {rejected.Length} action state(s).");
             }
-
-            await durableStorage.SaveChangesAsync(cancellationToken);
-            await _buffer.CompleteTerminalFlushAsync(terminals);
         }
         catch
         {
-            await _buffer.CancelTerminalFlushAsync(ids);
+            await _buffer.CancelIntentFlushAsync(intents);
             throw;
         }
     }
+
 
     private int GetIntentFlushSize()
         => Math.Max(1, _options.IntentFlushSize);
-
-    private int GetCompletionFlushSize()
-        => Math.Max(1, _options.CompletionFlushSize);
 
     private TimeSpan GetFlushInterval()
         => _options.FlushInterval <= TimeSpan.Zero ? TimeSpan.FromMilliseconds(50) : _options.FlushInterval;

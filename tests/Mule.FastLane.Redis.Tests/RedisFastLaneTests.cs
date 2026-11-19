@@ -172,6 +172,64 @@ public sealed class RedisFastLaneTests
         }
     }
 
+    [RedisFact]
+    public async Task Deferred_State_Should_Flush_To_Durable_Storage_Without_Losing_Ownership()
+    {
+        var keyPrefix = $"mule-tests:{Guid.NewGuid():N}";
+        using var host = CreateHost(out var databasePath, keyPrefix);
+
+        try
+        {
+            await EnsureDatabaseAsync(host);
+            var now = DateTimeOffset.UtcNow;
+            Ulid actionId;
+            using (var scope = host.Services.CreateScope())
+            {
+                actionId = await scope.ServiceProvider.GetRequiredService<IMuleClient>().EnqueueAsync(
+                    Key,
+                    new TestPayload("deferred-fastlane"));
+                var storage = scope.ServiceProvider.GetRequiredService<IMuleStorage>();
+                var execution = Assert.IsAssignableFrom<IMuleExecutionStorage>(storage);
+                var claim = await storage.LockAsync(actionId, TimeSpan.FromMinutes(1), now);
+
+                Assert.Equal(
+                    MuleActionTransitionOutcome.Applied,
+                    await execution.DeferClaimAsync(
+                        actionId,
+                        claim.ConcurrencyToken,
+                        now,
+                        now.AddMinutes(1),
+                        DeferralReason.From("fastlane-lease-busy")));
+            }
+
+            await host.StartAsync();
+            var deadline = DateTimeOffset.UtcNow.AddSeconds(5);
+            DurableAction durable = null;
+            while (DateTimeOffset.UtcNow < deadline)
+            {
+                using var scope = host.Services.CreateScope();
+                var db = scope.ServiceProvider.GetRequiredService<MuleDbContext>();
+                durable = await db.Actions.AsNoTracking().SingleOrDefaultAsync(x => x.Id == actionId);
+                if (durable?.PendingReason == DurableActionPendingReason.Deferred)
+                    break;
+
+                await Task.Delay(25);
+            }
+
+            await host.StopAsync();
+            Assert.NotNull(durable);
+            Assert.Equal(DurableActionStatus.Pending, durable.Status);
+            Assert.Equal(DurableActionPendingReason.Deferred, durable.PendingReason);
+            Assert.Equal("fastlane-lease-busy", durable.DeferralReasonCode);
+            Assert.Equal(0, durable.Attempts);
+        }
+        finally
+        {
+            await CleanupRedisAsync(keyPrefix);
+            TryDelete(databasePath);
+        }
+    }
+
     private static IHost CreateHost(
         out string databasePath,
         string keyPrefix,

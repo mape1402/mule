@@ -46,7 +46,8 @@ public sealed class RedisCoverageTests
         var buffer = new RedisFastLaneBuffer(connection, Options.Create(new FastLaneRedisOptions
         {
             LeaseDuration = TimeSpan.FromMilliseconds(50),
-            DeduplicationRetention = TimeSpan.Zero
+            DeduplicationRetention = TimeSpan.Zero,
+            FlushClaimTimeout = TimeSpan.Zero
         }));
         var now = DateTimeOffset.UtcNow;
         var action = CreateAction("one", now.AddSeconds(-3));
@@ -60,6 +61,10 @@ public sealed class RedisCoverageTests
         var leasedCancel = CreateAction("leased-cancel", now.AddSeconds(-8));
         var otherLane = CreateAction("other-lane", now.AddSeconds(-6));
         otherLane.Lane = "Lane-B";
+        var claimComplete = CreateAction("claim-complete", now.AddSeconds(-9));
+        var claimFail = CreateAction("claim-fail", now.AddSeconds(-10));
+        var claimRetry = CreateAction("claim-retry", now.AddSeconds(-11));
+        var claimDefer = CreateAction("claim-defer", now.AddSeconds(-12));
 
         try
         {
@@ -74,7 +79,57 @@ public sealed class RedisCoverageTests
             Assert.Null(await buffer.FindByDeduplicationKeyAsync(Key, ""));
             Assert.Null(await buffer.LockAsync(Ulid.NewUlid(), TimeSpan.FromMinutes(1), now));
 
-            await buffer.TryAddRangeAsync([retry, future, active, expired, lockOnly, cancel, leasedCancel, otherLane]);
+            await buffer.TryAddRangeAsync([
+                retry, future, active, expired, lockOnly, cancel, leasedCancel, otherLane,
+                claimComplete, claimFail, claimRetry, claimDefer
+            ]);
+            Assert.Contains(
+                await buffer.ReadPendingCandidatesAsync("Lane-A", -1, 20, DateTimeOffset.UtcNow.AddSeconds(1)),
+                x => x.Id == claimComplete.Id);
+            Assert.Null(await buffer.FindActionAsync(Ulid.NewUlid()));
+            Assert.Equal(claimComplete.Id, (await buffer.FindActionAsync(claimComplete.Id)).Id);
+
+            claimComplete = await buffer.LockAsync(claimComplete.Id, TimeSpan.FromMinutes(1), now);
+            Assert.Equal(
+                MuleActionTransitionOutcome.NotFound,
+                await buffer.CompleteClaimAsync(Ulid.NewUlid(), Ulid.NewUlid(), now));
+            Assert.Equal(
+                MuleActionTransitionOutcome.LeaseLost,
+                await buffer.CompleteClaimAsync(claimComplete.Id, Ulid.NewUlid(), now));
+            Assert.Equal(
+                MuleActionTransitionOutcome.Applied,
+                await buffer.CompleteClaimAsync(claimComplete.Id, claimComplete.ConcurrencyToken, now));
+
+            Assert.Equal(
+                MuleActionTransitionOutcome.NotFound,
+                await buffer.FailClaimAsync(Ulid.NewUlid(), Ulid.NewUlid(), "missing", now, null));
+            claimFail = await buffer.LockAsync(claimFail.Id, TimeSpan.FromMinutes(1), now);
+            Assert.Equal(
+                MuleActionTransitionOutcome.LeaseLost,
+                await buffer.FailClaimAsync(claimFail.Id, Ulid.NewUlid(), "stale", now, null));
+            Assert.Equal(
+                MuleActionTransitionOutcome.Applied,
+                await buffer.FailClaimAsync(claimFail.Id, claimFail.ConcurrencyToken, null, now, null));
+
+            claimRetry = await buffer.LockAsync(claimRetry.Id, TimeSpan.FromMinutes(1), now);
+            Assert.Equal(
+                MuleActionTransitionOutcome.Applied,
+                await buffer.FailClaimAsync(
+                    claimRetry.Id, claimRetry.ConcurrencyToken, "retry", now, now.AddSeconds(1)));
+
+            Assert.Equal(
+                MuleActionTransitionOutcome.NotFound,
+                await buffer.DeferClaimAsync(
+                    Ulid.NewUlid(), Ulid.NewUlid(), now, DeferralReason.From("missing")));
+            claimDefer = await buffer.LockAsync(claimDefer.Id, TimeSpan.FromMinutes(1), now);
+            Assert.Equal(
+                MuleActionTransitionOutcome.LeaseLost,
+                await buffer.DeferClaimAsync(
+                    claimDefer.Id, Ulid.NewUlid(), now, DeferralReason.From("stale")));
+            Assert.Equal(
+                MuleActionTransitionOutcome.Applied,
+                await buffer.DeferClaimAsync(
+                    claimDefer.Id, claimDefer.ConcurrencyToken, now.AddMinutes(1), DeferralReason.From("busy")));
             Assert.Equal(MuleCancellationOutcome.NotFound, (await buffer.CancelAsync(Ulid.NewUlid(), now)).Outcome);
             Assert.Equal(MuleCancellationOutcome.Cancelled, (await buffer.CancelAsync(cancel.Id, now)).Outcome);
             var repeatedCancellation = await buffer.CancelAsync(cancel.Id, now.AddMinutes(1));
@@ -106,23 +161,22 @@ public sealed class RedisCoverageTests
 
             var intents = await buffer.TakeIntentFlushBatchAsync(1);
             Assert.Single(intents);
-            await buffer.CancelIntentFlushAsync(intents.Select(x => x.Id).Append(Ulid.NewUlid()).ToArray());
+            var rejected = new MuleActionStateProjection(
+                intents.Single().Action,
+                Ulid.NewUlid(),
+                intents.Single().ProjectionToken);
+            await Assert.ThrowsAsync<InvalidOperationException>(() =>
+                buffer.CompleteIntentFlushAsync([rejected]));
+            await buffer.CancelIntentFlushAsync(intents);
             intents = await buffer.TakeIntentFlushBatchAsync(10);
             Assert.NotEmpty(intents);
-            Assert.Contains(intents, x => x.Status == DurableActionStatus.Locked);
+            Assert.Contains(intents, x => x.Action.Status == DurableActionStatus.Locked);
             await buffer.CompleteIntentFlushAsync([]);
-            await buffer.CompleteIntentFlushAsync(intents.Append(new DurableAction { Id = Ulid.NewUlid() }).ToArray());
+            await buffer.CompleteIntentFlushAsync(intents);
 
             Assert.True(await buffer.MarkCompletedAsync(action.Id, now.AddSeconds(3)));
             Assert.False(await buffer.MarkCompletedAsync(Ulid.NewUlid(), now));
-            var terminals = await buffer.TakeTerminalFlushBatchAsync(10);
-            Assert.NotEmpty(terminals);
             await buffer.CancelIntentFlushAsync([]);
-            await buffer.CancelTerminalFlushAsync([]);
-            await buffer.CancelTerminalFlushAsync(terminals.Select(x => x.Id).Append(Ulid.NewUlid()).ToArray());
-            terminals = await buffer.TakeTerminalFlushBatchAsync(10);
-            await buffer.CompleteTerminalFlushAsync([]);
-            await buffer.CompleteTerminalFlushAsync(terminals.Append(new DurableAction { Id = Ulid.NewUlid() }).ToArray());
 
             var completedBeforeIntent = CreateAction("completed-before-intent", now, DurableActionStatus.Completed);
             completedBeforeIntent.Attempts = 3;
@@ -130,8 +184,8 @@ public sealed class RedisCoverageTests
             failedBeforeIntent.Attempts = 3;
             await buffer.TryAddRangeAsync([completedBeforeIntent, failedBeforeIntent]);
             var durableIntents = await buffer.TakeIntentFlushBatchAsync(10);
-            Assert.Contains(durableIntents, x => x.Id == completedBeforeIntent.Id && x.Status == DurableActionStatus.Locked);
-            Assert.Contains(durableIntents, x => x.Id == failedBeforeIntent.Id && x.Attempts == 2);
+            Assert.Contains(durableIntents, x => x.Action.Id == completedBeforeIntent.Id && x.Action.Status == DurableActionStatus.Completed);
+            Assert.Contains(durableIntents, x => x.Action.Id == failedBeforeIntent.Id && x.Action.Attempts == 3);
         }
         finally
         {
@@ -259,6 +313,71 @@ public sealed class RedisCoverageTests
     }
 
     [RedisFact]
+    public async Task Storage_Should_Combine_Buffered_And_Durable_Execution_State()
+    {
+        var prefix = $"mule-tests:{Guid.NewGuid():N}";
+        await using var connection = await CreateConnectionAsync(prefix);
+        var durable = Substitute.For<IMuleDurableStorage, IMuleExecutionStorage>();
+        var execution = (IMuleExecutionStorage)durable;
+        var now = DateTimeOffset.UtcNow;
+        var durableAction = CreateAction("durable-execution", now.AddMinutes(-2));
+        execution.ReadPendingCandidatesAsync(
+                Arg.Any<string>(), Arg.Any<int>(), Arg.Any<int>(), Arg.Any<TimeSpan>(), Arg.Any<DateTimeOffset>(), Arg.Any<CancellationToken>())
+            .Returns([durableAction]);
+        execution.FindActionAsync(durableAction.Id, Arg.Any<CancellationToken>()).Returns(durableAction);
+        execution.CompleteClaimAsync(Arg.Any<Ulid>(), Arg.Any<Ulid>(), Arg.Any<DateTimeOffset>(), Arg.Any<CancellationToken>())
+            .Returns(MuleActionTransitionOutcome.Applied);
+        execution.FailClaimAsync(Arg.Any<Ulid>(), Arg.Any<Ulid>(), Arg.Any<string>(), Arg.Any<DateTimeOffset>(), Arg.Any<DateTimeOffset?>(), Arg.Any<CancellationToken>())
+            .Returns(MuleActionTransitionOutcome.Applied);
+        execution.DeferClaimAsync(Arg.Any<Ulid>(), Arg.Any<Ulid>(), Arg.Any<DateTimeOffset>(), Arg.Any<DateTimeOffset>(), Arg.Any<DeferralReason>(), Arg.Any<CancellationToken>())
+            .Returns(MuleActionTransitionOutcome.Applied);
+
+        var buffer = new RedisFastLaneBuffer(connection, Options.Create(new FastLaneRedisOptions()));
+        var storage = new FastLaneRedisStorage(durable, buffer);
+        var bufferedComplete = CreateAction("buffered-execution-complete", now.AddMinutes(-1));
+        var bufferedFail = CreateAction("buffered-execution-fail", now);
+        var bufferedDefer = CreateAction("buffered-execution-defer", now);
+
+        try
+        {
+            await buffer.TryAddRangeAsync([bufferedComplete, bufferedFail, bufferedDefer]);
+            Assert.Contains(
+                await storage.ReadPendingCandidatesAsync("Lane-A", 0, 10, TimeSpan.FromMinutes(1), now),
+                x => x.Id == durableAction.Id);
+            Assert.Equal(bufferedComplete.Id, (await storage.FindActionAsync(bufferedComplete.Id)).Id);
+            Assert.Equal(durableAction.Id, (await storage.FindActionAsync(durableAction.Id)).Id);
+
+            bufferedComplete = await buffer.LockAsync(bufferedComplete.Id, TimeSpan.FromMinutes(1), now);
+            bufferedFail = await buffer.LockAsync(bufferedFail.Id, TimeSpan.FromMinutes(1), now);
+            bufferedDefer = await buffer.LockAsync(bufferedDefer.Id, TimeSpan.FromMinutes(1), now);
+            Assert.Equal(MuleActionTransitionOutcome.Applied,
+                await storage.CompleteClaimAsync(bufferedComplete.Id, bufferedComplete.ConcurrencyToken, now));
+            Assert.Equal(MuleActionTransitionOutcome.Applied,
+                await storage.FailClaimAsync(bufferedFail.Id, bufferedFail.ConcurrencyToken, "failed", now, null));
+            Assert.Equal(MuleActionTransitionOutcome.Applied,
+                await storage.DeferClaimAsync(
+                    bufferedDefer.Id, bufferedDefer.ConcurrencyToken, now, now.AddMinutes(1), DeferralReason.From("busy")));
+            Assert.Equal(MuleActionTransitionOutcome.Applied,
+                await storage.CompleteClaimAsync(Ulid.NewUlid(), Ulid.NewUlid(), now));
+            Assert.Equal(MuleActionTransitionOutcome.Applied,
+                await storage.FailClaimAsync(Ulid.NewUlid(), Ulid.NewUlid(), "durable", now, null));
+            Assert.Equal(MuleActionTransitionOutcome.Applied,
+                await storage.DeferClaimAsync(
+                    Ulid.NewUlid(), Ulid.NewUlid(), now, now, DeferralReason.From("durable")));
+
+            var unsupported = new FastLaneRedisStorage(
+                Substitute.For<IMuleDurableStorage>(),
+                buffer);
+            await Assert.ThrowsAsync<NotSupportedException>(() =>
+                unsupported.ReadPendingCandidatesAsync("Lane-A", 0, 1, TimeSpan.FromMinutes(1), now));
+        }
+        finally
+        {
+            await CleanupRedisAsync(prefix);
+        }
+    }
+
+    [RedisFact]
     public async Task LockAsync_Should_Return_Null_When_Lease_Is_Held()
     {
         var prefix = $"mule-tests:{Guid.NewGuid():N}";
@@ -349,52 +468,24 @@ public sealed class RedisCoverageTests
             await Task.Delay(20);
             await canceledLoop.StopAsync(CancellationToken.None);
 
-            var nonBatch = Substitute.For<IMuleDurableStorage>();
-            nonBatch.AddRangeAsync(Arg.Any<IReadOnlyCollection<DurableAction>>(), Arg.Any<CancellationToken>()).Returns(Task.CompletedTask);
-            nonBatch.SaveChangesAsync(Arg.Any<CancellationToken>()).Returns(Task.CompletedTask);
-            nonBatch.MarkCompletedAsync(Arg.Any<Ulid>(), Arg.Any<DateTimeOffset>(), Arg.Any<CancellationToken>()).Returns(Task.CompletedTask);
-            var nonBatchAction = CreateAction("non-batch", now);
-            await buffer.TryAddAsync(nonBatchAction);
-            var nonBatchService = CreateFlushService(buffer, nonBatch);
-            await InvokeFlushOnceAsync(nonBatchService);
-            Assert.True(await buffer.MarkCompletedAsync(nonBatchAction.Id, now));
-            await InvokeFlushOnceAsync(nonBatchService);
-            await nonBatch.Received().MarkCompletedAsync(nonBatchAction.Id, Arg.Any<DateTimeOffset>(), Arg.Any<CancellationToken>());
+            var unsupported = Substitute.For<IMuleDurableStorage>();
+            await buffer.TryAddAsync(CreateAction("unsupported-projection", now));
+            var unsupportedService = CreateFlushService(buffer, unsupported);
+            await Assert.ThrowsAsync<NotSupportedException>(() => InvokeFlushOnceAsync(unsupportedService));
 
-            var nonBatchNullDate = CreateAction("non-batch-null-date", now);
-            await buffer.TryAddAsync(nonBatchNullDate);
-            await InvokeFlushOnceAsync(nonBatchService);
-            Assert.True(await buffer.MarkCompletedAsync(nonBatchNullDate.Id, now));
-            await ClearCompletedDateAsync(connection, nonBatchNullDate.Id);
-            await InvokeFlushOnceAsync(nonBatchService);
-
-            var unsupportedCancellation = Substitute.For<IMuleDurableStorage>();
-            var unsupportedCancellationAction = CreateAction("unsupported-cancellation", now);
-            await buffer.TryAddAsync(unsupportedCancellationAction);
-            var unsupportedCancellationService = CreateFlushService(buffer, unsupportedCancellation);
-            await InvokeFlushOnceAsync(unsupportedCancellationService);
-            Assert.Equal(
-                MuleCancellationOutcome.Cancelled,
-                (await buffer.CancelAsync(unsupportedCancellationAction.Id, now)).Outcome);
-            await Assert.ThrowsAsync<InvalidOperationException>(() =>
-                InvokeFlushOnceAsync(unsupportedCancellationService));
-            var unsupportedTerminal = await buffer.TakeTerminalFlushBatchAsync(1);
-            await buffer.CompleteTerminalFlushAsync(unsupportedTerminal);
-
-            var rejectedCancellation = Substitute.For<IMuleDurableStorage, IMuleTerminalCancellationStorage>();
-            ((IMuleTerminalCancellationStorage)rejectedCancellation)
-                .MarkCancelledAsync(Arg.Any<Ulid>(), Arg.Any<DateTimeOffset>(), Arg.Any<CancellationToken>())
-                .Returns(false);
-            var rejectedCancellationAction = CreateAction("rejected-cancellation", now);
-            await buffer.TryAddAsync(rejectedCancellationAction);
-            var rejectedCancellationService = CreateFlushService(buffer, rejectedCancellation);
-            await InvokeFlushOnceAsync(rejectedCancellationService);
-            Assert.Equal(
-                MuleCancellationOutcome.Cancelled,
-                (await buffer.CancelAsync(rejectedCancellationAction.Id, now)).Outcome);
-            await ClearCancelledDateAsync(connection, rejectedCancellationAction.Id);
-            await Assert.ThrowsAsync<InvalidOperationException>(() =>
-                InvokeFlushOnceAsync(rejectedCancellationService));
+            var rejecting = Substitute.For<IMuleDurableStorage, IMuleStateProjectionStorage>();
+            ((IMuleStateProjectionStorage)rejecting)
+                .ProjectStateRangeAsync(
+                    Arg.Any<IReadOnlyCollection<MuleActionStateProjection>>(),
+                    Arg.Any<CancellationToken>())
+                .Returns(call => Task.FromResult<IReadOnlyCollection<MuleActionStateProjectionResult>>(
+                    call.Arg<IReadOnlyCollection<MuleActionStateProjection>>()
+                        .Select(x => new MuleActionStateProjectionResult(
+                            x.Action.Id,
+                            MuleActionTransitionOutcome.LeaseLost))
+                        .ToArray()));
+            var rejectingService = CreateFlushService(buffer, rejecting);
+            await Assert.ThrowsAsync<InvalidOperationException>(() => InvokeFlushOnceAsync(rejectingService));
         }
         finally
         {
@@ -640,7 +731,7 @@ public sealed class RedisCoverageTests
             LastError = status == DurableActionStatus.Failed ? "failed" : null
         };
 
-    private sealed class RecordingDurableStorage : IMuleDurableStorage, IMuleBatchTerminalStorage
+    private sealed class RecordingDurableStorage : IMuleDurableStorage, IMuleBatchTerminalStorage, IMuleStateProjectionStorage
     {
         public List<DurableAction> Added { get; } = new();
         public List<DurableAction> Pending { get; } = new();
@@ -708,5 +799,29 @@ public sealed class RedisCoverageTests
 
         public Task SaveChangesAsync(CancellationToken cancellationToken = default)
             => Task.CompletedTask;
+
+        public async Task<IReadOnlyCollection<MuleActionStateProjectionResult>> ProjectStateRangeAsync(
+            IReadOnlyCollection<MuleActionStateProjection> projections,
+            CancellationToken cancellationToken = default)
+        {
+            if (BlockOnAdd)
+                await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+            if (ThrowOnAdd)
+                throw new InvalidOperationException("add failed");
+            if (ThrowOnMarkFailed && projections.Any(x => x.Action.Status == DurableActionStatus.Failed))
+                throw new InvalidOperationException("mark failed");
+
+            foreach (var projection in projections)
+            {
+                Added.Add(projection.Action);
+                MarkCompletedCalled |= projection.Action.Status == DurableActionStatus.Completed;
+                MarkCompletedRangeCalled |= projection.Action.Status == DurableActionStatus.Completed;
+                MarkFailedCalled |= projection.Action.Status == DurableActionStatus.Failed;
+            }
+
+            return projections
+                .Select(x => new MuleActionStateProjectionResult(x.Action.Id, MuleActionTransitionOutcome.Applied))
+                .ToArray();
+        }
     }
 }

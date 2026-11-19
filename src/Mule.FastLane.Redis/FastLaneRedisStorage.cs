@@ -1,6 +1,6 @@
 namespace Mule.FastLane.Redis;
 
-internal sealed class FastLaneRedisStorage : IMuleStorage, IMuleCancellationStorage
+internal sealed class FastLaneRedisStorage : IMuleStorage, IMuleExecutionStorage, IMuleCancellationStorage
 {
     private readonly IMuleDurableStorage _durableStorage;
     private readonly RedisFastLaneBuffer _buffer;
@@ -103,6 +103,78 @@ internal sealed class FastLaneRedisStorage : IMuleStorage, IMuleCancellationStor
         return await _durableStorage.LockAsync(id, lockTimeout, now, cancellationToken);
     }
 
+    public async Task<IReadOnlyCollection<DurableAction>> ReadPendingCandidatesAsync(
+        string lane,
+        int offset,
+        int batchSize,
+        TimeSpan lockTimeout,
+        DateTimeOffset now,
+        CancellationToken cancellationToken = default)
+    {
+        var take = checked(Math.Max(0, offset) + Math.Max(1, batchSize));
+        var bufferedTask = _buffer.ReadPendingCandidatesAsync(lane, 0, take, now);
+        var durableTask = ExecutionStorage.ReadPendingCandidatesAsync(
+            lane, 0, take, lockTimeout, now, cancellationToken);
+        await Task.WhenAll(bufferedTask, durableTask);
+
+        return bufferedTask.Result
+            .Concat(durableTask.Result)
+            .GroupBy(x => x.Id)
+            .Select(x => x.First())
+            .OrderBy(x => x.NextAttemptOnUtc ?? x.CreatedOnUtc)
+            .ThenBy(x => x.CreatedOnUtc)
+            .ThenBy(x => x.Id)
+            .Skip(Math.Max(0, offset))
+            .Take(Math.Max(1, batchSize))
+            .ToArray();
+    }
+
+    public async Task<DurableAction> FindActionAsync(Ulid id, CancellationToken cancellationToken = default)
+        => await _buffer.FindActionAsync(id)
+            ?? await ExecutionStorage.FindActionAsync(id, cancellationToken);
+
+    public async Task<MuleActionTransitionOutcome> CompleteClaimAsync(
+        Ulid id,
+        Ulid expectedConcurrencyToken,
+        DateTimeOffset completedOnUtc,
+        CancellationToken cancellationToken = default)
+    {
+        var buffered = await _buffer.CompleteClaimAsync(id, expectedConcurrencyToken, completedOnUtc);
+        return buffered == MuleActionTransitionOutcome.NotFound
+            ? await ExecutionStorage.CompleteClaimAsync(id, expectedConcurrencyToken, completedOnUtc, cancellationToken)
+            : buffered;
+    }
+
+    public async Task<MuleActionTransitionOutcome> FailClaimAsync(
+        Ulid id,
+        Ulid expectedConcurrencyToken,
+        string error,
+        DateTimeOffset now,
+        DateTimeOffset? nextAttemptOnUtc,
+        CancellationToken cancellationToken = default)
+    {
+        var buffered = await _buffer.FailClaimAsync(id, expectedConcurrencyToken, error, now, nextAttemptOnUtc);
+        return buffered == MuleActionTransitionOutcome.NotFound
+            ? await ExecutionStorage.FailClaimAsync(
+                id, expectedConcurrencyToken, error, now, nextAttemptOnUtc, cancellationToken)
+            : buffered;
+    }
+
+    public async Task<MuleActionTransitionOutcome> DeferClaimAsync(
+        Ulid id,
+        Ulid expectedConcurrencyToken,
+        DateTimeOffset deferredOnUtc,
+        DateTimeOffset notBeforeUtc,
+        DeferralReason reason,
+        CancellationToken cancellationToken = default)
+    {
+        var buffered = await _buffer.DeferClaimAsync(id, expectedConcurrencyToken, notBeforeUtc, reason);
+        return buffered == MuleActionTransitionOutcome.NotFound
+            ? await ExecutionStorage.DeferClaimAsync(
+                id, expectedConcurrencyToken, deferredOnUtc, notBeforeUtc, reason, cancellationToken)
+            : buffered;
+    }
+
     public async Task MarkCompletedAsync(Ulid id, DateTimeOffset completedOnUtc, CancellationToken cancellationToken = default)
     {
         if (await _buffer.MarkCompletedAsync(id, completedOnUtc))
@@ -170,4 +242,9 @@ internal sealed class FastLaneRedisStorage : IMuleStorage, IMuleCancellationStor
         _pendingAdds.Clear();
         await _durableStorage.SaveChangesAsync(cancellationToken);
     }
+
+    private IMuleExecutionStorage ExecutionStorage
+        => _durableStorage as IMuleExecutionStorage
+            ?? throw new NotSupportedException(
+                $"Durable storage '{_durableStorage.GetType().FullName}' does not support keyed execution or deferral.");
 }
