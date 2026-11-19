@@ -18,12 +18,16 @@ envelope.completedOnUtc = ARGV[2]
 envelope.terminalOnUtc = ARGV[2]
 envelope.lockedOnUtc = cjson.null
 envelope.nextAttemptOnUtc = cjson.null
+envelope.pendingReason = 0
+envelope.deferralReasonCode = cjson.null
 envelope.lastError = cjson.null
 envelope.concurrencyToken = ARGV[5]
+envelope.intentDirty = true
 envelope.terminalDirty = true
 redis.call('SET', KEYS[1], cjson.encode(envelope))
 redis.call('ZADD', KEYS[2], ARGV[3], ARGV[4])
-redis.call('DEL', KEYS[3])
+redis.call('ZADD', KEYS[3], ARGV[3], ARGV[4])
+redis.call('DEL', KEYS[4])
 return 1
 """;
 
@@ -41,41 +45,19 @@ for _, id in ipairs(ids) do
         redis.call('ZREM', KEYS[1], id)
     else
         local envelope = cjson.decode(payload)
-        if envelope.intentDirty == true and envelope.intentFlushing ~= true then
+        local flushExpired = envelope.intentFlushing == true
+            and (envelope.intentFlushClaimedOnUtc == nil
+                or envelope.intentFlushClaimedOnUtc == cjson.null
+                or envelope.intentFlushClaimedOnUtc <= ARGV[3])
+        if envelope.intentDirty == true and (envelope.intentFlushing ~= true or flushExpired) then
             envelope.intentFlushing = true
+            envelope.intentFlushClaimedOnUtc = ARGV[2]
+            envelope.intentFlushToken = ARGV[4]
             local updated = cjson.encode(envelope)
             redis.call('SET', KEYS[2] .. id, updated)
             table.insert(claimed, updated)
             count = count + 1
         elseif envelope.intentDirty ~= true then
-            redis.call('ZREM', KEYS[1], id)
-        end
-    end
-end
-return claimed
-""";
-
-    private const string TakeTerminalFlushScript = """
-local ids = redis.call('ZRANGE', KEYS[1], 0, tonumber(ARGV[1]) * 4 - 1)
-local claimed = {}
-local count = 0
-for _, id in ipairs(ids) do
-    if count >= tonumber(ARGV[1]) then
-        break
-    end
-
-    local payload = redis.call('GET', KEYS[2] .. id)
-    if not payload then
-        redis.call('ZREM', KEYS[1], id)
-    else
-        local envelope = cjson.decode(payload)
-        if envelope.intentPersisted == true and envelope.terminalDirty == true and envelope.terminalFlushing ~= true then
-            envelope.terminalFlushing = true
-            local updated = cjson.encode(envelope)
-            redis.call('SET', KEYS[2] .. id, updated)
-            table.insert(claimed, updated)
-            count = count + 1
-        elseif envelope.terminalDirty ~= true then
             redis.call('ZREM', KEYS[1], id)
         end
     end
@@ -104,6 +86,8 @@ for _, id in ipairs(ids) do
                     envelope.startedOnUtc = ARGV[7]
                 end
                 envelope.concurrencyToken = ARGV[8]
+                envelope.pendingReason = 0
+                envelope.deferralReasonCode = cjson.null
                 envelope.intentDirty = true
                 local updated = cjson.encode(envelope)
                 redis.call('SET', KEYS[3] .. id, updated)
@@ -137,6 +121,8 @@ envelope.lockedOnUtc = cjson.null
 envelope.concurrencyToken = ARGV[8]
 if retry then
     envelope.nextAttemptOnUtc = ARGV[6]
+    envelope.pendingReason = 1
+    envelope.deferralReasonCode = cjson.null
     envelope.terminalOnUtc = cjson.null
     envelope.intentDirty = true
     envelope.terminalDirty = false
@@ -144,13 +130,95 @@ if retry then
     redis.call('ZADD', KEYS[4], ARGV[7], ARGV[4])
 else
     envelope.nextAttemptOnUtc = cjson.null
+    envelope.pendingReason = 0
+    envelope.deferralReasonCode = cjson.null
     envelope.terminalOnUtc = ARGV[6]
-    envelope.intentDirty = false
+    envelope.intentDirty = true
     envelope.terminalDirty = true
+    redis.call('ZADD', KEYS[2], ARGV[3], ARGV[4])
     redis.call('ZADD', KEYS[3], ARGV[3], ARGV[4])
 end
 redis.call('SET', KEYS[1], cjson.encode(envelope))
 redis.call('DEL', KEYS[5])
+return 1
+""";
+
+    private const string CompleteClaimScript = """
+local payload = redis.call('GET', KEYS[1])
+if not payload then return 0 end
+local envelope = cjson.decode(payload)
+if envelope.status ~= tonumber(ARGV[1]) or envelope.concurrencyToken ~= ARGV[2] then return -1 end
+envelope.status = tonumber(ARGV[3])
+envelope.completedOnUtc = ARGV[4]
+envelope.terminalOnUtc = ARGV[4]
+envelope.lockedOnUtc = cjson.null
+envelope.nextAttemptOnUtc = cjson.null
+envelope.pendingReason = 0
+envelope.deferralReasonCode = cjson.null
+envelope.lastError = cjson.null
+envelope.concurrencyToken = ARGV[7]
+envelope.intentDirty = true
+envelope.terminalDirty = true
+redis.call('SET', KEYS[1], cjson.encode(envelope))
+redis.call('ZADD', KEYS[2], ARGV[5], ARGV[6])
+redis.call('ZADD', KEYS[3], ARGV[5], ARGV[6])
+redis.call('DEL', KEYS[4])
+return 1
+""";
+
+    private const string FailClaimScript = """
+local payload = redis.call('GET', KEYS[1])
+if not payload then return 0 end
+local envelope = cjson.decode(payload)
+if envelope.status ~= tonumber(ARGV[1]) or envelope.concurrencyToken ~= ARGV[2] then return -1 end
+local retry = ARGV[7] == '1'
+envelope.attempts = (envelope.attempts or 0) + 1
+envelope.status = tonumber(ARGV[3])
+envelope.lastError = ARGV[4]
+envelope.lockedOnUtc = cjson.null
+envelope.concurrencyToken = ARGV[10]
+if retry then
+    envelope.nextAttemptOnUtc = ARGV[8]
+    envelope.pendingReason = 1
+    envelope.deferralReasonCode = cjson.null
+    envelope.terminalOnUtc = cjson.null
+    envelope.intentDirty = true
+    envelope.terminalDirty = false
+    redis.call('ZADD', KEYS[2], ARGV[5], ARGV[6])
+    redis.call('ZADD', KEYS[4], ARGV[9], ARGV[6])
+else
+    envelope.nextAttemptOnUtc = cjson.null
+    envelope.pendingReason = 0
+    envelope.deferralReasonCode = cjson.null
+    envelope.terminalOnUtc = ARGV[8]
+    envelope.intentDirty = true
+    envelope.terminalDirty = true
+    redis.call('ZADD', KEYS[3], ARGV[5], ARGV[6])
+end
+redis.call('SET', KEYS[1], cjson.encode(envelope))
+redis.call('ZADD', KEYS[2], ARGV[5], ARGV[6])
+redis.call('DEL', KEYS[5])
+return 1
+""";
+
+    private const string DeferClaimScript = """
+local payload = redis.call('GET', KEYS[1])
+if not payload then return 0 end
+local envelope = cjson.decode(payload)
+if envelope.status ~= tonumber(ARGV[1]) or envelope.concurrencyToken ~= ARGV[2] then return -1 end
+envelope.status = tonumber(ARGV[3])
+envelope.lockedOnUtc = cjson.null
+envelope.nextAttemptOnUtc = ARGV[4]
+envelope.pendingReason = 2
+envelope.deferralReasonCode = ARGV[5]
+envelope.terminalOnUtc = cjson.null
+envelope.concurrencyToken = ARGV[8]
+envelope.intentDirty = true
+envelope.terminalDirty = false
+redis.call('SET', KEYS[1], cjson.encode(envelope))
+redis.call('ZADD', KEYS[2], ARGV[6], ARGV[7])
+redis.call('ZADD', KEYS[3], ARGV[9], ARGV[7])
+redis.call('DEL', KEYS[4])
 return 1
 """;
 
@@ -163,7 +231,7 @@ local envelope = cjson.decode(payload)
 if envelope.status == tonumber(ARGV[2]) then
     return { 2, envelope.cancelledOnUtc or '' }
 end
-if envelope.status ~= tonumber(ARGV[1]) or redis.call('EXISTS', KEYS[3]) == 1 then
+if envelope.status ~= tonumber(ARGV[1]) or redis.call('EXISTS', KEYS[4]) == 1 then
     return { 3, '' }
 end
 envelope.status = tonumber(ARGV[2])
@@ -171,12 +239,16 @@ envelope.cancelledOnUtc = ARGV[3]
 envelope.terminalOnUtc = ARGV[3]
 envelope.lockedOnUtc = cjson.null
 envelope.nextAttemptOnUtc = cjson.null
+envelope.pendingReason = 0
+envelope.deferralReasonCode = cjson.null
 envelope.concurrencyToken = ARGV[6]
+envelope.intentDirty = true
 envelope.terminalDirty = true
 envelope.terminalFlushed = false
 redis.call('SET', KEYS[1], cjson.encode(envelope))
-redis.call('ZREM', KEYS[4] .. envelope.lane, ARGV[5])
+redis.call('ZREM', KEYS[5] .. envelope.lane, ARGV[5])
 redis.call('ZADD', KEYS[2], ARGV[4], ARGV[5])
+redis.call('ZADD', KEYS[3], ARGV[4], ARGV[5])
 return { 1, ARGV[3] }
 """;
 
@@ -216,6 +288,8 @@ if envelope.startedOnUtc == nil or envelope.startedOnUtc == cjson.null then
     envelope.startedOnUtc = ARGV[4]
 end
 envelope.concurrencyToken = ARGV[9]
+envelope.pendingReason = 0
+envelope.deferralReasonCode = cjson.null
 envelope.intentDirty = true
 local updated = cjson.encode(envelope)
 redis.call('SET', KEYS[1], updated)
@@ -232,14 +306,35 @@ if not payload then
 end
 
 local envelope = cjson.decode(payload)
+local expected = ARGV[2]
+local persisted = envelope.persistedConcurrencyToken
+if expected == '' then
+    if persisted ~= nil and persisted ~= cjson.null and persisted ~= '' then return -1 end
+elseif persisted == nil or persisted == cjson.null or persisted ~= expected then
+    return -1
+end
+if envelope.intentFlushToken == nil or envelope.intentFlushToken == cjson.null or envelope.intentFlushToken ~= ARGV[6] then
+    envelope.intentPersisted = true
+    envelope.persistedConcurrencyToken = ARGV[3]
+    redis.call('SET', KEYS[1], cjson.encode(envelope))
+    return -2
+end
 envelope.intentPersisted = true
 envelope.intentFlushing = false
-if envelope.concurrencyToken == ARGV[2] then
+envelope.intentFlushClaimedOnUtc = cjson.null
+envelope.intentFlushToken = cjson.null
+envelope.persistedConcurrencyToken = ARGV[3]
+if envelope.concurrencyToken == ARGV[3] then
     envelope.intentDirty = false
+    if envelope.status == 2 or envelope.status == 3 or envelope.status == 4 then
+        envelope.terminalDirty = false
+        envelope.terminalFlushed = true
+        redis.call('ZREM', KEYS[3], ARGV[1])
+    end
 end
 
 if envelope.intentDirty == true then
-    redis.call('ZADD', KEYS[2], ARGV[3], ARGV[1])
+    redis.call('ZADD', KEYS[2], ARGV[4], ARGV[1])
 else
     redis.call('ZREM', KEYS[2], ARGV[1])
 end
@@ -251,7 +346,7 @@ local canRemove = envelope.intentPersisted == true
 if canRemove then
     redis.call('DEL', KEYS[1])
     if envelope.deduplicationKey ~= nil and envelope.deduplicationKey ~= cjson.null and envelope.deduplicationKey ~= '' then
-        redis.call('DEL', ARGV[4] .. envelope.key .. ':' .. envelope.deduplicationKey)
+        redis.call('DEL', ARGV[5] .. envelope.key .. ':' .. envelope.deduplicationKey)
     end
     return 2
 end
@@ -268,66 +363,14 @@ if not payload then
 end
 
 local envelope = cjson.decode(payload)
+if envelope.intentFlushToken == nil or envelope.intentFlushToken == cjson.null or envelope.intentFlushToken ~= ARGV[3] then
+    return -1
+end
 envelope.intentFlushing = false
+envelope.intentFlushClaimedOnUtc = cjson.null
+envelope.intentFlushToken = cjson.null
 redis.call('SET', KEYS[1], cjson.encode(envelope))
 if envelope.intentDirty == true then
-    redis.call('ZADD', KEYS[2], ARGV[2], ARGV[1])
-else
-    redis.call('ZREM', KEYS[2], ARGV[1])
-end
-return 1
-""";
-
-    private const string CompleteTerminalFlushScript = """
-local payload = redis.call('GET', KEYS[1])
-if not payload then
-    redis.call('ZREM', KEYS[2], ARGV[1])
-    return 0
-end
-
-local envelope = cjson.decode(payload)
-envelope.terminalFlushing = false
-if envelope.concurrencyToken == ARGV[2] then
-    envelope.terminalDirty = false
-    envelope.terminalFlushed = true
-else
-    envelope.terminalDirty = true
-    envelope.terminalFlushed = false
-end
-
-if envelope.terminalDirty == true then
-    redis.call('ZADD', KEYS[2], ARGV[3], ARGV[1])
-else
-    redis.call('ZREM', KEYS[2], ARGV[1])
-end
-
-local canRemove = envelope.intentPersisted == true
-    and envelope.intentDirty ~= true
-    and envelope.terminalFlushed == true
-    and envelope.terminalDirty ~= true
-if canRemove then
-    redis.call('DEL', KEYS[1])
-    if envelope.deduplicationKey ~= nil and envelope.deduplicationKey ~= cjson.null and envelope.deduplicationKey ~= '' then
-        redis.call('DEL', ARGV[4] .. envelope.key .. ':' .. envelope.deduplicationKey)
-    end
-    return 2
-end
-
-redis.call('SET', KEYS[1], cjson.encode(envelope))
-return 1
-""";
-
-    private const string CancelTerminalFlushScript = """
-local payload = redis.call('GET', KEYS[1])
-if not payload then
-    redis.call('ZREM', KEYS[2], ARGV[1])
-    return 0
-end
-
-local envelope = cjson.decode(payload)
-envelope.terminalFlushing = false
-redis.call('SET', KEYS[1], cjson.encode(envelope))
-if envelope.terminalDirty == true then
     redis.call('ZADD', KEYS[2], ARGV[2], ARGV[1])
 else
     redis.call('ZREM', KEYS[2], ARGV[1])
@@ -513,6 +556,127 @@ return 1
         return next;
     }
 
+    public async Task<IReadOnlyCollection<DurableAction>> ReadPendingCandidatesAsync(
+        string lane,
+        int offset,
+        int batchSize,
+        DateTimeOffset now)
+    {
+        var database = await _connection.GetDatabaseAsync();
+        var ids = await database.SortedSetRangeByScoreAsync(
+            PendingKey(NormalizeLane(lane)),
+            double.NegativeInfinity,
+            Score(now),
+            Exclude.None,
+            Order.Ascending,
+            Math.Max(0, offset),
+            Math.Max(1, batchSize));
+        if (ids.Length == 0)
+            return Array.Empty<DurableAction>();
+
+        var values = await Task.WhenAll(ids.Select(id => database.StringGetAsync(GetActionKey(Ulid.Parse((string)id)))));
+        return values
+            .Where(value => value.HasValue)
+            .Select(value => JsonSerializer.Deserialize<RedisActionEnvelope>((string)value, JsonOptions))
+            .Where(envelope => envelope != null)
+            .Select(envelope => envelope.ToAction())
+            .ToArray();
+    }
+
+    public async Task<DurableAction> FindActionAsync(Ulid id)
+        => (await GetEnvelopeAsync(id))?.ToAction();
+
+    public async Task<MuleActionTransitionOutcome> CompleteClaimAsync(
+        Ulid id,
+        Ulid expectedConcurrencyToken,
+        DateTimeOffset completedOnUtc)
+    {
+        var database = await _connection.GetDatabaseAsync();
+        var result = (int)await database.ScriptEvaluateAsync(
+            CompleteClaimScript,
+            [GetActionKey(id), IntentFlushKey, TerminalFlushKey, GetLeaseKey(id)],
+            [
+                (int)DurableActionStatus.Locked,
+                expectedConcurrencyToken.ToString(),
+                (int)DurableActionStatus.Completed,
+                FormatDate(completedOnUtc),
+                Score(completedOnUtc),
+                id.ToString(),
+                Ulid.NewUlid().ToString()
+            ]);
+        return TransitionOutcome(result);
+    }
+
+    public async Task<MuleActionTransitionOutcome> FailClaimAsync(
+        Ulid id,
+        Ulid expectedConcurrencyToken,
+        string error,
+        DateTimeOffset now,
+        DateTimeOffset? nextAttemptOnUtc)
+    {
+        var envelope = await GetEnvelopeAsync(id);
+        if (envelope == null)
+            return MuleActionTransitionOutcome.NotFound;
+
+        var database = await _connection.GetDatabaseAsync();
+        var retry = nextAttemptOnUtc != null;
+        var result = (int)await database.ScriptEvaluateAsync(
+            FailClaimScript,
+            [
+                GetActionKey(id),
+                IntentFlushKey,
+                TerminalFlushKey,
+                PendingKey(NormalizeLane(envelope.Lane)),
+                GetLeaseKey(id)
+            ],
+            [
+                (int)DurableActionStatus.Locked,
+                expectedConcurrencyToken.ToString(),
+                (int)(retry ? DurableActionStatus.Pending : DurableActionStatus.Failed),
+                error ?? string.Empty,
+                Score(now),
+                id.ToString(),
+                retry ? "1" : "0",
+                FormatDate(nextAttemptOnUtc ?? now),
+                retry ? Score(nextAttemptOnUtc.Value) : 0,
+                Ulid.NewUlid().ToString()
+            ]);
+        return TransitionOutcome(result);
+    }
+
+    public async Task<MuleActionTransitionOutcome> DeferClaimAsync(
+        Ulid id,
+        Ulid expectedConcurrencyToken,
+        DateTimeOffset notBeforeUtc,
+        DeferralReason reason)
+    {
+        var envelope = await GetEnvelopeAsync(id);
+        if (envelope == null)
+            return MuleActionTransitionOutcome.NotFound;
+
+        var database = await _connection.GetDatabaseAsync();
+        var result = (int)await database.ScriptEvaluateAsync(
+            DeferClaimScript,
+            [
+                GetActionKey(id),
+                IntentFlushKey,
+                PendingKey(NormalizeLane(envelope.Lane)),
+                GetLeaseKey(id)
+            ],
+            [
+                (int)DurableActionStatus.Locked,
+                expectedConcurrencyToken.ToString(),
+                (int)DurableActionStatus.Pending,
+                FormatDate(notBeforeUtc),
+                reason.Value,
+                Score(notBeforeUtc),
+                id.ToString(),
+                Ulid.NewUlid().ToString(),
+                Score(notBeforeUtc)
+            ]);
+        return TransitionOutcome(result);
+    }
+
     public async Task<bool> MarkCompletedAsync(Ulid id, DateTimeOffset completedOnUtc)
     {
         var database = await _connection.GetDatabaseAsync();
@@ -520,6 +684,7 @@ return 1
             MarkCompletedScript,
             [
                 GetActionKey(id),
+                IntentFlushKey,
                 TerminalFlushKey,
                 GetLeaseKey(id)
             ],
@@ -570,6 +735,7 @@ return 1
             CancelScript,
             [
                 GetActionKey(id),
+                IntentFlushKey,
                 TerminalFlushKey,
                 GetLeaseKey(id),
                 $"{_connection.Prefix}:fastlane:pending:"
@@ -598,94 +764,68 @@ return 1
         return new MuleCancellationResult(id, outcome, effectiveDate);
     }
 
-    public async Task<IReadOnlyCollection<DurableAction>> TakeIntentFlushBatchAsync(int batchSize)
+    public async Task<IReadOnlyCollection<MuleActionStateProjection>> TakeIntentFlushBatchAsync(int batchSize)
     {
         var database = await _connection.GetDatabaseAsync();
+        var projectionToken = Ulid.NewUlid();
+        var now = DateTimeOffset.UtcNow;
         var result = await database.ScriptEvaluateAsync(
             TakeIntentFlushScript,
             [IntentFlushKey, $"{_connection.Prefix}:fastlane:action:"],
-            [Math.Max(1, batchSize)]);
+            [
+                Math.Max(1, batchSize),
+                FormatDate(now),
+                FormatDate(now.Subtract(GetFlushClaimTimeout())),
+                projectionToken.ToString()
+            ]);
         var values = (RedisResult[])result;
 
         return values
             .Select(value => JsonSerializer.Deserialize<RedisActionEnvelope>((string)(RedisValue)value, JsonOptions))
             .Where(envelope => envelope != null)
-            .Select(envelope => CloneForDurableIntent(envelope).ToAction())
+            .Select(envelope => new MuleActionStateProjection(
+                envelope.ToAction(),
+                envelope.PersistedConcurrencyToken,
+                envelope.IntentFlushToken ?? projectionToken))
             .ToArray();
     }
 
-    public async Task CompleteIntentFlushAsync(IReadOnlyCollection<DurableAction> actions)
+    public async Task CompleteIntentFlushAsync(IReadOnlyCollection<MuleActionStateProjection> projections)
     {
-        if (actions.Count == 0)
+        if (projections.Count == 0)
             return;
 
         var database = await _connection.GetDatabaseAsync();
-        await Task.WhenAll(actions.Select(action => database.ScriptEvaluateAsync(
+        var results = await Task.WhenAll(projections.Select(projection => database.ScriptEvaluateAsync(
             CompleteIntentFlushScript,
-            [GetActionKey(action.Id), IntentFlushKey],
+            [GetActionKey(projection.Action.Id), IntentFlushKey, TerminalFlushKey],
             [
-                action.Id.ToString(),
-                action.ConcurrencyToken.ToString(),
+                projection.Action.Id.ToString(),
+                projection.ExpectedConcurrencyToken?.ToString() ?? string.Empty,
+                projection.Action.ConcurrencyToken.ToString(),
                 Score(DateTimeOffset.UtcNow),
-                DeduplicationKeyPrefix
+                DeduplicationKeyPrefix,
+                projection.ProjectionToken.ToString()
             ])));
+
+        if (results.Any(result => (int)result == -1))
+            throw new InvalidOperationException("FastLane durable projection acknowledgement was rejected.");
     }
 
-    public async Task CancelIntentFlushAsync(IReadOnlyCollection<Ulid> ids)
+    public async Task CancelIntentFlushAsync(IReadOnlyCollection<MuleActionStateProjection> projections)
     {
-        if (ids.Count == 0)
+        if (projections.Count == 0)
             return;
 
         var database = await _connection.GetDatabaseAsync();
-        await Task.WhenAll(ids.Select(id => database.ScriptEvaluateAsync(
+        await Task.WhenAll(projections.Select(projection => database.ScriptEvaluateAsync(
             CancelIntentFlushScript,
-            [GetActionKey(id), IntentFlushKey],
-            [id.ToString(), Score(DateTimeOffset.UtcNow)])));
-    }
-
-    public async Task<IReadOnlyCollection<DurableAction>> TakeTerminalFlushBatchAsync(int batchSize)
-    {
-        var database = await _connection.GetDatabaseAsync();
-        var result = await database.ScriptEvaluateAsync(
-            TakeTerminalFlushScript,
-            [TerminalFlushKey, $"{_connection.Prefix}:fastlane:action:"],
-            [Math.Max(1, batchSize)]);
-        var values = (RedisResult[])result;
-
-        return values
-            .Select(value => JsonSerializer.Deserialize<RedisActionEnvelope>((string)(RedisValue)value, JsonOptions))
-            .Where(envelope => envelope != null)
-            .Select(envelope => envelope.ToAction())
-            .ToArray();
-    }
-
-    public async Task CompleteTerminalFlushAsync(IReadOnlyCollection<DurableAction> actions)
-    {
-        if (actions.Count == 0)
-            return;
-
-        var database = await _connection.GetDatabaseAsync();
-        await Task.WhenAll(actions.Select(action => database.ScriptEvaluateAsync(
-            CompleteTerminalFlushScript,
-            [GetActionKey(action.Id), TerminalFlushKey],
+            [GetActionKey(projection.Action.Id), IntentFlushKey],
             [
-                action.Id.ToString(),
-                action.ConcurrencyToken.ToString(),
+                projection.Action.Id.ToString(),
                 Score(DateTimeOffset.UtcNow),
-                DeduplicationKeyPrefix
+                projection.ProjectionToken.ToString()
             ])));
-    }
-
-    public async Task CancelTerminalFlushAsync(IReadOnlyCollection<Ulid> ids)
-    {
-        if (ids.Count == 0)
-            return;
-
-        var database = await _connection.GetDatabaseAsync();
-        await Task.WhenAll(ids.Select(id => database.ScriptEvaluateAsync(
-            CancelTerminalFlushScript,
-            [GetActionKey(id), TerminalFlushKey],
-            [id.ToString(), Score(DateTimeOffset.UtcNow)])));
     }
 
     private async Task<RedisActionEnvelope> GetEnvelopeAsync(Ulid id)
@@ -695,23 +835,6 @@ return 1
         return value.HasValue
             ? JsonSerializer.Deserialize<RedisActionEnvelope>((string)value, JsonOptions)
             : null;
-    }
-
-    private RedisActionEnvelope CloneForDurableIntent(RedisActionEnvelope envelope)
-    {
-        var clone = RedisActionEnvelope.FromAction(envelope.ToAction());
-        if (clone.Status is DurableActionStatus.Pending or DurableActionStatus.Completed or DurableActionStatus.Failed)
-        {
-            clone.Status = DurableActionStatus.Locked;
-            clone.LockedOnUtc ??= DateTimeOffset.UtcNow;
-            if (envelope.Status == DurableActionStatus.Failed)
-                clone.Attempts = Math.Max(0, envelope.Attempts - 1);
-            clone.CompletedOnUtc = null;
-            clone.TerminalOnUtc = null;
-            clone.LastError = null;
-        }
-
-        return clone;
     }
 
     private string GetActionKey(Ulid id) => $"{_connection.Prefix}:fastlane:action:{id}";
@@ -734,6 +857,9 @@ return 1
     private TimeSpan GetLeaseDuration()
         => _options.LeaseDuration <= TimeSpan.Zero ? TimeSpan.FromMinutes(2) : _options.LeaseDuration;
 
+    private TimeSpan GetFlushClaimTimeout()
+        => _options.FlushClaimTimeout <= TimeSpan.Zero ? TimeSpan.FromMinutes(1) : _options.FlushClaimTimeout;
+
     private TimeSpan GetDeduplicationRetention()
         => _options.DeduplicationRetention <= TimeSpan.Zero ? TimeSpan.FromDays(7) : _options.DeduplicationRetention;
 
@@ -748,4 +874,12 @@ return 1
 
     private static string NormalizeLane(string lane)
         => string.IsNullOrWhiteSpace(lane) ? MuleSettings.DefaultLane : lane;
+
+    private static MuleActionTransitionOutcome TransitionOutcome(int result)
+        => result switch
+        {
+            > 0 => MuleActionTransitionOutcome.Applied,
+            < 0 => MuleActionTransitionOutcome.LeaseLost,
+            _ => MuleActionTransitionOutcome.NotFound
+        };
 }

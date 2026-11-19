@@ -36,16 +36,9 @@ public sealed class RedisFlushRaceTests : IAsyncLifetime
         await buffer.CompleteIntentFlushAsync([staleIntent]);
 
         var currentIntent = Assert.Single(await buffer.TakeIntentFlushBatchAsync(1));
-        Assert.NotEqual(staleIntent.ConcurrencyToken, currentIntent.ConcurrencyToken);
+        Assert.Equal(staleIntent.Action.ConcurrencyToken, currentIntent.ExpectedConcurrencyToken);
+        Assert.NotEqual(staleIntent.Action.ConcurrencyToken, currentIntent.Action.ConcurrencyToken);
         await buffer.CompleteIntentFlushAsync([currentIntent]);
-
-        var staleTerminal = Assert.Single(await buffer.TakeTerminalFlushBatchAsync(1));
-        Assert.True(await buffer.MarkCompletedAsync(action.Id, now.AddSeconds(2)));
-        await buffer.CompleteTerminalFlushAsync([staleTerminal]);
-
-        var currentTerminal = Assert.Single(await buffer.TakeTerminalFlushBatchAsync(1));
-        Assert.NotEqual(staleTerminal.ConcurrencyToken, currentTerminal.ConcurrencyToken);
-        await buffer.CompleteTerminalFlushAsync([currentTerminal]);
 
         var database = await connection.GetDatabaseAsync();
         Assert.False(await database.KeyExistsAsync($"{_prefix}:fastlane:action:{action.Id}"));
@@ -72,7 +65,7 @@ public sealed class RedisFlushRaceTests : IAsyncLifetime
         Assert.NotNull(await buffer.LockAsync(action.Id, TimeSpan.FromMinutes(1), now));
         var intent = Assert.Single(await buffer.TakeIntentFlushBatchAsync(1));
         Assert.True(await buffer.MarkCompletedAsync(action.Id, now.AddSeconds(1)));
-        await buffer.CancelIntentFlushAsync([intent.Id]);
+        await buffer.CancelIntentFlushAsync([intent]);
 
         var database = await connection.GetDatabaseAsync();
         var value = await database.StringGetAsync($"{_prefix}:fastlane:action:{action.Id}");
@@ -83,15 +76,10 @@ public sealed class RedisFlushRaceTests : IAsyncLifetime
             Assert.False(document.RootElement.GetProperty("intentFlushing").GetBoolean());
         }
 
-        await buffer.CompleteIntentFlushAsync(await buffer.TakeIntentFlushBatchAsync(1));
-        var terminal = Assert.Single(await buffer.TakeTerminalFlushBatchAsync(1));
-        await buffer.CancelTerminalFlushAsync([terminal.Id]);
-
-        value = await database.StringGetAsync($"{_prefix}:fastlane:action:{action.Id}");
-        using var finalDocument = JsonDocument.Parse((string)value);
-        Assert.Equal((int)DurableActionStatus.Completed, finalDocument.RootElement.GetProperty("status").GetInt32());
-        Assert.True(finalDocument.RootElement.GetProperty("terminalDirty").GetBoolean());
-        Assert.False(finalDocument.RootElement.GetProperty("terminalFlushing").GetBoolean());
+        var current = Assert.Single(await buffer.TakeIntentFlushBatchAsync(1));
+        Assert.Equal(DurableActionStatus.Completed, current.Action.Status);
+        await buffer.CompleteIntentFlushAsync([current]);
+        Assert.False(await database.KeyExistsAsync($"{_prefix}:fastlane:action:{action.Id}"));
     }
 
     public Task InitializeAsync() => Task.CompletedTask;

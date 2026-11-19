@@ -34,6 +34,10 @@ internal sealed class RedisActionEnvelope
 
     public DateTimeOffset? NextAttemptOnUtc { get; set; }
 
+    public DurableActionPendingReason PendingReason { get; set; }
+
+    public string DeferralReasonCode { get; set; }
+
     public DateTimeOffset? CompletedOnUtc { get; set; }
 
     public DateTimeOffset? CancelledOnUtc { get; set; }
@@ -42,9 +46,15 @@ internal sealed class RedisActionEnvelope
 
     public bool IntentPersisted { get; set; }
 
+    public Ulid? PersistedConcurrencyToken { get; set; }
+
     public bool IntentDirty { get; set; } = true;
 
     public bool IntentFlushing { get; set; }
+
+    public DateTimeOffset? IntentFlushClaimedOnUtc { get; set; }
+
+    public Ulid? IntentFlushToken { get; set; }
 
     public bool TerminalDirty { get; set; }
 
@@ -71,6 +81,8 @@ internal sealed class RedisActionEnvelope
             LockedOnUtc = LockedOnUtc,
             StartedOnUtc = StartedOnUtc,
             NextAttemptOnUtc = NextAttemptOnUtc,
+            PendingReason = PendingReason,
+            DeferralReasonCode = DeferralReasonCode,
             CompletedOnUtc = CompletedOnUtc,
             CancelledOnUtc = CancelledOnUtc,
             TerminalOnUtc = TerminalOnUtc
@@ -95,6 +107,8 @@ internal sealed class RedisActionEnvelope
             LockedOnUtc = action.LockedOnUtc,
             StartedOnUtc = action.StartedOnUtc,
             NextAttemptOnUtc = action.NextAttemptOnUtc,
+            PendingReason = action.PendingReason,
+            DeferralReasonCode = action.DeferralReasonCode,
             CompletedOnUtc = action.CompletedOnUtc,
             CancelledOnUtc = action.CancelledOnUtc,
             TerminalOnUtc = action.TerminalOnUtc

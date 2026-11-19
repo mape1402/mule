@@ -56,9 +56,9 @@ public sealed class FastLaneInMemoryCoverageTests
 
         var intents = buffer.TakeIntentFlushBatch(10).ToArray();
         Assert.NotEmpty(intents);
-        buffer.CancelIntentFlush([action.Id, Ulid.NewUlid()]);
+        buffer.CancelIntentFlush(intents);
         intents = buffer.TakeIntentFlushBatch(10).ToArray();
-        buffer.CompleteIntentFlush(intents.Select(x => x.Id).Append(Ulid.NewUlid()).ToArray());
+        buffer.CompleteIntentFlush(intents);
 
         Assert.True(buffer.MarkCompleted(action.Id, now.AddSeconds(1)));
         Assert.True(buffer.MarkFailed(expired.Id, "terminal", now.AddSeconds(2), null));
@@ -66,12 +66,9 @@ public sealed class FastLaneInMemoryCoverageTests
         Assert.False(buffer.MarkCompleted(Ulid.NewUlid(), now));
         Assert.False(buffer.MarkFailed(Ulid.NewUlid(), "missing", now, null));
 
-        var terminal = buffer.TakeTerminalFlushBatch(10).ToArray();
-        Assert.Contains(terminal, x => x.Id == action.Id);
-        Assert.Empty(buffer.TakeTerminalFlushBatch(10));
-        buffer.CancelTerminalFlush([action.Id, Ulid.NewUlid()]);
-        terminal = buffer.TakeTerminalFlushBatch(10).ToArray();
-        buffer.CompleteTerminalFlush(terminal.Select(x => x.Id).Append(Ulid.NewUlid()).ToArray());
+        var terminal = buffer.TakeIntentFlushBatch(10).ToArray();
+        Assert.Contains(terminal, x => x.Action.Id == action.Id);
+        buffer.CompleteIntentFlush(terminal);
 
         Assert.False(buffer.Contains(action.Id));
 
@@ -82,8 +79,8 @@ public sealed class FastLaneInMemoryCoverageTests
         Assert.True(buffer.TryAdd(completedBeforeIntent));
         Assert.True(buffer.TryAdd(failedBeforeIntent));
         var durableIntents = buffer.TakeIntentFlushBatch(10);
-        Assert.Contains(durableIntents, x => x.Id == completedBeforeIntent.Id && x.Status == DurableActionStatus.Locked);
-        Assert.Contains(durableIntents, x => x.Id == failedBeforeIntent.Id && x.Attempts == 2);
+        Assert.Contains(durableIntents, x => x.Action.Id == completedBeforeIntent.Id && x.Action.Status == DurableActionStatus.Completed);
+        Assert.Contains(durableIntents, x => x.Action.Id == failedBeforeIntent.Id && x.Action.Attempts == 3);
     }
 
     [Fact]
@@ -171,7 +168,7 @@ public sealed class FastLaneInMemoryCoverageTests
         Assert.Equal(MuleCancellationOutcome.TooLate, tooLate.Outcome);
         Assert.Contains(
             buffer.TakeIntentFlushBatch(10),
-            x => x.Id == pending.Id && x.Status == DurableActionStatus.Cancelled);
+            x => x.Action.Id == pending.Id && x.Action.Status == DurableActionStatus.Cancelled);
 
         var unsupported = Substitute.For<IMuleDurableStorage>();
         var unsupportedStorage = new FastLaneInMemoryStorage(unsupported, new InMemoryFastLaneBuffer());
@@ -205,6 +202,132 @@ public sealed class FastLaneInMemoryCoverageTests
 
         durable.NextPending = now.AddMinutes(1);
         Assert.Equal(now, await storage.GetNextPendingOnUtcAsync(TimeSpan.FromMinutes(1), now));
+    }
+
+    [Fact]
+    public void Buffer_Should_Enforce_Claim_Ownership_For_All_Transitions()
+    {
+        var buffer = new InMemoryFastLaneBuffer();
+        var now = DateTimeOffset.UtcNow;
+        var complete = CreateAction("claim-complete", now.AddMinutes(-3));
+        var fail = CreateAction("claim-fail", now.AddMinutes(-2));
+        var retry = CreateAction("claim-retry", now.AddMinutes(-1));
+        var defer = CreateAction("claim-defer", now);
+        var future = CreateAction("candidate-future", now, nextAttemptOnUtc: now.AddMinutes(1));
+        var dueWithDate = CreateAction("candidate-due-date", now, nextAttemptOnUtc: now.AddSeconds(-1));
+        var otherLane = CreateAction("candidate-other-lane", now);
+        otherLane.Lane = "other";
+        foreach (var action in new[] { complete, fail, retry, defer, future, dueWithDate, otherLane })
+            Assert.True(buffer.TryAdd(action));
+
+        Assert.Equal(5, buffer.ReadPendingCandidates("Lane-A", -1, 10, TimeSpan.FromMinutes(1), now).Count);
+        Assert.Null(buffer.FindAction(Ulid.NewUlid()));
+        Assert.Equal(complete.Id, buffer.FindAction(complete.Id).Id);
+
+        complete = buffer.Lock(complete.Id, TimeSpan.FromMinutes(1), now);
+        Assert.Equal(MuleActionTransitionOutcome.NotFound,
+            buffer.CompleteClaim(Ulid.NewUlid(), Ulid.NewUlid(), now));
+        Assert.Equal(MuleActionTransitionOutcome.LeaseLost,
+            buffer.CompleteClaim(complete.Id, Ulid.NewUlid(), now));
+        Assert.Equal(MuleActionTransitionOutcome.Applied,
+            buffer.CompleteClaim(complete.Id, complete.ConcurrencyToken, now));
+
+        fail = buffer.Lock(fail.Id, TimeSpan.FromMinutes(1), now);
+        Assert.Equal(MuleActionTransitionOutcome.NotFound,
+            buffer.FailClaim(Ulid.NewUlid(), Ulid.NewUlid(), "missing", now, null));
+        Assert.Equal(MuleActionTransitionOutcome.LeaseLost,
+            buffer.FailClaim(fail.Id, Ulid.NewUlid(), "stale", now, null));
+        Assert.Equal(MuleActionTransitionOutcome.Applied,
+            buffer.FailClaim(fail.Id, fail.ConcurrencyToken, "terminal", now, null));
+
+        retry = buffer.Lock(retry.Id, TimeSpan.FromMinutes(1), now);
+        Assert.Equal(MuleActionTransitionOutcome.Applied,
+            buffer.FailClaim(retry.Id, retry.ConcurrencyToken, "retry", now, now.AddSeconds(1)));
+
+        defer = buffer.Lock(defer.Id, TimeSpan.FromMinutes(1), now);
+        Assert.Equal(MuleActionTransitionOutcome.NotFound,
+            buffer.DeferClaim(Ulid.NewUlid(), Ulid.NewUlid(), now, DeferralReason.From("missing")));
+        Assert.Equal(MuleActionTransitionOutcome.LeaseLost,
+            buffer.DeferClaim(defer.Id, Ulid.NewUlid(), now, DeferralReason.From("stale")));
+        Assert.Equal(MuleActionTransitionOutcome.Applied,
+            buffer.DeferClaim(defer.Id, defer.ConcurrencyToken, now.AddMinutes(1), DeferralReason.From("busy")));
+
+        var projectionBuffer = new InMemoryFastLaneBuffer();
+        var projectionAction = CreateAction("projection-branches", now);
+        projectionBuffer.TryAdd(projectionAction);
+        var projection = Assert.Single(projectionBuffer.TakeIntentFlushBatch(1));
+        Assert.Empty(projectionBuffer.TakeIntentFlushBatch(1));
+        projectionBuffer.CompleteIntentFlush([
+            new MuleActionStateProjection(CreateAction("missing-projection", now), null, projection.ProjectionToken)
+        ]);
+        projectionBuffer.CompleteIntentFlush([
+            new MuleActionStateProjection(
+                projection.Action,
+                projection.ExpectedConcurrencyToken,
+                Ulid.NewUlid())
+        ]);
+        projectionBuffer.CompleteIntentFlush([
+            new MuleActionStateProjection(
+                projection.Action,
+                Ulid.NewUlid(),
+                projection.ProjectionToken)
+        ]);
+        projectionBuffer.CompleteIntentFlush([projection]);
+    }
+
+    [Fact]
+    public async Task Storage_Should_Combine_Buffered_And_Durable_Execution_State()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var durable = Substitute.For<IMuleDurableStorage, IMuleExecutionStorage>();
+        var execution = (IMuleExecutionStorage)durable;
+        var durableAction = CreateAction("durable-candidate", now.AddMinutes(-2));
+        durableAction.NextAttemptOnUtc = now.AddMinutes(-1);
+        execution.ReadPendingCandidatesAsync(
+                Arg.Any<string>(), Arg.Any<int>(), Arg.Any<int>(), Arg.Any<TimeSpan>(), Arg.Any<DateTimeOffset>(), Arg.Any<CancellationToken>())
+            .Returns([durableAction]);
+        execution.FindActionAsync(durableAction.Id, Arg.Any<CancellationToken>()).Returns(durableAction);
+        execution.CompleteClaimAsync(Arg.Any<Ulid>(), Arg.Any<Ulid>(), Arg.Any<DateTimeOffset>(), Arg.Any<CancellationToken>())
+            .Returns(MuleActionTransitionOutcome.Applied);
+        execution.FailClaimAsync(Arg.Any<Ulid>(), Arg.Any<Ulid>(), Arg.Any<string>(), Arg.Any<DateTimeOffset>(), Arg.Any<DateTimeOffset?>(), Arg.Any<CancellationToken>())
+            .Returns(MuleActionTransitionOutcome.Applied);
+        execution.DeferClaimAsync(Arg.Any<Ulid>(), Arg.Any<Ulid>(), Arg.Any<DateTimeOffset>(), Arg.Any<DateTimeOffset>(), Arg.Any<DeferralReason>(), Arg.Any<CancellationToken>())
+            .Returns(MuleActionTransitionOutcome.Applied);
+
+        var buffer = new InMemoryFastLaneBuffer();
+        var bufferedComplete = CreateAction("buffered-complete", now.AddMinutes(-1));
+        var bufferedFail = CreateAction("buffered-fail", now);
+        var bufferedDefer = CreateAction("buffered-defer", now);
+        buffer.TryAdd(bufferedComplete);
+        buffer.TryAdd(bufferedFail);
+        buffer.TryAdd(bufferedDefer);
+        bufferedComplete = buffer.Lock(bufferedComplete.Id, TimeSpan.FromMinutes(1), now);
+        bufferedFail = buffer.Lock(bufferedFail.Id, TimeSpan.FromMinutes(1), now);
+        bufferedDefer = buffer.Lock(bufferedDefer.Id, TimeSpan.FromMinutes(1), now);
+        var storage = new FastLaneInMemoryStorage(durable, buffer);
+
+        Assert.Contains(await storage.ReadPendingCandidatesAsync("Lane-A", 0, 10, TimeSpan.FromMinutes(1), now),
+            x => x.Id == durableAction.Id);
+        Assert.Equal(bufferedComplete.Id, (await storage.FindActionAsync(bufferedComplete.Id)).Id);
+        Assert.Equal(durableAction.Id, (await storage.FindActionAsync(durableAction.Id)).Id);
+        Assert.Equal(MuleActionTransitionOutcome.Applied,
+            await storage.CompleteClaimAsync(bufferedComplete.Id, bufferedComplete.ConcurrencyToken, now));
+        Assert.Equal(MuleActionTransitionOutcome.Applied,
+            await storage.FailClaimAsync(bufferedFail.Id, bufferedFail.ConcurrencyToken, "failed", now, null));
+        Assert.Equal(MuleActionTransitionOutcome.Applied,
+            await storage.DeferClaimAsync(bufferedDefer.Id, bufferedDefer.ConcurrencyToken, now, now.AddMinutes(1), DeferralReason.From("busy")));
+        Assert.Equal(MuleActionTransitionOutcome.Applied,
+            await storage.CompleteClaimAsync(Ulid.NewUlid(), Ulid.NewUlid(), now));
+        Assert.Equal(MuleActionTransitionOutcome.Applied,
+            await storage.FailClaimAsync(Ulid.NewUlid(), Ulid.NewUlid(), "durable", now, null));
+        Assert.Equal(MuleActionTransitionOutcome.Applied,
+            await storage.DeferClaimAsync(Ulid.NewUlid(), Ulid.NewUlid(), now, now, DeferralReason.From("durable")));
+
+        var unsupported = new FastLaneInMemoryStorage(
+            Substitute.For<IMuleDurableStorage>(),
+            new InMemoryFastLaneBuffer());
+        await Assert.ThrowsAsync<NotSupportedException>(() =>
+            unsupported.ReadPendingCandidatesAsync("Lane-A", 0, 1, TimeSpan.FromMinutes(1), now));
     }
 
     [Fact]
@@ -273,31 +396,29 @@ public sealed class FastLaneInMemoryCoverageTests
     }
 
     [Fact]
-    public async Task FlushService_Should_Reject_Unsupported_Or_Rejected_Cancellation()
+    public async Task FlushService_Should_Reject_Unsupported_Or_Conflicting_Projection()
     {
         var now = DateTimeOffset.UtcNow;
         var unsupported = Substitute.For<IMuleDurableStorage>();
         var unsupportedBuffer = new InMemoryFastLaneBuffer();
-        var unsupportedAction = CreateAction("unsupported-cancel", now);
+        var unsupportedAction = CreateAction("unsupported-projection", now);
         unsupportedBuffer.TryAdd(unsupportedAction);
         var unsupportedService = CreateService(unsupportedBuffer, unsupported);
-        await InvokeFlushOnceAsync(unsupportedService);
-        unsupportedBuffer.TryCancel(unsupportedAction.Id, now, out _);
+        await Assert.ThrowsAsync<NotSupportedException>(() => InvokeFlushOnceAsync(unsupportedService));
 
-        await Assert.ThrowsAsync<InvalidOperationException>(() => InvokeFlushOnceAsync(unsupportedService));
-
-        var rejecting = Substitute.For<IMuleDurableStorage, IMuleTerminalCancellationStorage>();
-        ((IMuleTerminalCancellationStorage)rejecting)
-            .MarkCancelledAsync(Arg.Any<Ulid>(), Arg.Any<DateTimeOffset>(), Arg.Any<CancellationToken>())
-            .Returns(false);
+        var rejecting = Substitute.For<IMuleDurableStorage, IMuleStateProjectionStorage>();
+        ((IMuleStateProjectionStorage)rejecting)
+            .ProjectStateRangeAsync(
+                Arg.Any<IReadOnlyCollection<MuleActionStateProjection>>(),
+                Arg.Any<CancellationToken>())
+            .Returns(call => Task.FromResult<IReadOnlyCollection<MuleActionStateProjectionResult>>(
+                call.Arg<IReadOnlyCollection<MuleActionStateProjection>>()
+                    .Select(x => new MuleActionStateProjectionResult(x.Action.Id, MuleActionTransitionOutcome.LeaseLost))
+                    .ToArray()));
         var rejectingBuffer = new InMemoryFastLaneBuffer();
-        var rejectingAction = CreateAction("rejected-cancel", now);
+        var rejectingAction = CreateAction("rejected-projection", now);
         rejectingBuffer.TryAdd(rejectingAction);
         var rejectingService = CreateService(rejectingBuffer, rejecting);
-        await InvokeFlushOnceAsync(rejectingService);
-        rejectingBuffer.TryCancel(rejectingAction.Id, now, out _);
-        GetBufferedAction(rejectingBuffer, rejectingAction.Id).CancelledOnUtc = null;
-
         await Assert.ThrowsAsync<InvalidOperationException>(() => InvokeFlushOnceAsync(rejectingService));
     }
 
@@ -344,13 +465,12 @@ public sealed class FastLaneInMemoryCoverageTests
         var terminalMatrix = new InMemoryFastLaneBuffer();
         var matrixAction = CreateAction("matrix", now);
         terminalMatrix.TryAdd(matrixAction);
-        Assert.Empty(terminalMatrix.TakeTerminalFlushBatch(1));
-        terminalMatrix.CompleteIntentFlush([matrixAction.Id]);
-        Assert.Empty(terminalMatrix.TakeTerminalFlushBatch(1));
+        terminalMatrix.CompleteIntentFlush(terminalMatrix.TakeIntentFlushBatch(1));
         terminalMatrix.MarkCompleted(matrixAction.Id, now);
         GetBufferedAction(terminalMatrix, matrixAction.Id).TerminalOnUtc = null;
-        Assert.Single(terminalMatrix.TakeTerminalFlushBatch(1));
-        Assert.Empty(terminalMatrix.TakeTerminalFlushBatch(1));
+        var terminalProjection = Assert.Single(terminalMatrix.TakeIntentFlushBatch(1));
+        terminalMatrix.CompleteIntentFlush([terminalProjection]);
+        Assert.False(terminalMatrix.Contains(matrixAction.Id));
     }
 
     private static bool InvokeCanLock(DurableAction action, DateTimeOffset now)
@@ -421,7 +541,7 @@ public sealed class FastLaneInMemoryCoverageTests
             LastError = status == DurableActionStatus.Failed ? "failed" : null
         };
 
-    private sealed class RecordingDurableStorage : IMuleDurableStorage
+    private sealed class RecordingDurableStorage : IMuleDurableStorage, IMuleStateProjectionStorage
     {
         public List<DurableAction> Added { get; } = new();
         public List<DurableAction> Pending { get; } = new();
@@ -447,7 +567,6 @@ public sealed class FastLaneInMemoryCoverageTests
 
             if (ThrowOnAdd)
                 throw new InvalidOperationException("add failed");
-
             Added.AddRange(actions);
         }
 
@@ -488,6 +607,29 @@ public sealed class FastLaneInMemoryCoverageTests
         {
             Saved = true;
             return Task.CompletedTask;
+        }
+
+        public async Task<IReadOnlyCollection<MuleActionStateProjectionResult>> ProjectStateRangeAsync(
+            IReadOnlyCollection<MuleActionStateProjection> projections,
+            CancellationToken cancellationToken = default)
+        {
+            if (BlockOnAdd)
+                await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+            if (ThrowOnAdd)
+                throw new InvalidOperationException("add failed");
+            if (ThrowOnMarkFailed && projections.Any(x => x.Action.Status == DurableActionStatus.Failed))
+                throw new InvalidOperationException("mark failed");
+
+            foreach (var projection in projections)
+            {
+                Added.Add(projection.Action);
+                MarkCompletedCalled |= projection.Action.Status == DurableActionStatus.Completed;
+                MarkFailedCalled |= projection.Action.Status == DurableActionStatus.Failed;
+            }
+
+            return projections
+                .Select(x => new MuleActionStateProjectionResult(x.Action.Id, MuleActionTransitionOutcome.Applied))
+                .ToArray();
         }
     }
 }

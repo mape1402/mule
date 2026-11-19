@@ -52,6 +52,8 @@ internal sealed class InMemoryFastLaneBuffer
             buffered.Action.Status = DurableActionStatus.Locked;
             buffered.Action.LockedOnUtc = now;
             buffered.Action.StartedOnUtc ??= now;
+            buffered.Action.PendingReason = DurableActionPendingReason.None;
+            buffered.Action.DeferralReasonCode = null;
             buffered.Action.ConcurrencyToken = Ulid.NewUlid();
             buffered.IntentDirty = true;
             return CloneForExecution(buffered.Action);
@@ -79,6 +81,8 @@ internal sealed class InMemoryFastLaneBuffer
                 buffered.Action.Status = DurableActionStatus.Locked;
                 buffered.Action.LockedOnUtc = now;
                 buffered.Action.StartedOnUtc ??= now;
+                buffered.Action.PendingReason = DurableActionPendingReason.None;
+                buffered.Action.DeferralReasonCode = null;
                 buffered.Action.ConcurrencyToken = Ulid.NewUlid();
                 buffered.IntentDirty = true;
             }
@@ -114,8 +118,11 @@ internal sealed class InMemoryFastLaneBuffer
             buffered.Action.TerminalOnUtc = completedOnUtc;
             buffered.Action.LockedOnUtc = null;
             buffered.Action.NextAttemptOnUtc = null;
+            buffered.Action.PendingReason = DurableActionPendingReason.None;
+            buffered.Action.DeferralReasonCode = null;
             buffered.Action.LastError = null;
             buffered.Action.ConcurrencyToken = Ulid.NewUlid();
+            buffered.IntentDirty = true;
             buffered.TerminalDirty = true;
             return true;
         }
@@ -133,11 +140,107 @@ internal sealed class InMemoryFastLaneBuffer
             buffered.Action.LastError = error;
             buffered.Action.LockedOnUtc = null;
             buffered.Action.NextAttemptOnUtc = nextAttemptOnUtc;
+            buffered.Action.PendingReason = nextAttemptOnUtc == null
+                ? DurableActionPendingReason.None
+                : DurableActionPendingReason.Retry;
+            buffered.Action.DeferralReasonCode = null;
             buffered.Action.TerminalOnUtc = nextAttemptOnUtc == null ? now : null;
             buffered.Action.ConcurrencyToken = Ulid.NewUlid();
-            buffered.IntentDirty = nextAttemptOnUtc != null;
+            buffered.IntentDirty = true;
             buffered.TerminalDirty = nextAttemptOnUtc == null;
             return true;
+        }
+    }
+
+    public IReadOnlyCollection<DurableAction> ReadPendingCandidates(
+        string lane,
+        int offset,
+        int batchSize,
+        TimeSpan lockTimeout,
+        DateTimeOffset now)
+    {
+        lane = NormalizeLane(lane);
+        lock (_gate)
+        {
+            return _actions.Values
+                .Where(x => x.Action.Lane == lane && CanLock(x.Action, lockTimeout, now))
+                .OrderBy(x => x.Action.NextAttemptOnUtc ?? x.Action.CreatedOnUtc)
+                .ThenBy(x => x.Action.CreatedOnUtc)
+                .ThenBy(x => x.Action.Id)
+                .Skip(Math.Max(0, offset))
+                .Take(Math.Max(1, batchSize))
+                .Select(x => CloneForExecution(x.Action))
+                .ToArray();
+        }
+    }
+
+    public DurableAction FindAction(Ulid id)
+    {
+        lock (_gate)
+            return _actions.TryGetValue(id, out var buffered)
+                ? CloneForExecution(buffered.Action)
+                : null;
+    }
+
+    public MuleActionTransitionOutcome CompleteClaim(Ulid id, Ulid expectedToken, DateTimeOffset completedOnUtc)
+    {
+        lock (_gate)
+        {
+            if (!_actions.TryGetValue(id, out var buffered))
+                return MuleActionTransitionOutcome.NotFound;
+            if (buffered.Action.Status != DurableActionStatus.Locked
+                || buffered.Action.ConcurrencyToken != expectedToken)
+                return MuleActionTransitionOutcome.LeaseLost;
+
+            MarkCompletedCore(buffered, completedOnUtc);
+            return MuleActionTransitionOutcome.Applied;
+        }
+    }
+
+    public MuleActionTransitionOutcome FailClaim(
+        Ulid id,
+        Ulid expectedToken,
+        string error,
+        DateTimeOffset now,
+        DateTimeOffset? nextAttemptOnUtc)
+    {
+        lock (_gate)
+        {
+            if (!_actions.TryGetValue(id, out var buffered))
+                return MuleActionTransitionOutcome.NotFound;
+            if (buffered.Action.Status != DurableActionStatus.Locked
+                || buffered.Action.ConcurrencyToken != expectedToken)
+                return MuleActionTransitionOutcome.LeaseLost;
+
+            MarkFailedCore(buffered, error, now, nextAttemptOnUtc);
+            return MuleActionTransitionOutcome.Applied;
+        }
+    }
+
+    public MuleActionTransitionOutcome DeferClaim(
+        Ulid id,
+        Ulid expectedToken,
+        DateTimeOffset notBeforeUtc,
+        DeferralReason reason)
+    {
+        lock (_gate)
+        {
+            if (!_actions.TryGetValue(id, out var buffered))
+                return MuleActionTransitionOutcome.NotFound;
+            if (buffered.Action.Status != DurableActionStatus.Locked
+                || buffered.Action.ConcurrencyToken != expectedToken)
+                return MuleActionTransitionOutcome.LeaseLost;
+
+            buffered.Action.Status = DurableActionStatus.Pending;
+            buffered.Action.LockedOnUtc = null;
+            buffered.Action.NextAttemptOnUtc = notBeforeUtc;
+            buffered.Action.PendingReason = DurableActionPendingReason.Deferred;
+            buffered.Action.DeferralReasonCode = reason.Value;
+            buffered.Action.TerminalOnUtc = null;
+            buffered.Action.ConcurrencyToken = Ulid.NewUlid();
+            buffered.IntentDirty = true;
+            buffered.TerminalDirty = false;
+            return MuleActionTransitionOutcome.Applied;
         }
     }
 
@@ -172,6 +275,7 @@ internal sealed class InMemoryFastLaneBuffer
             buffered.Action.LockedOnUtc = null;
             buffered.Action.NextAttemptOnUtc = null;
             buffered.Action.ConcurrencyToken = Ulid.NewUlid();
+            buffered.IntentDirty = true;
             buffered.TerminalDirty = true;
             buffered.TerminalFlushed = false;
             result = new MuleCancellationResult(id, MuleCancellationOutcome.Cancelled, cancelledOnUtc);
@@ -179,7 +283,7 @@ internal sealed class InMemoryFastLaneBuffer
         }
     }
 
-    public IReadOnlyCollection<DurableAction> TakeIntentFlushBatch(int batchSize)
+    public IReadOnlyCollection<MuleActionStateProjection> TakeIntentFlushBatch(int batchSize)
     {
         lock (_gate)
         {
@@ -190,83 +294,57 @@ internal sealed class InMemoryFastLaneBuffer
                 .Select(x =>
                 {
                     x.IntentFlushing = true;
-                    return CloneForDurableIntent(x.Action);
+                    x.IntentFlushToken = Ulid.NewUlid();
+                    return new MuleActionStateProjection(
+                        CloneForExecution(x.Action),
+                        x.PersistedConcurrencyToken,
+                        x.IntentFlushToken);
                 })
                 .ToArray();
         }
     }
 
-    public void CompleteIntentFlush(IReadOnlyCollection<Ulid> ids)
+    public void CompleteIntentFlush(IReadOnlyCollection<MuleActionStateProjection> projections)
     {
         lock (_gate)
         {
-            foreach (var id in ids)
+            foreach (var projection in projections)
             {
-                if (!_actions.TryGetValue(id, out var buffered))
+                if (!_actions.TryGetValue(projection.Action.Id, out var buffered))
+                    continue;
+                if (buffered.IntentFlushToken != projection.ProjectionToken)
+                    continue;
+                if (buffered.PersistedConcurrencyToken != projection.ExpectedConcurrencyToken)
                     continue;
 
                 buffered.IntentPersisted = true;
-                buffered.IntentDirty = false;
+                buffered.PersistedConcurrencyToken = projection.Action.ConcurrencyToken;
+                buffered.IntentDirty = buffered.Action.ConcurrencyToken != projection.Action.ConcurrencyToken;
                 buffered.IntentFlushing = false;
-                TryRemove(buffered);
-            }
-        }
-    }
-
-    public void CancelIntentFlush(IReadOnlyCollection<Ulid> ids)
-    {
-        lock (_gate)
-        {
-            foreach (var id in ids)
-            {
-                if (_actions.TryGetValue(id, out var buffered))
-                    buffered.IntentFlushing = false;
-            }
-        }
-    }
-
-    public IReadOnlyCollection<DurableAction> TakeTerminalFlushBatch(int batchSize)
-    {
-        lock (_gate)
-        {
-            return _actions.Values
-                .Where(x => x.IntentPersisted && x.TerminalDirty && !x.TerminalFlushing)
-                .OrderBy(x => x.Action.TerminalOnUtc ?? x.Action.CompletedOnUtc ?? x.Action.CreatedOnUtc)
-                .Take(batchSize)
-                .Select(x =>
+                buffered.IntentFlushToken = Ulid.Empty;
+                if (!buffered.IntentDirty && buffered.Action.Status is
+                    DurableActionStatus.Completed or DurableActionStatus.Failed or DurableActionStatus.Cancelled)
                 {
-                    x.TerminalFlushing = true;
-                    return CloneForExecution(x.Action);
-                })
-                .ToArray();
-        }
-    }
-
-    public void CompleteTerminalFlush(IReadOnlyCollection<Ulid> ids)
-    {
-        lock (_gate)
-        {
-            foreach (var id in ids)
-            {
-                if (!_actions.TryGetValue(id, out var buffered))
-                    continue;
-
-                buffered.TerminalDirty = false;
-                buffered.TerminalFlushed = true;
-                buffered.TerminalFlushing = false;
+                    buffered.TerminalDirty = false;
+                    buffered.TerminalFlushed = true;
+                }
                 TryRemove(buffered);
             }
         }
     }
 
-    public void CancelTerminalFlush(IReadOnlyCollection<Ulid> ids)
+    public void CancelIntentFlush(IReadOnlyCollection<MuleActionStateProjection> projections)
     {
         lock (_gate)
         {
-            foreach (var id in ids)
+            foreach (var projection in projections)
             {
-                if (_actions.TryGetValue(id, out var buffered))
-                    buffered.TerminalFlushing = false;
+                if (_actions.TryGetValue(projection.Action.Id, out var buffered) &&
+                    buffered.IntentFlushToken == projection.ProjectionToken)
+                {
+                    buffered.IntentFlushing = false;
+                    buffered.IntentFlushToken = Ulid.Empty;
+                }
             }
         }
     }
@@ -309,23 +387,6 @@ internal sealed class InMemoryFastLaneBuffer
     private static DurableAction CloneForExecution(DurableAction action)
         => Clone(action);
 
-    private static DurableAction CloneForDurableIntent(DurableAction action)
-    {
-        var clone = Clone(action);
-        if (clone.Status is DurableActionStatus.Pending or DurableActionStatus.Completed or DurableActionStatus.Failed)
-        {
-            clone.Status = DurableActionStatus.Locked;
-            clone.LockedOnUtc ??= DateTimeOffset.UtcNow;
-            if (action.Status == DurableActionStatus.Failed)
-                clone.Attempts = Math.Max(0, action.Attempts - 1);
-            clone.CompletedOnUtc = null;
-            clone.TerminalOnUtc = null;
-            clone.LastError = null;
-        }
-
-        return clone;
-    }
-
     private static DurableAction Clone(DurableAction action)
         => new()
         {
@@ -345,6 +406,8 @@ internal sealed class InMemoryFastLaneBuffer
             LockedOnUtc = action.LockedOnUtc,
             StartedOnUtc = action.StartedOnUtc,
             NextAttemptOnUtc = action.NextAttemptOnUtc,
+            PendingReason = action.PendingReason,
+            DeferralReasonCode = action.DeferralReasonCode,
             CompletedOnUtc = action.CompletedOnUtc,
             CancelledOnUtc = action.CancelledOnUtc,
             TerminalOnUtc = action.TerminalOnUtc
@@ -352,6 +415,42 @@ internal sealed class InMemoryFastLaneBuffer
 
     private static string NormalizeLane(string lane)
         => string.IsNullOrWhiteSpace(lane) ? MuleSettings.DefaultLane : lane;
+
+    private static void MarkCompletedCore(BufferedAction buffered, DateTimeOffset completedOnUtc)
+    {
+        buffered.Action.Status = DurableActionStatus.Completed;
+        buffered.Action.CompletedOnUtc = completedOnUtc;
+        buffered.Action.TerminalOnUtc = completedOnUtc;
+        buffered.Action.LockedOnUtc = null;
+        buffered.Action.NextAttemptOnUtc = null;
+        buffered.Action.PendingReason = DurableActionPendingReason.None;
+        buffered.Action.DeferralReasonCode = null;
+        buffered.Action.LastError = null;
+        buffered.Action.ConcurrencyToken = Ulid.NewUlid();
+        buffered.IntentDirty = true;
+        buffered.TerminalDirty = true;
+    }
+
+    private static void MarkFailedCore(
+        BufferedAction buffered,
+        string error,
+        DateTimeOffset now,
+        DateTimeOffset? nextAttemptOnUtc)
+    {
+        buffered.Action.Attempts++;
+        buffered.Action.Status = nextAttemptOnUtc == null ? DurableActionStatus.Failed : DurableActionStatus.Pending;
+        buffered.Action.LastError = error;
+        buffered.Action.LockedOnUtc = null;
+        buffered.Action.NextAttemptOnUtc = nextAttemptOnUtc;
+        buffered.Action.PendingReason = nextAttemptOnUtc == null
+            ? DurableActionPendingReason.None
+            : DurableActionPendingReason.Retry;
+        buffered.Action.DeferralReasonCode = null;
+        buffered.Action.TerminalOnUtc = nextAttemptOnUtc == null ? now : null;
+        buffered.Action.ConcurrencyToken = Ulid.NewUlid();
+        buffered.IntentDirty = true;
+        buffered.TerminalDirty = nextAttemptOnUtc == null;
+    }
 
     private sealed class BufferedAction
     {
@@ -364,14 +463,17 @@ internal sealed class InMemoryFastLaneBuffer
 
         public bool IntentPersisted { get; set; }
 
+        public Ulid? PersistedConcurrencyToken { get; set; }
+
         public bool IntentDirty { get; set; } = true;
 
         public bool IntentFlushing { get; set; }
+
+        public Ulid IntentFlushToken { get; set; }
 
         public bool TerminalDirty { get; set; }
 
         public bool TerminalFlushed { get; set; }
 
-        public bool TerminalFlushing { get; set; }
     }
 }

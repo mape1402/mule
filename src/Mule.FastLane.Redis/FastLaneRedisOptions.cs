@@ -22,6 +22,8 @@ public sealed class FastLaneRedisOptions
 
     public TimeSpan FlushInterval { get; set; } = TimeSpan.FromMilliseconds(50);
 
+    public TimeSpan FlushClaimTimeout { get; set; } = TimeSpan.FromMinutes(1);
+
     public TimeSpan LeaseDuration { get; set; } = TimeSpan.FromMinutes(2);
 
     public TimeSpan DeduplicationRetention { get; set; } = TimeSpan.FromDays(7);
