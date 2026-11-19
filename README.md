@@ -351,6 +351,8 @@ await db.Database.EnsureCreatedAsync();
 
 Mule's default EF model is intentionally portable. It configures `DurableAction.Id` and `DurableAction.ConcurrencyToken` as `Ulid` values stored as 26-character strings, marks the concurrency token for optimistic concurrency, and applies conservative lengths to common string fields.
 
+Existing EF hosts upgrading to keyed scheduling and cooperative deferral must add a migration for `DurableAction.PendingReason` (required integer, default `0`) and `DurableAction.DeferralReasonCode` (nullable string, maximum 128 characters). The model also adds an index over `Status`, `PendingReason`, and `NextAttemptOnUtc`; let the configured EF provider generate its native migration instead of writing provider-specific SQL in Mule.
+
 Customize the Mule entity from the Mule registration chain when your provider or host needs different storage details:
 
 ```csharp
@@ -476,13 +478,12 @@ services.AddMule(mule => mule
     .UseFastLaneInMemory(options =>
     {
         options.IntentFlushSize = 500;
-        options.CompletionFlushSize = 1_000;
         options.FlushInterval = TimeSpan.FromMilliseconds(50);
     })
     .AddActionsFromAssemblyContaining<SendReceiptAction>());
 ```
 
-With FastLane InMemory, `EnqueueAsync` and `EnqueueManyAsync` acknowledge after the intent is accepted by the in-process buffer. Mule can execute that buffered work immediately, while a background flusher persists intents to the durable provider in batches. Terminal states are also buffered and flushed after their intents have been persisted, so durable storage observes the intent before `Completed`, `Failed`, or `Cancelled`.
+With FastLane InMemory, `EnqueueAsync` and `EnqueueManyAsync` acknowledge after the intent is accepted by the in-process buffer. Mule can execute that buffered work immediately, while a background flusher projects the latest versioned action state to durable storage in batches. A completion, failure, cancellation, retry, or deferral cannot overtake the original insert: the projection carries the durable concurrency token and either inserts the action or advances exactly the expected version.
 
 This mode is faster than direct EF Core writes, but it is intentionally less durable. If the process exits before a flush, buffered intents or terminal updates that have not reached the durable provider can be lost. Use it when the producer can tolerate that window.
 
@@ -498,15 +499,15 @@ services.AddMule(mule => mule
         options.ConnectionString = redisConnectionString;
         options.KeyPrefix = "checkout";
         options.IntentFlushSize = 1_000;
-        options.CompletionFlushSize = 2_000;
         options.FlushInterval = TimeSpan.FromMilliseconds(25);
         options.LeaseDuration = TimeSpan.FromMinutes(2);
+        options.FlushClaimTimeout = TimeSpan.FromMinutes(1);
         options.DeduplicationRetention = TimeSpan.FromDays(7);
     })
     .AddActionsFromAssemblyContaining<SendReceiptAction>());
 ```
 
-With FastLane Redis, foreground enqueue writes to Redis first and returns without waiting for an EF Core insert. Mule workers can claim buffered work from Redis immediately, using per-action Redis leases so multiple replicas do not execute the same buffered intent at the same time. A background flusher persists intents to the durable provider in batches, then flushes terminal states only after the intent exists in durable storage.
+With FastLane Redis, foreground enqueue writes to Redis first and returns without waiting for an EF Core insert. Mule workers can claim buffered work from Redis immediately, using per-action Redis leases so multiple replicas do not execute the same buffered intent at the same time. A background flusher projects the complete versioned state to durable storage, so execution is allowed to finish before the first SQL batch without creating an insert-versus-completion race.
 
 Redis connection setup is intentionally flexible. For simple deployments, keep using `ConnectionString`. For advanced deployments, provide `ConfigurationOptions` or a factory that returns an `IConnectionMultiplexer` created by the application:
 
@@ -548,11 +549,13 @@ services.AddMule(mule => mule
 
 When multiple connection options are provided, Mule resolves Redis in this order: `ConnectionFactory`, `ConfigurationOptions`, then `ConnectionString`. Mule disposes internally-created connections by default. When using a shared connection from DI, set `DisposeConnection = false` so the application keeps ownership.
 
-Intent and terminal flush batches are claimed in Redis before durable storage is touched. This prevents multiple replicas from flushing the same buffered item concurrently, and prevents a terminal state such as `Completed` or `Cancelled` from being flushed before the original durable intent exists in the durable provider. If durable persistence fails, Mule releases the flush claim so another flush cycle can retry.
+Flush batches are claimed in Redis before durable storage is touched. Every claim has a unique ownership token and an expiration controlled by `FlushClaimTimeout`. Only that owner can acknowledge or release the claim; an expired replica cannot clear a newer replica's reservation. Durable projection is idempotent, so a crash after the database commit but before the Redis acknowledgement is recovered safely.
+
+FastLane requires a durable provider that implements Mule's versioned state projection contract. The built-in EF Core and InMemory providers support it. A custom durable provider must implement `IMuleStateProjectionStorage` before it can be placed behind either FastLane package.
 
 FastLane Redis does not replace its configured durable provider. Treat it as a fast shared front buffer in front of EF Core or another authoritative provider. If Redis is configured with volatile persistence or data is evicted before Mule flushes it, unflushed intents can be lost. Use Redis persistence and memory policies that match the durability window your workload can tolerate. To use Redis itself as the authoritative provider, install `Mule.DurableActions.Redis` and register `UseRedis(...)` instead.
 
-For high-throughput workloads, tune `IntentFlushSize` and `CompletionFlushSize` together with `DispatchBatchSize`, `ExecutionQueueCapacity`, and lane `MaxDegreeOfParallelism`. Larger flush batches reduce durable storage round trips; larger dispatch batches reduce Redis claim overhead. Keep `LeaseDuration` comfortably above the normal execution time for an action so another replica does not reclaim work that is still running.
+For high-throughput workloads, tune `IntentFlushSize` together with `DispatchBatchSize`, `ExecutionQueueCapacity`, and lane `MaxDegreeOfParallelism`. Larger projection batches reduce durable storage round trips; larger dispatch batches reduce Redis claim overhead. Keep `LeaseDuration` comfortably above the normal execution time for an action so another replica does not reclaim work that is still running.
 
 ### Local Stress Results
 
@@ -746,6 +749,9 @@ services.AddMule(mule => mule
         settings.RecoveryMode = MuleRecoveryMode.Scheduled;
         settings.DispatchInterval = TimeSpan.FromSeconds(5);
         settings.DispatchBatchSize = 50;
+        settings.ExecutionKeyCandidateBatchSize = 256;
+        settings.ExecutionKeyContentionDelay = TimeSpan.FromMilliseconds(25);
+        settings.MinimumDeferralDelay = TimeSpan.FromMilliseconds(25);
         settings.MaxDrainBatchesPerCycle = 4;
         settings.MaxDrainActionsPerCycle = 1_000;
         settings.DrainUntilEmpty = false;
@@ -840,6 +846,58 @@ The older `MaxAttempts` and `RetryDelay` settings remain supported. Mule uses th
 
 `Priority` and `Weight` guide lane scheduling. Higher-priority lanes get more opportunities, but Mule uses weighted fair scheduling so lower-priority lanes still receive turns while high-priority lanes have constant backlog.
 
+### Keyed Scheduling
+
+Use `ExecutionKeySelector` when actions that belong to the same logical instance must not execute concurrently. The selector runs before an action consumes an executor slot:
+
+```csharp
+services.AddMule(mule => mule
+    .UseEntityFrameworkCore<AppDbContext>()
+    .Configure(settings =>
+    {
+        settings.ExecutionKeySelector = action =>
+            string.IsNullOrWhiteSpace(action.CorrelationId)
+                ? null
+                : ExecutionKey.From($"order:{action.CorrelationId}");
+        settings.ExecutionKeyCandidateBatchSize = 256;
+        settings.ExecutionKeyContentionDelay = TimeSpan.FromMilliseconds(25);
+    })
+    .AddActionsFromAssemblyContaining<SendReceiptAction>());
+```
+
+Returning `null` leaves an action unconstrained. Returning an `ExecutionKey` serializes that key across all lanes in the current process, while unrelated keys continue in parallel. Mule scans more candidates than it can claim and rotates through contended candidates so one hot key does not starve other keys.
+
+Key coordination is intentionally process-local and is not a distributed mutex between replicas. Durable claim tokens still prevent two replicas from completing the same action, but two different actions with the same execution key can run on different replicas. Use a distributed domain lease when exclusion must span replicas; if that lease is busy, defer the action cooperatively.
+
+### Cooperative Deferral
+
+A handler can return an action to `Pending` without consuming its retry budget:
+
+```csharp
+public async ValueTask ExecuteAsync(
+    MuleActionContext<CapturePayment> context,
+    CancellationToken cancellationToken)
+{
+    var lease = await paymentLease.TryAcquireAsync(
+        context.Payload.PaymentId,
+        cancellationToken);
+
+    if (lease is null)
+    {
+        context.DeferUntil(
+            DateTimeOffset.UtcNow.AddSeconds(10),
+            DeferralReason.From("payment-lease-busy"));
+        return;
+    }
+
+    await paymentGateway.CaptureAsync(context.Payload, cancellationToken);
+}
+```
+
+Deferral preserves the action id, payload, correlation id, metadata, lane, and deduplication key. It records `PendingReason = Deferred`, the typed reason code, and `NextAttemptOnUtc`; it does not increment `Attempts`. A handler exception always follows the normal failure/retry policy, even if the handler requested deferral before throwing. `MinimumDeferralDelay` prevents immediate rescheduling loops.
+
+Completion, failure, and deferral transitions include the claim's `ConcurrencyToken`. If a lease expires and another replica reclaims the action, the stale handler can no longer overwrite the newer owner.
+
 Immediate dispatch starts workers for each configured lane using that lane's `WorkerCount`. Mule also keeps fallback workers for lanes that are used without explicit lane configuration, so simple applications can keep using the `default` lane only.
 
 `ConfigureHighThroughputRuntime()` applies productive generic defaults for durable inbox/outbox-style workloads. `ConfigureLane(...)` is a chainable helper for lane-specific tuning:
@@ -876,6 +934,8 @@ services.AddMule(mule => mule
 
 Use `Polling` when another process may insert work without notifying the current process, or when you prefer a simple heartbeat. Use `Scheduled` when Mule owns the enqueue path in the current application and you want to avoid storage polling while there is no pending or failed work.
 
+Foreground activation is nonblocking. After persistence, Mule only attempts an in-memory queue write; when that queue is full it records an omitted activation and signals durable recovery instead of delaying the request. Scheduled recovery wakes for the next due retry or deferral, and always scans once on process startup.
+
 `CleanupMode` controls completed action retention:
 
 - `Disabled`: completed actions are kept for audit/history.
@@ -902,6 +962,8 @@ var snapshot = await diagnostics.GetSnapshotAsync();
 The snapshot includes:
 
 - pending count
+- ready pending count
+- deferred pending count
 - locked count
 - completed count
 - failed count
@@ -937,6 +999,9 @@ The snapshot includes:
 - backlog by action key
 - failures by action key
 - retries by action key
+- deferrals by lane and reason
+- execution-key contention by lane
+- immediate activations omitted and recovered
 
 ## Testing
 
