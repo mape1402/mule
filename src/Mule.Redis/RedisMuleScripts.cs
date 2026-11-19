@@ -5,7 +5,7 @@ internal static class RedisMuleScripts
     public const string AddActions = """
 local prefix = ARGV[1]
 local count = tonumber(ARGV[2])
-local width = 22
+local width = 24
 local added = 0
 local duplicates = 0
 
@@ -28,12 +28,12 @@ for index = 0, count - 1 do
 
     if canAdd then
         local status = tonumber(ARGV[offset + 11])
-        local created = tonumber(ARGV[offset + 14])
-        local locked = tonumber(ARGV[offset + 15]) or created
-        local completed = tonumber(ARGV[offset + 18]) or created
-        local cancelled = tonumber(ARGV[offset + 19]) or created
-        local terminal = tonumber(ARGV[offset + 20]) or created
-        local due = tonumber(ARGV[offset + 21])
+        local created = tonumber(ARGV[offset + 16])
+        local locked = tonumber(ARGV[offset + 17]) or created
+        local completed = tonumber(ARGV[offset + 20]) or created
+        local cancelled = tonumber(ARGV[offset + 21]) or created
+        local terminal = tonumber(ARGV[offset + 22]) or created
+        local due = tonumber(ARGV[offset + 23])
         local lane = ARGV[offset + 3]
         local laneDue = ARGV[offset + 4]
         local actionType = ARGV[offset + 2]
@@ -51,15 +51,17 @@ for index = 0, count - 1 do
             'dedupe', ARGV[offset + 9],
             'dedupeField', dedupeField,
             'status', status,
-            'attempts', ARGV[offset + 12],
-            'error', ARGV[offset + 13],
-            'created', ARGV[offset + 14],
-            'locked', ARGV[offset + 15],
-            'started', ARGV[offset + 16],
-            'next', ARGV[offset + 17],
-            'completed', ARGV[offset + 18],
-            'cancelled', ARGV[offset + 19],
-            'terminal', ARGV[offset + 20])
+            'pendingReason', ARGV[offset + 12],
+            'deferralReason', ARGV[offset + 13],
+            'attempts', ARGV[offset + 14],
+            'error', ARGV[offset + 15],
+            'created', ARGV[offset + 16],
+            'locked', ARGV[offset + 17],
+            'started', ARGV[offset + 18],
+            'next', ARGV[offset + 19],
+            'completed', ARGV[offset + 20],
+            'cancelled', ARGV[offset + 21],
+            'terminal', ARGV[offset + 22])
 
         redis.call('SADD', KEYS[3], lane)
         if status == 0 or status == 1 then
@@ -110,6 +112,8 @@ for _, id in ipairs(ids) do
                 'status', 1,
                 'locked', now,
                 'started', (started and started ~= '') and started or now,
+                'pendingReason', 0,
+                'deferralReason', '',
                 'ct', token)
             if not started or started == '' then
                 redis.call('HINCRBYFLOAT', KEYS[5], 'enqueueExecutionSum', now - created)
@@ -148,6 +152,8 @@ redis.call('HSET', actionKey,
     'status', 1,
     'locked', now,
     'started', (started and started ~= '') and started or now,
+    'pendingReason', 0,
+    'deferralReason', '',
     'ct', ARGV[3])
 if not started or started == '' then
     redis.call('HINCRBYFLOAT', KEYS[6], 'enqueueExecutionSum', now - created)
@@ -178,7 +184,8 @@ for index = 0, count - 1 do
             local started = tonumber(redis.call('HGET', actionKey, 'started'))
             redis.call('HSET', actionKey,
                 'status', 2, 'completed', completed, 'terminal', completed,
-                'locked', '', 'next', '', 'error', '', 'ct', token)
+                'locked', '', 'next', '', 'pendingReason', 0, 'deferralReason', '',
+                'error', '', 'ct', token)
             redis.call('ZREM', KEYS[1], id)
             redis.call('ZREM', laneDue, id)
             redis.call('ZREM', KEYS[2], id)
@@ -219,14 +226,16 @@ redis.call('ZREM', KEYS[5], id)
 if nextAttempt then
     redis.call('HSET', actionKey,
         'status', 0, 'attempts', attempts, 'error', ARGV[2],
-        'locked', '', 'next', nextAttempt, 'terminal', '', 'ct', ARGV[4])
+        'locked', '', 'next', nextAttempt, 'pendingReason', 1,
+        'deferralReason', '', 'terminal', '', 'ct', ARGV[4])
     redis.call('ZADD', KEYS[4], created, id)
     redis.call('ZADD', KEYS[2], nextAttempt, id)
     redis.call('ZADD', laneDue, nextAttempt, id)
 else
     redis.call('HSET', actionKey,
         'status', 3, 'attempts', attempts, 'error', ARGV[2],
-        'locked', '', 'next', '', 'terminal', now, 'ct', ARGV[4])
+        'locked', '', 'next', '', 'pendingReason', 0,
+        'deferralReason', '', 'terminal', now, 'ct', ARGV[4])
     redis.call('ZREM', KEYS[2], id)
     redis.call('ZREM', laneDue, id)
     redis.call('ZADD', KEYS[6], created, id)
@@ -236,6 +245,102 @@ else
     redis.call('HINCRBYFLOAT', KEYS[10], 'terminalSum', now - created)
     redis.call('HINCRBY', KEYS[10], 'terminalCount', 1)
 end
+return 1
+""";
+
+    public const string CompleteClaim = """
+local actionKey = KEYS[1]
+if redis.call('EXISTS', actionKey) == 0 then return 0 end
+if tonumber(redis.call('HGET', actionKey, 'status')) ~= 1 then return -1 end
+if redis.call('HGET', actionKey, 'ct') ~= ARGV[1] then return -1 end
+
+local id = redis.call('HGET', actionKey, 'id')
+local lane = redis.call('HGET', actionKey, 'lane')
+local laneDue = redis.call('HGET', actionKey, 'laneDue')
+local actionType = redis.call('HGET', actionKey, 'key')
+local created = tonumber(redis.call('HGET', actionKey, 'created'))
+local started = tonumber(redis.call('HGET', actionKey, 'started'))
+local completed = tonumber(ARGV[2])
+redis.call('HSET', actionKey,
+    'status', 2, 'completed', completed, 'terminal', completed,
+    'locked', '', 'next', '', 'pendingReason', 0, 'deferralReason', '',
+    'error', '', 'ct', ARGV[3])
+redis.call('ZREM', KEYS[2], id)
+redis.call('ZREM', laneDue, id)
+redis.call('ZREM', KEYS[3], id)
+redis.call('ZREM', KEYS[4], id)
+redis.call('ZADD', KEYS[5], completed, id)
+redis.call('HINCRBY', KEYS[6], lane, -1)
+redis.call('HINCRBY', KEYS[7], actionType, -1)
+if started then
+    redis.call('HINCRBYFLOAT', KEYS[8], 'executionSum', completed - started)
+    redis.call('HINCRBY', KEYS[8], 'executionCount', 1)
+end
+redis.call('HINCRBYFLOAT', KEYS[8], 'terminalSum', completed - created)
+redis.call('HINCRBY', KEYS[8], 'terminalCount', 1)
+return 1
+""";
+
+    public const string FailClaim = """
+local actionKey = KEYS[1]
+if redis.call('EXISTS', actionKey) == 0 then return 0 end
+if tonumber(redis.call('HGET', actionKey, 'status')) ~= 1 then return -1 end
+if redis.call('HGET', actionKey, 'ct') ~= ARGV[1] then return -1 end
+
+local id = redis.call('HGET', actionKey, 'id')
+local lane = redis.call('HGET', actionKey, 'lane')
+local laneDue = redis.call('HGET', actionKey, 'laneDue')
+local actionType = redis.call('HGET', actionKey, 'key')
+local created = tonumber(redis.call('HGET', actionKey, 'created'))
+local attempts = tonumber(redis.call('HGET', actionKey, 'attempts') or '0') + 1
+local now = tonumber(ARGV[2])
+local nextAttempt = tonumber(ARGV[4])
+redis.call('HINCRBY', KEYS[8], actionType, 1)
+redis.call('ZREM', KEYS[3], id)
+redis.call('ZREM', KEYS[4], id)
+if nextAttempt then
+    redis.call('HSET', actionKey,
+        'status', 0, 'attempts', attempts, 'error', ARGV[3],
+        'locked', '', 'next', nextAttempt, 'pendingReason', 1,
+        'deferralReason', '', 'terminal', '', 'ct', ARGV[5])
+    redis.call('ZADD', KEYS[3], created, id)
+    redis.call('ZADD', KEYS[2], nextAttempt, id)
+    redis.call('ZADD', laneDue, nextAttempt, id)
+else
+    redis.call('HSET', actionKey,
+        'status', 3, 'attempts', attempts, 'error', ARGV[3],
+        'locked', '', 'next', '', 'pendingReason', 0,
+        'deferralReason', '', 'terminal', now, 'ct', ARGV[5])
+    redis.call('ZREM', KEYS[2], id)
+    redis.call('ZREM', laneDue, id)
+    redis.call('ZADD', KEYS[5], created, id)
+    redis.call('HINCRBY', KEYS[6], lane, -1)
+    redis.call('HINCRBY', KEYS[7], actionType, -1)
+    redis.call('HINCRBY', KEYS[9], actionType, 1)
+    redis.call('HINCRBYFLOAT', KEYS[10], 'terminalSum', now - created)
+    redis.call('HINCRBY', KEYS[10], 'terminalCount', 1)
+end
+return 1
+""";
+
+    public const string DeferClaim = """
+local actionKey = KEYS[1]
+if redis.call('EXISTS', actionKey) == 0 then return 0 end
+if tonumber(redis.call('HGET', actionKey, 'status')) ~= 1 then return -1 end
+if redis.call('HGET', actionKey, 'ct') ~= ARGV[1] then return -1 end
+
+local id = redis.call('HGET', actionKey, 'id')
+local laneDue = redis.call('HGET', actionKey, 'laneDue')
+local created = tonumber(redis.call('HGET', actionKey, 'created'))
+local notBefore = tonumber(ARGV[2])
+redis.call('HSET', actionKey,
+    'status', 0, 'locked', '', 'next', notBefore,
+    'pendingReason', 2, 'deferralReason', ARGV[3],
+    'terminal', '', 'ct', ARGV[4])
+redis.call('ZREM', KEYS[4], id)
+redis.call('ZADD', KEYS[3], created, id)
+redis.call('ZADD', KEYS[2], notBefore, id)
+redis.call('ZADD', laneDue, notBefore, id)
 return 1
 """;
 
@@ -255,7 +360,7 @@ local created = tonumber(redis.call('HGET', actionKey, 'created'))
 local now = tonumber(ARGV[1])
 redis.call('HSET', actionKey,
     'status', 4, 'cancelled', now, 'terminal', now,
-    'locked', '', 'next', '', 'ct', ARGV[3])
+    'locked', '', 'next', '', 'pendingReason', 0, 'deferralReason', '', 'ct', ARGV[3])
 redis.call('ZREM', KEYS[2], id)
 redis.call('ZREM', laneDue, id)
 redis.call('ZREM', KEYS[3], id)

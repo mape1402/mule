@@ -5,6 +5,8 @@ using Mule.Diagnostics;
 
 internal sealed class InMemoryMuleStorage :
     IMuleDurableStorage,
+    IMuleExecutionStorage,
+    IMuleStateProjectionStorage,
     IMuleReplayStorage,
     IMuleCancellationStorage,
     IMuleTerminalCancellationStorage
@@ -66,6 +68,51 @@ internal sealed class InMemoryMuleStorage :
 
     public Task<DurableAction> LockAsync(Ulid id, TimeSpan lockTimeout, DateTimeOffset now, CancellationToken cancellationToken = default)
         => Task.FromResult(_store.Lock(id, lockTimeout, now));
+
+    public Task<IReadOnlyCollection<DurableAction>> ReadPendingCandidatesAsync(
+        string lane,
+        int offset,
+        int batchSize,
+        TimeSpan lockTimeout,
+        DateTimeOffset now,
+        CancellationToken cancellationToken = default)
+        => Task.FromResult(_store.ReadPendingCandidates(lane, offset, batchSize, lockTimeout, now));
+
+    public Task<DurableAction> FindActionAsync(Ulid id, CancellationToken cancellationToken = default)
+        => Task.FromResult(_store.FindAction(id));
+
+    public Task<MuleActionTransitionOutcome> CompleteClaimAsync(
+        Ulid id,
+        Ulid expectedConcurrencyToken,
+        DateTimeOffset completedOnUtc,
+        CancellationToken cancellationToken = default)
+        => Task.FromResult(_store.CompleteClaim(id, expectedConcurrencyToken, completedOnUtc));
+
+    public Task<MuleActionTransitionOutcome> FailClaimAsync(
+        Ulid id,
+        Ulid expectedConcurrencyToken,
+        string error,
+        DateTimeOffset now,
+        DateTimeOffset? nextAttemptOnUtc,
+        CancellationToken cancellationToken = default)
+        => Task.FromResult(_store.FailClaim(id, expectedConcurrencyToken, error, now, nextAttemptOnUtc));
+
+    public Task<MuleActionTransitionOutcome> DeferClaimAsync(
+        Ulid id,
+        Ulid expectedConcurrencyToken,
+        DateTimeOffset deferredOnUtc,
+        DateTimeOffset notBeforeUtc,
+        DeferralReason reason,
+        CancellationToken cancellationToken = default)
+        => Task.FromResult(_store.DeferClaim(id, expectedConcurrencyToken, notBeforeUtc, reason));
+
+    public Task<IReadOnlyCollection<MuleActionStateProjectionResult>> ProjectStateRangeAsync(
+        IReadOnlyCollection<MuleActionStateProjection> projections,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        return Task.FromResult(_store.ProjectStateRange(projections));
+    }
 
     public Task MarkCompletedAsync(Ulid id, DateTimeOffset completedOnUtc, CancellationToken cancellationToken = default)
     {

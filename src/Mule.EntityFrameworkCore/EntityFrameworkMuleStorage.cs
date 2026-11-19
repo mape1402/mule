@@ -5,6 +5,8 @@ using Mule.Diagnostics;
 
 internal partial class EntityFrameworkMuleStorage<TDbContext> :
     IMuleDurableStorage,
+    IMuleExecutionStorage,
+    IMuleStateProjectionStorage,
     IMuleBatchTerminalStorage,
     IMuleReplayStorage,
     IMuleCancellationStorage,
@@ -197,6 +199,8 @@ internal partial class EntityFrameworkMuleStorage<TDbContext> :
         action.Status = DurableActionStatus.Locked;
         action.LockedOnUtc = now;
         action.StartedOnUtc ??= now;
+        action.PendingReason = DurableActionPendingReason.None;
+        action.DeferralReasonCode = null;
         action.ConcurrencyToken = Ulid.NewUlid();
 
         try
@@ -219,6 +223,8 @@ internal partial class EntityFrameworkMuleStorage<TDbContext> :
         action.TerminalOnUtc = completedOnUtc;
         action.LockedOnUtc = null;
         action.NextAttemptOnUtc = null;
+        action.PendingReason = DurableActionPendingReason.None;
+        action.DeferralReasonCode = null;
         action.LastError = null;
         action.ConcurrencyToken = Ulid.NewUlid();
     }
@@ -250,6 +256,10 @@ internal partial class EntityFrameworkMuleStorage<TDbContext> :
         action.LastError = error;
         action.LockedOnUtc = null;
         action.NextAttemptOnUtc = nextAttemptOnUtc;
+        action.PendingReason = nextAttemptOnUtc == null
+            ? DurableActionPendingReason.None
+            : DurableActionPendingReason.Retry;
+        action.DeferralReasonCode = null;
         action.TerminalOnUtc = nextAttemptOnUtc == null ? now : null;
         action.ConcurrencyToken = Ulid.NewUlid();
     }
@@ -312,7 +322,237 @@ internal partial class EntityFrameworkMuleStorage<TDbContext> :
         }
     }
 
+    public async Task<IReadOnlyCollection<DurableAction>> ReadPendingCandidatesAsync(
+        string lane,
+        int offset,
+        int batchSize,
+        TimeSpan lockTimeout,
+        DateTimeOffset now,
+        CancellationToken cancellationToken = default)
+    {
+        var normalizedLane = NormalizeLane(lane);
+        var lockExpiration = now.Subtract(lockTimeout);
+        try
+        {
+            return await Actions
+                .AsNoTracking()
+                .Where(x =>
+                    x.Lane == normalizedLane &&
+                    ((x.Status == DurableActionStatus.Pending && (x.NextAttemptOnUtc == null || x.NextAttemptOnUtc <= now)) ||
+                     (x.Status == DurableActionStatus.Locked && x.LockedOnUtc != null && x.LockedOnUtc <= lockExpiration)))
+                .OrderBy(x => x.NextAttemptOnUtc ?? x.CreatedOnUtc)
+                .ThenBy(x => x.CreatedOnUtc)
+                .ThenBy(x => x.Id)
+                .Skip(Math.Max(0, offset))
+                .Take(Math.Max(1, batchSize))
+                .ToArrayAsync(cancellationToken);
+        }
+        catch (Exception ex) when (ShouldFallbackToClientFiltering(ex))
+        {
+            var candidates = await Actions
+                .AsNoTracking()
+                .Where(x => x.Lane == normalizedLane &&
+                    (x.Status == DurableActionStatus.Pending || x.Status == DurableActionStatus.Locked))
+                .ToListAsync(cancellationToken);
+            return candidates
+                .Where(x => CanLock(x.Status, x.LockedOnUtc, x.NextAttemptOnUtc, lockExpiration, now))
+                .OrderBy(x => x.NextAttemptOnUtc ?? x.CreatedOnUtc)
+                .ThenBy(x => x.CreatedOnUtc)
+                .ThenBy(x => x.Id)
+                .Skip(Math.Max(0, offset))
+                .Take(Math.Max(1, batchSize))
+                .ToArray();
+        }
+    }
+
+    public Task<DurableAction> FindActionAsync(Ulid id, CancellationToken cancellationToken = default)
+        => Actions.AsNoTracking().FirstOrDefaultAsync(x => x.Id == id, cancellationToken);
+
+    public Task<MuleActionTransitionOutcome> CompleteClaimAsync(
+        Ulid id,
+        Ulid expectedConcurrencyToken,
+        DateTimeOffset completedOnUtc,
+        CancellationToken cancellationToken = default)
+        => ApplyClaimTransitionAsync(
+            id,
+            expectedConcurrencyToken,
+            action =>
+            {
+                action.Status = DurableActionStatus.Completed;
+                action.CompletedOnUtc = completedOnUtc;
+                action.TerminalOnUtc = completedOnUtc;
+                action.LockedOnUtc = null;
+                action.NextAttemptOnUtc = null;
+                action.PendingReason = DurableActionPendingReason.None;
+                action.DeferralReasonCode = null;
+                action.LastError = null;
+            },
+            cancellationToken);
+
+    public Task<MuleActionTransitionOutcome> FailClaimAsync(
+        Ulid id,
+        Ulid expectedConcurrencyToken,
+        string error,
+        DateTimeOffset now,
+        DateTimeOffset? nextAttemptOnUtc,
+        CancellationToken cancellationToken = default)
+        => ApplyClaimTransitionAsync(
+            id,
+            expectedConcurrencyToken,
+            action =>
+            {
+                action.Attempts++;
+                action.Status = nextAttemptOnUtc == null ? DurableActionStatus.Failed : DurableActionStatus.Pending;
+                action.LastError = error;
+                action.LockedOnUtc = null;
+                action.NextAttemptOnUtc = nextAttemptOnUtc;
+                action.PendingReason = nextAttemptOnUtc == null
+                    ? DurableActionPendingReason.None
+                    : DurableActionPendingReason.Retry;
+                action.DeferralReasonCode = null;
+                action.TerminalOnUtc = nextAttemptOnUtc == null ? now : null;
+            },
+            cancellationToken);
+
+    public Task<MuleActionTransitionOutcome> DeferClaimAsync(
+        Ulid id,
+        Ulid expectedConcurrencyToken,
+        DateTimeOffset deferredOnUtc,
+        DateTimeOffset notBeforeUtc,
+        DeferralReason reason,
+        CancellationToken cancellationToken = default)
+        => ApplyClaimTransitionAsync(
+            id,
+            expectedConcurrencyToken,
+            action =>
+            {
+                action.Status = DurableActionStatus.Pending;
+                action.LockedOnUtc = null;
+                action.NextAttemptOnUtc = notBeforeUtc;
+                action.PendingReason = DurableActionPendingReason.Deferred;
+                action.DeferralReasonCode = reason.Value;
+                action.TerminalOnUtc = null;
+            },
+            cancellationToken);
+
+    public async Task<IReadOnlyCollection<MuleActionStateProjectionResult>> ProjectStateRangeAsync(
+        IReadOnlyCollection<MuleActionStateProjection> projections,
+        CancellationToken cancellationToken = default)
+    {
+        if (projections == null)
+            throw new ArgumentNullException(nameof(projections));
+        if (projections.Count == 0)
+            return Array.Empty<MuleActionStateProjectionResult>();
+        if (projections.Any(x => x == null))
+            throw new ArgumentException("Projection collection cannot contain null values.", nameof(projections));
+
+        var duplicateId = projections
+            .GroupBy(x => x.Action.Id)
+            .FirstOrDefault(x => x.Count() > 1);
+        if (duplicateId != null)
+            throw new ArgumentException($"Action '{duplicateId.Key}' occurs more than once in the projection batch.", nameof(projections));
+
+        var ids = projections.Select(x => x.Action.Id).ToArray();
+        var existing = await Actions
+            .Where(x => ids.Contains(x.Id))
+            .ToDictionaryAsync(x => x.Id, cancellationToken);
+        var results = new List<MuleActionStateProjectionResult>(projections.Count);
+        var changed = new HashSet<Ulid>();
+
+        foreach (var projection in projections)
+        {
+            var state = projection.Action;
+            if (!existing.TryGetValue(state.Id, out var current))
+            {
+                if (projection.ExpectedConcurrencyToken != null)
+                {
+                    results.Add(new(state.Id, MuleActionTransitionOutcome.NotFound));
+                    continue;
+                }
+
+                await Actions.AddAsync(CloneState(state), cancellationToken);
+                changed.Add(state.Id);
+                results.Add(new(state.Id, MuleActionTransitionOutcome.Applied));
+                continue;
+            }
+
+            if (current.ConcurrencyToken == state.ConcurrencyToken)
+            {
+                results.Add(new(state.Id, MuleActionTransitionOutcome.Applied));
+                continue;
+            }
+
+            if (projection.ExpectedConcurrencyToken is { } expected)
+            {
+                if (current.ConcurrencyToken != expected)
+                {
+                    results.Add(new(state.Id, MuleActionTransitionOutcome.LeaseLost));
+                    continue;
+                }
+            }
+            else if (current.ConcurrencyToken != state.ConcurrencyToken)
+            {
+                results.Add(new(state.Id, MuleActionTransitionOutcome.LeaseLost));
+                continue;
+            }
+
+            CopyState(state, current);
+            changed.Add(state.Id);
+            results.Add(new(state.Id, MuleActionTransitionOutcome.Applied));
+        }
+
+        if (changed.Count == 0)
+            return results;
+
+        try
+        {
+            await _dbContext.SaveChangesAsync(cancellationToken);
+            return results;
+        }
+        catch (DbUpdateConcurrencyException)
+        {
+            DetachChangedEntries();
+            return results
+                .Select(x => changed.Contains(x.ActionId)
+                    ? x with { Outcome = MuleActionTransitionOutcome.LeaseLost }
+                    : x)
+                .ToArray();
+        }
+    }
+
     protected DbSet<DurableAction> Actions => _dbContext.Set<DurableAction>();
+
+    private static DurableAction CloneState(DurableAction source)
+    {
+        var clone = new DurableAction();
+        CopyState(source, clone);
+        return clone;
+    }
+
+    private static void CopyState(DurableAction source, DurableAction target)
+    {
+        target.Id = source.Id;
+        target.ConcurrencyToken = source.ConcurrencyToken;
+        target.Key = source.Key;
+        target.Lane = source.Lane;
+        target.Payload = source.Payload;
+        target.PayloadType = source.PayloadType;
+        target.Metadata = source.Metadata;
+        target.CorrelationId = source.CorrelationId;
+        target.DeduplicationKey = source.DeduplicationKey;
+        target.Status = source.Status;
+        target.Attempts = source.Attempts;
+        target.LastError = source.LastError;
+        target.CreatedOnUtc = source.CreatedOnUtc;
+        target.LockedOnUtc = source.LockedOnUtc;
+        target.StartedOnUtc = source.StartedOnUtc;
+        target.NextAttemptOnUtc = source.NextAttemptOnUtc;
+        target.PendingReason = source.PendingReason;
+        target.DeferralReasonCode = source.DeferralReasonCode;
+        target.CompletedOnUtc = source.CompletedOnUtc;
+        target.CancelledOnUtc = source.CancelledOnUtc;
+        target.TerminalOnUtc = source.TerminalOnUtc;
+    }
 
     private async Task<Ulid[]> GetClaimCandidateIdsAsync(
         string normalizedLane,
@@ -404,6 +644,32 @@ internal partial class EntityFrameworkMuleStorage<TDbContext> :
     private async Task<DurableAction> FindAsync(Ulid id, CancellationToken cancellationToken)
         => await Actions.FindAsync(new object[] { id }, cancellationToken)
             ?? throw new InvalidOperationException($"Mule action '{id}' was not found.");
+
+    private async Task<MuleActionTransitionOutcome> ApplyClaimTransitionAsync(
+        Ulid id,
+        Ulid expectedConcurrencyToken,
+        Action<DurableAction> transition,
+        CancellationToken cancellationToken)
+    {
+        var action = await Actions.FirstOrDefaultAsync(x => x.Id == id, cancellationToken);
+        if (action == null)
+            return MuleActionTransitionOutcome.NotFound;
+        if (action.Status != DurableActionStatus.Locked || action.ConcurrencyToken != expectedConcurrencyToken)
+            return MuleActionTransitionOutcome.LeaseLost;
+
+        transition(action);
+        action.ConcurrencyToken = Ulid.NewUlid();
+        try
+        {
+            await _dbContext.SaveChangesAsync(cancellationToken);
+            return MuleActionTransitionOutcome.Applied;
+        }
+        catch (DbUpdateConcurrencyException)
+        {
+            DetachChangedEntries();
+            return MuleActionTransitionOutcome.LeaseLost;
+        }
+    }
 
     public void Dispose()
         => _dbContext.Dispose();

@@ -32,9 +32,9 @@ internal class EntityFrameworkMuleDiagnostics<TDbContext> : IMuleDiagnostics, ID
         var throughputSinceUtc = now.AddMinutes(-1);
         var runtime = _metrics.GetSnapshot(now);
 
-        var pendingDates = await actions
+        var pendingActions = await actions
             .Where(x => x.Status == DurableActionStatus.Pending)
-            .Select(x => x.CreatedOnUtc)
+            .Select(x => new { x.CreatedOnUtc, x.NextAttemptOnUtc, x.PendingReason })
             .ToListAsync(cancellationToken);
 
         var lockedDates = await actions
@@ -84,12 +84,16 @@ internal class EntityFrameworkMuleDiagnostics<TDbContext> : IMuleDiagnostics, ID
             .Select(x => new { Key = x.Key, Count = x.Sum(action => action.Attempts) })
             .ToListAsync(cancellationToken);
 
-        var oldestPendingOnUtc = pendingDates.Count == 0 ? null : (DateTimeOffset?)pendingDates.Min();
+        var oldestPendingOnUtc = pendingActions.Count == 0
+            ? null
+            : (DateTimeOffset?)pendingActions.Min(x => x.CreatedOnUtc);
         var oldestLockedOnUtc = lockedDates.Count == 0 ? null : (DateTimeOffset?)lockedDates.Min();
 
         return new MuleDiagnosticsSnapshot
         {
             Pending = await actions.CountAsync(x => x.Status == DurableActionStatus.Pending, cancellationToken),
+            Ready = pendingActions.Count(x => x.NextAttemptOnUtc == null || x.NextAttemptOnUtc <= now),
+            Deferred = pendingActions.Count(x => x.PendingReason == DurableActionPendingReason.Deferred),
             Locked = await actions.CountAsync(x => x.Status == DurableActionStatus.Locked, cancellationToken),
             Completed = await actions.CountAsync(x => x.Status == DurableActionStatus.Completed, cancellationToken),
             Failed = await actions.CountAsync(x => x.Status == DurableActionStatus.Failed, cancellationToken),
@@ -105,6 +109,8 @@ internal class EntityFrameworkMuleDiagnostics<TDbContext> : IMuleDiagnostics, ID
             ReplayRejected = runtime.ReplayRejected,
             ReplayRetried = runtime.ReplayRetried,
             ReplayMaterializationFailures = runtime.ReplayMaterializationFailures,
+            ActivationsOmitted = runtime.ActivationsOmitted,
+            ActivationsRecovered = runtime.ActivationsRecovered,
             OldestPendingOnUtc = oldestPendingOnUtc,
             OldestLockedOnUtc = oldestLockedOnUtc,
             OldestFailedOnUtc = failedDates.Count == 0 ? null : failedDates.Min(),
@@ -125,6 +131,9 @@ internal class EntityFrameworkMuleDiagnostics<TDbContext> : IMuleDiagnostics, ID
             WaitingExecutionByLane = runtime.WaitingExecutionByLane,
             ExecutingByLane = runtime.ExecutingByLane,
             ExecutorSaturationByLane = runtime.ExecutorSaturationByLane,
+            DeferredByLane = runtime.DeferredByLane,
+            DeferredByReason = runtime.DeferredByReason,
+            ExecutionKeyContentionByLane = runtime.ExecutionKeyContentionByLane,
             OldestWaitingExecutionAgeByLane = runtime.OldestWaitingExecutionAgeByLane
         };
     }

@@ -132,6 +132,28 @@ public sealed class InMemoryReplayTests
     }
 
     [Fact]
+    public async Task Future_Replay_Should_Report_Its_Scheduled_Due_Time()
+    {
+        var store = new InMemoryMuleStore();
+        var storage = new InMemoryMuleStorage(store, new MuleRuntimeMetrics());
+        var source = CreateAction(DurableActionStatus.Failed);
+        store.Add(source);
+        var now = DateTimeOffset.UtcNow;
+        var due = now.AddMinutes(1);
+
+        await storage.ScheduleAsync(source.Id, Request(due), now);
+
+        Assert.Equal(due, await storage.GetNextScheduledOnUtcAsync(TimeSpan.FromMinutes(1), now));
+
+        var pastStore = new InMemoryMuleStore();
+        var pastStorage = new InMemoryMuleStorage(pastStore, new MuleRuntimeMetrics());
+        var pastSource = CreateAction(DurableActionStatus.Failed);
+        pastStore.Add(pastSource);
+        await pastStorage.ScheduleAsync(pastSource.Id, Request(now.AddMinutes(-1)), now);
+        Assert.Equal(now, await pastStorage.GetNextScheduledOnUtcAsync(TimeSpan.FromMinutes(1), now));
+    }
+
+    [Fact]
     public async Task Claim_Release_And_Materialize_Should_Be_Lease_Safe_And_Recoverable()
     {
         var store = new InMemoryMuleStore();

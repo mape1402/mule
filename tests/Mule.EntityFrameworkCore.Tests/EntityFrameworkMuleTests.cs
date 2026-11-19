@@ -296,6 +296,193 @@ public sealed class EntityFrameworkMuleTests
         TryDelete(databasePath);
     }
 
+    [Fact]
+    public async Task Deferral_And_State_Projection_Should_Enforce_Concurrency_Tokens()
+    {
+        using var host = CreateHost(out var databasePath);
+        await EnsureDatabaseAsync(host);
+        var now = DateTimeOffset.UtcNow;
+        Ulid actionId;
+        DurableAction firstClaim;
+
+        using (var scope = host.Services.CreateScope())
+        {
+            var client = scope.ServiceProvider.GetRequiredService<IMuleClient>();
+            actionId = await client.EnqueueAsync(
+                Key,
+                new TestPayload("defer"),
+                options => options.DeduplicationKey = "ef-deferral");
+            var storage = scope.ServiceProvider.GetRequiredService<IMuleStorage>();
+            firstClaim = await storage.LockAsync(actionId, TimeSpan.FromMinutes(1), now);
+            var execution = Assert.IsAssignableFrom<IMuleExecutionStorage>(storage);
+
+            Assert.Equal(
+                MuleActionTransitionOutcome.Applied,
+                await execution.DeferClaimAsync(
+                    actionId,
+                    firstClaim.ConcurrencyToken,
+                    now,
+                    now.AddMinutes(2),
+                    DeferralReason.From("lease-busy")));
+        }
+
+        using (var scope = host.Services.CreateScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<MuleDbContext>();
+            var deferred = await db.Actions.AsNoTracking().SingleAsync(x => x.Id == actionId);
+            Assert.Equal(DurableActionStatus.Pending, deferred.Status);
+            Assert.Equal(DurableActionPendingReason.Deferred, deferred.PendingReason);
+            Assert.Equal("lease-busy", deferred.DeferralReasonCode);
+            Assert.Equal(0, deferred.Attempts);
+        }
+
+        using (var scope = host.Services.CreateScope())
+        {
+            var storage = scope.ServiceProvider.GetRequiredService<IMuleStorage>();
+            var execution = Assert.IsAssignableFrom<IMuleExecutionStorage>(storage);
+            var secondClaim = await storage.LockAsync(actionId, TimeSpan.FromMinutes(1), now.AddMinutes(3));
+
+            Assert.Equal(
+                MuleActionTransitionOutcome.LeaseLost,
+                await execution.CompleteClaimAsync(actionId, firstClaim.ConcurrencyToken, now.AddMinutes(3)));
+            Assert.Equal(
+                MuleActionTransitionOutcome.Applied,
+                await execution.CompleteClaimAsync(actionId, secondClaim.ConcurrencyToken, now.AddMinutes(3)));
+        }
+
+        using (var scope = host.Services.CreateScope())
+        {
+            var projectionStorage = Assert.IsAssignableFrom<IMuleStateProjectionStorage>(
+                scope.ServiceProvider.GetRequiredService<IMuleStorage>());
+            var projected = new DurableAction
+            {
+                Key = Key,
+                Lane = MuleSettings.DefaultLane,
+                Payload = "{}",
+                PayloadType = typeof(TestPayload).AssemblyQualifiedName,
+                Status = DurableActionStatus.Pending,
+                PendingReason = DurableActionPendingReason.Deferred,
+                DeferralReasonCode = "projection",
+                NextAttemptOnUtc = now.AddMinutes(5),
+                CreatedOnUtc = now
+            };
+            var inserted = Assert.Single(await projectionStorage.ProjectStateRangeAsync(
+                [new MuleActionStateProjection(projected, null)]));
+            Assert.Equal(MuleActionTransitionOutcome.Applied, inserted.Outcome);
+
+            var previousToken = projected.ConcurrencyToken;
+            projected.ConcurrencyToken = Ulid.NewUlid();
+            projected.PendingReason = DurableActionPendingReason.Retry;
+            projected.DeferralReasonCode = null;
+            var updated = Assert.Single(await projectionStorage.ProjectStateRangeAsync(
+                [new MuleActionStateProjection(projected, previousToken)]));
+            Assert.Equal(MuleActionTransitionOutcome.Applied, updated.Outcome);
+
+            projected.ConcurrencyToken = Ulid.NewUlid();
+            var stale = Assert.Single(await projectionStorage.ProjectStateRangeAsync(
+                [new MuleActionStateProjection(projected, previousToken)]));
+            Assert.Equal(MuleActionTransitionOutcome.LeaseLost, stale.Outcome);
+        }
+
+        TryDelete(databasePath);
+    }
+
+    [Fact]
+    public async Task Execution_Storage_Should_Cover_Candidates_Claim_Outcomes_And_Projection_Validation()
+    {
+        using var host = CreateHost(out var databasePath);
+        await EnsureDatabaseAsync(host);
+        var now = DateTimeOffset.UtcNow;
+        var due = new DurableAction
+        {
+            Key = Key,
+            Lane = "coverage",
+            Payload = "{}",
+            PayloadType = typeof(TestPayload).AssemblyQualifiedName,
+            CreatedOnUtc = now.AddMinutes(-2)
+        };
+        var future = new DurableAction
+        {
+            Key = Key,
+            Lane = "coverage",
+            Payload = "{}",
+            PayloadType = typeof(TestPayload).AssemblyQualifiedName,
+            CreatedOnUtc = now,
+            NextAttemptOnUtc = now.AddMinutes(2)
+        };
+
+        using (var scope = host.Services.CreateScope())
+        {
+            var storage = scope.ServiceProvider.GetRequiredService<IMuleStorage>();
+            await storage.AddRangeAsync([due, future]);
+            await storage.SaveChangesAsync();
+        }
+
+        using (var scope = host.Services.CreateScope())
+        {
+            var storage = scope.ServiceProvider.GetRequiredService<IMuleStorage>();
+            var execution = Assert.IsAssignableFrom<IMuleExecutionStorage>(storage);
+            var candidates = await execution.ReadPendingCandidatesAsync(
+                "coverage", -1, 10, TimeSpan.FromMinutes(1), now);
+            Assert.Contains(candidates, x => x.Id == due.Id);
+            Assert.DoesNotContain(candidates, x => x.Id == future.Id);
+            Assert.Null(await execution.FindActionAsync(Ulid.NewUlid()));
+            Assert.Equal(due.Id, (await execution.FindActionAsync(due.Id)).Id);
+
+            Assert.Equal(MuleActionTransitionOutcome.NotFound,
+                await execution.CompleteClaimAsync(Ulid.NewUlid(), Ulid.NewUlid(), now));
+            var claim = await storage.LockAsync(due.Id, TimeSpan.FromMinutes(1), now);
+            Assert.Equal(MuleActionTransitionOutcome.LeaseLost,
+                await execution.FailClaimAsync(due.Id, Ulid.NewUlid(), "stale", now, null));
+            Assert.Equal(MuleActionTransitionOutcome.Applied,
+                await execution.FailClaimAsync(due.Id, claim.ConcurrencyToken, "retry", now, now.AddSeconds(1)));
+
+            Assert.Equal(MuleActionTransitionOutcome.NotFound,
+                await execution.DeferClaimAsync(
+                    Ulid.NewUlid(), Ulid.NewUlid(), now, now, DeferralReason.From("missing")));
+        }
+
+        using (var scope = host.Services.CreateScope())
+        {
+            var storage = scope.ServiceProvider.GetRequiredService<IMuleStorage>();
+            var execution = Assert.IsAssignableFrom<IMuleExecutionStorage>(storage);
+            var claim = await storage.LockAsync(due.Id, TimeSpan.FromMinutes(1), now.AddMinutes(1));
+            Assert.Equal(MuleActionTransitionOutcome.Applied,
+                await execution.FailClaimAsync(due.Id, claim.ConcurrencyToken, "terminal", now.AddMinutes(1), null));
+
+            var projectionStorage = Assert.IsAssignableFrom<IMuleStateProjectionStorage>(storage);
+            await Assert.ThrowsAsync<ArgumentNullException>(() => projectionStorage.ProjectStateRangeAsync(null));
+            await Assert.ThrowsAsync<ArgumentException>(() =>
+                projectionStorage.ProjectStateRangeAsync([null]));
+            await Assert.ThrowsAsync<ArgumentException>(() =>
+                projectionStorage.ProjectStateRangeAsync([
+                    new MuleActionStateProjection(future, future.ConcurrencyToken),
+                    new MuleActionStateProjection(future, future.ConcurrencyToken)]));
+            Assert.Empty(await projectionStorage.ProjectStateRangeAsync([]));
+
+            var missing = new DurableAction
+            {
+                Key = Key,
+                Payload = "{}",
+                PayloadType = typeof(TestPayload).AssemblyQualifiedName
+            };
+            Assert.Equal(MuleActionTransitionOutcome.NotFound,
+                Assert.Single(await projectionStorage.ProjectStateRangeAsync([
+                    new MuleActionStateProjection(missing, Ulid.NewUlid())])).Outcome);
+
+            var persistedFuture = await execution.FindActionAsync(future.Id);
+            Assert.Equal(MuleActionTransitionOutcome.Applied,
+                Assert.Single(await projectionStorage.ProjectStateRangeAsync([
+                    new MuleActionStateProjection(persistedFuture, persistedFuture.ConcurrencyToken)])).Outcome);
+            persistedFuture.ConcurrencyToken = Ulid.NewUlid();
+            Assert.Equal(MuleActionTransitionOutcome.LeaseLost,
+                Assert.Single(await projectionStorage.ProjectStateRangeAsync([
+                    new MuleActionStateProjection(persistedFuture, null)])).Outcome);
+        }
+
+        TryDelete(databasePath);
+    }
+
     private static IHost CreateHost(out string databasePath)
     {
         databasePath = Path.Combine(Path.GetTempPath(), $"mule-{Guid.NewGuid():N}.db");

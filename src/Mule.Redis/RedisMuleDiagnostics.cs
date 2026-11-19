@@ -51,11 +51,12 @@ internal sealed class RedisMuleDiagnostics : IMuleDiagnostics
         var failuresTask = database.HashGetAllAsync(keys.FailuresByActionKey);
         var retriesTask = database.HashGetAllAsync(keys.RetriesByActionKey);
         var latenciesTask = database.HashGetAllAsync(keys.Latencies);
+        var pendingStateTask = ReadPendingStateAsync(database, keys, nowMs);
 
         await Task.WhenAll(
             pendingTask, lockedTask, completedTask, failedTask, cancelledTask,
             expiredTask, throughputTask, pendingOldestTask, lockedOldestTask, failedOldestTask,
-            backlogLaneTask, backlogActionTask, failuresTask, retriesTask, latenciesTask);
+            backlogLaneTask, backlogActionTask, failuresTask, retriesTask, latenciesTask, pendingStateTask);
         cancellationToken.ThrowIfCancellationRequested();
 
         var oldestPending = pendingOldestTask.Result;
@@ -64,6 +65,8 @@ internal sealed class RedisMuleDiagnostics : IMuleDiagnostics
         return new MuleDiagnosticsSnapshot
         {
             Pending = checked((int)pendingTask.Result),
+            Ready = pendingStateTask.Result.Ready,
+            Deferred = pendingStateTask.Result.Deferred,
             Locked = checked((int)lockedTask.Result),
             Completed = checked((int)completedTask.Result),
             Failed = checked((int)failedTask.Result),
@@ -79,6 +82,8 @@ internal sealed class RedisMuleDiagnostics : IMuleDiagnostics
             ReplayRejected = runtime.ReplayRejected,
             ReplayRetried = runtime.ReplayRetried,
             ReplayMaterializationFailures = runtime.ReplayMaterializationFailures,
+            ActivationsOmitted = runtime.ActivationsOmitted,
+            ActivationsRecovered = runtime.ActivationsRecovered,
             OldestPendingOnUtc = oldestPending,
             OldestLockedOnUtc = oldestLocked,
             OldestFailedOnUtc = failedOldestTask.Result,
@@ -99,6 +104,9 @@ internal sealed class RedisMuleDiagnostics : IMuleDiagnostics
             WaitingExecutionByLane = runtime.WaitingExecutionByLane,
             ExecutingByLane = runtime.ExecutingByLane,
             ExecutorSaturationByLane = runtime.ExecutorSaturationByLane,
+            DeferredByLane = runtime.DeferredByLane,
+            DeferredByReason = runtime.DeferredByReason,
+            ExecutionKeyContentionByLane = runtime.ExecutionKeyContentionByLane,
             OldestWaitingExecutionAgeByLane = runtime.OldestWaitingExecutionAgeByLane
         };
     }
@@ -109,6 +117,32 @@ internal sealed class RedisMuleDiagnostics : IMuleDiagnostics
         return entries.Length == 0
             ? null
             : DateTimeOffset.FromUnixTimeMilliseconds((long)entries[0].Score);
+    }
+
+    private static async Task<(int Ready, int Deferred)> ReadPendingStateAsync(
+        IDatabase database,
+        RedisMuleKeyspace keys,
+        long nowMilliseconds)
+    {
+        var ids = await database.SortedSetRangeByRankAsync(keys.Pending);
+        if (ids.Length == 0)
+            return (0, 0);
+
+        var reads = ids.Select(id => database.HashGetAsync(
+            keys.Action(Ulid.Parse(id.ToString())),
+            ["next", "pendingReason"])).ToArray();
+        var values = await Task.WhenAll(reads);
+        var ready = 0;
+        var deferred = 0;
+        foreach (var value in values)
+        {
+            if (!long.TryParse(value[0].ToString(), out var next) || next <= nowMilliseconds)
+                ready++;
+            if (int.TryParse(value[1].ToString(), out var reason)
+                && reason == (int)DurableActionPendingReason.Deferred)
+                deferred++;
+        }
+        return (ready, deferred);
     }
 
     private static IReadOnlyDictionary<string, int> StringCounts(HashEntry[] entries)

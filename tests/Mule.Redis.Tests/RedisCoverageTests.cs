@@ -82,8 +82,8 @@ public sealed class RedisCoverageTests : IAsyncLifetime
         Assert.Equal(MuleSettings.DefaultLane, arguments[3].ToString());
         Assert.Equal(string.Empty, arguments[5].ToString());
         Assert.Equal(string.Empty, arguments[10].ToString());
-        Assert.Equal(now.AddSeconds(10).ToUnixTimeMilliseconds(), (long)arguments[21]);
-        Assert.Equal(now.AddMinutes(1).ToUnixTimeMilliseconds(), (long)pendingArguments[21]);
+        Assert.Equal(now.AddSeconds(10).ToUnixTimeMilliseconds(), (long)arguments[23]);
+        Assert.Equal(now.AddMinutes(1).ToUnixTimeMilliseconds(), (long)pendingArguments[23]);
         Assert.Equal(MuleSettings.DefaultLane, minimal.Lane);
         Assert.Equal(DateTimeOffset.UnixEpoch, minimal.CreatedOnUtc);
         Assert.Equal(0, minimal.Attempts);
