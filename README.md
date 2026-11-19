@@ -351,7 +351,9 @@ await db.Database.EnsureCreatedAsync();
 
 Mule's default EF model is intentionally portable. It configures `DurableAction.Id` and `DurableAction.ConcurrencyToken` as `Ulid` values stored as 26-character strings, marks the concurrency token for optimistic concurrency, and applies conservative lengths to common string fields.
 
-Existing EF hosts upgrading to keyed scheduling and cooperative deferral must add a migration for `DurableAction.PendingReason` (required integer, default `0`) and `DurableAction.DeferralReasonCode` (nullable string, maximum 128 characters). The model also adds an index over `Status`, `PendingReason`, and `NextAttemptOnUtc`; let the configured EF provider generate its native migration instead of writing provider-specific SQL in Mule.
+#### Upgrading To 2.4.0
+
+Mule 2.4.0 adds persisted scheduling metadata for keyed scheduling and cooperative deferral. Existing EF hosts must add a migration for `DurableAction.PendingReason` (required integer, default `0`) and `DurableAction.DeferralReasonCode` (nullable string, maximum 128 characters). The model also adds an index over `Status`, `PendingReason`, and `NextAttemptOnUtc`; let the configured EF provider generate its native migration instead of writing provider-specific SQL in Mule.
 
 Customize the Mule entity from the Mule registration chain when your provider or host needs different storage details:
 
